@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+use std::io::Write;
+
 mod diagnose;
 mod localization;
 mod models;
@@ -15,11 +17,35 @@ mod retry_after;
 mod settings_store;
 mod theme;
 mod tray_icon;
+mod uninstaller;
 mod updater;
 mod window;
 
 fn main() {
+    let os_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(exit_code) = uninstaller::handle_cli_mode(&os_args) {
+        std::process::exit(exit_code);
+    }
+    match uninstaller::is_uninstall_in_progress() {
+        Ok(true) => {
+            uninstaller::show_startup_info(
+                "An uninstall is already in progress. Please wait for it to finish before starting Codex Usage again.",
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            uninstaller::show_startup_error(&error);
+            return;
+        }
+    }
+
     let args: Vec<String> = std::env::args().collect();
+    if version_requested(&args) {
+        print_version();
+        return;
+    }
+
     let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
     if diagnose_enabled {
         match diagnose::init() {
@@ -52,4 +78,73 @@ fn main() {
         diagnose::log("entering window::run");
     }
     window::run();
+}
+
+fn version_requested(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| matches!(arg.as_str(), "-v" | "--version"))
+}
+
+fn version_output() -> String {
+    format!("{} {}\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
+fn print_version() {
+    #[cfg(windows)]
+    attach_parent_console_if_needed();
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    let _ = stdout.write_all(version_output().as_bytes());
+    let _ = stdout.flush();
+}
+
+#[cfg(windows)]
+fn attach_parent_console_if_needed() {
+    use windows::Win32::System::Console::{
+        AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE,
+    };
+
+    // Keep inherited handles intact so shell redirection continues to work.
+    if unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.is_err() {
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{version_output, version_requested};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn recognizes_version_flags_among_other_arguments() {
+        assert!(version_requested(&args(&["codex-usage.exe", "-v"])));
+        assert!(version_requested(&args(&[
+            "codex-usage.exe",
+            "--diagnose",
+            "--version"
+        ])));
+    }
+
+    #[test]
+    fn does_not_match_partial_or_executable_name_flags() {
+        assert!(!version_requested(&args(&[
+            "codex-usage.exe",
+            "--verbose",
+            "-version"
+        ])));
+        assert!(!version_requested(&args(&["--version"])));
+    }
+
+    #[test]
+    fn formats_package_name_and_version_on_one_line() {
+        assert_eq!(
+            version_output(),
+            format!("{} {}\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+        );
+    }
 }

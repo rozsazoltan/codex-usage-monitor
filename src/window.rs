@@ -14,7 +14,7 @@ use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
-use windows::Win32::UI::Shell::ExtractIconExW;
+use windows::Win32::UI::Shell::{ExtractIconExW, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
@@ -164,18 +164,87 @@ const IDM_FONT_STANDARD: u16 = 97;
 const IDM_FONT_LARGE: u16 = 98;
 const IDM_APPEARANCE_RECOMMENDED: u16 = 99;
 const IDM_APPEARANCE_RESET: u16 = 100;
+const IDM_COLOR_CLAUDE: u16 = 101;
+const IDM_COLOR_CODEX: u16 = 102;
+const IDM_COLOR_RESET: u16 = 103;
+const IDM_ABOUT_STAR: u16 = 104;
+const IDM_UNINSTALL: u16 = 105;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
+const TIMER_REOPEN_CONTEXT_MENU: usize = 7;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
 /// recreates the taskbar and wipes our tray-icon registration).
 const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+#[repr(C)]
+struct ChooseColor {
+    size: u32,
+    owner: HWND,
+    instance: HINSTANCE,
+    result: u32,
+    custom_colors: *mut u32,
+    flags: u32,
+    data: LPARAM,
+    hook: Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> u32>,
+    template: PCWSTR,
+}
+
+#[link(name = "comdlg32")]
+extern "system" {
+    fn ChooseColorW(dialog: *mut ChooseColor) -> BOOL;
+}
+
+fn choose_accent_color(hwnd: HWND, initial: Color) -> Option<Color> {
+    let mut custom_colors = [0x00FF_FFFFu32; 16];
+    let mut dialog = ChooseColor {
+        size: std::mem::size_of::<ChooseColor>() as u32,
+        owner: hwnd,
+        instance: HINSTANCE::default(),
+        result: initial.to_colorref(),
+        custom_colors: custom_colors.as_mut_ptr(),
+        flags: 0x0000_0001 | 0x0000_0002,
+        data: LPARAM(0),
+        hook: None,
+        template: PCWSTR::null(),
+    };
+    unsafe {
+        ChooseColorW(&mut dialog).as_bool().then(|| {
+            Color::new(
+                (dialog.result & 0xFF) as u8,
+                ((dialog.result >> 8) & 0xFF) as u8,
+                ((dialog.result >> 16) & 0xFF) as u8,
+            )
+        })
+    }
+}
+
+fn is_context_setting(id: u16) -> bool {
+    matches!(
+        id,
+        IDM_FREQ_1MIN
+            | IDM_FREQ_5MIN
+            | IDM_FREQ_15MIN
+            | IDM_FREQ_1HOUR
+            | IDM_ADAPTIVE_REFRESH
+            | IDM_START_WITH_WINDOWS
+            | IDM_RESET_POSITION
+            | IDM_ANCHOR_LEFT
+            | IDM_LANG_SYSTEM..=IDM_LANG_SIMPLIFIED_CHINESE
+            | IDM_MODEL_CLAUDE_CODE..=IDM_MODEL_ANTIGRAVITY
+            | IDM_SHOW_SESSION_WINDOW
+            | IDM_SHOW_WEEKLY_WINDOW
+            | IDM_ALERT_OFF..=IDM_ALERT_30
+            | IDM_PALETTE_SYSTEM..=IDM_FONT_LARGE
+            | IDM_APPEARANCE_RECOMMENDED..=IDM_COLOR_RESET
+    ) || (IDM_MONITOR_FIRST..IDM_MONITOR_FIRST + MAX_MONITOR_MENU_ITEMS as u16).contains(&id)
+}
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
@@ -360,8 +429,8 @@ enum BarStyle {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BarThickness {
-    #[default]
     Standard,
+    #[default]
     Slim,
 }
 
@@ -380,6 +449,10 @@ struct Appearance {
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_accent: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_accent: Option<[u8; 3]>,
 }
 
 impl Appearance {
@@ -389,6 +462,8 @@ impl Appearance {
             bar_style: BarStyle::Continuous,
             bar_thickness: BarThickness::Slim,
             font_size: FontSize::Large,
+            claude_accent: None,
+            codex_accent: None,
         }
     }
     fn is_dark(self, system_is_dark: bool) -> bool {
@@ -1210,6 +1285,112 @@ fn show_error_message(hwnd: HWND, title: &str, message: &str) {
     }
 }
 
+fn confirm_and_begin_uninstall(hwnd: HWND) {
+    let language = lock_state()
+        .as_ref()
+        .map(|state| state.language)
+        .unwrap_or(LanguageId::English);
+    let chinese = language == LanguageId::SimplifiedChinese;
+    let kind = crate::uninstaller::uninstall_kind();
+    if kind == crate::uninstaller::UninstallKind::Winget {
+        show_info_message(
+            hwnd,
+            if chinese {
+                "卸载 Codex Usage"
+            } else {
+                "Uninstall Codex Usage"
+            },
+            if chinese {
+                "请使用以下命令卸载 Codex Usage：\n\nwinget uninstall --id rozsazoltan.codexusage --exact"
+            } else {
+                "To uninstall Codex Usage, run this command:\n\nwinget uninstall --id rozsazoltan.codexusage --exact"
+            },
+        );
+        return;
+    }
+    let kind_name = match kind {
+        crate::uninstaller::UninstallKind::Managed => {
+            if chinese {
+                "托管安装"
+            } else {
+                "managed installation"
+            }
+        }
+        crate::uninstaller::UninstallKind::Portable => {
+            if chinese {
+                "便携版"
+            } else {
+                "portable copy"
+            }
+        }
+        crate::uninstaller::UninstallKind::Winget => {
+            if chinese {
+                "winget 安装"
+            } else {
+                "winget installation"
+            }
+        }
+    };
+    let title = if chinese {
+        "卸载 Codex Usage"
+    } else {
+        "Uninstall Codex Usage"
+    };
+    let prompt = if chinese {
+        format!("确定卸载 Codex Usage？\n\n检测到：{kind_name}。此操作无法撤销。")
+    } else {
+        format!("Uninstall Codex Usage?\n\nDetected: {kind_name}. This action cannot be undone.")
+    };
+    let (title_wide, prompt_wide) = (
+        native_interop::wide_str(title),
+        native_interop::wide_str(&prompt),
+    );
+    let accepted = unsafe {
+        MessageBoxW(
+            hwnd,
+            PCWSTR::from_raw(prompt_wide.as_ptr()),
+            PCWSTR::from_raw(title_wide.as_ptr()),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        ) == IDYES
+    };
+    if !accepted {
+        return;
+    }
+
+    let settings_prompt = if chinese {
+        "同时删除保存的设置？\n\n默认保留设置。选择“是”删除设置，“否”保留设置，“取消”中止卸载。"
+    } else {
+        "Also remove saved settings?\n\nSettings are preserved by default. Choose Yes to remove settings, No to keep them, or Cancel to abort uninstall."
+    };
+    let (settings_title, settings_prompt_wide) = (
+        native_interop::wide_str(title),
+        native_interop::wide_str(settings_prompt),
+    );
+    let choice = unsafe {
+        MessageBoxW(
+            hwnd,
+            PCWSTR::from_raw(settings_prompt_wide.as_ptr()),
+            PCWSTR::from_raw(settings_title.as_ptr()),
+            MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    };
+    if choice == IDCANCEL {
+        return;
+    }
+
+    if let Err(error) = crate::uninstaller::begin_uninstall(choice == IDYES) {
+        show_error_message(
+            hwnd,
+            if chinese {
+                "卸载失败"
+            } else {
+                "Uninstall failed"
+            },
+            &error,
+        );
+    }
+}
+
 fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor) -> bool {
     let message = strings
         .update_prompt_now
@@ -1811,6 +1992,12 @@ fn claude_accent_color() -> Color {
     Color::from_hex("#D97757")
 }
 
+fn custom_color(color: Option<[u8; 3]>, fallback: Color) -> Color {
+    color
+        .map(|[r, g, b]| Color::new(r, g, b))
+        .unwrap_or(fallback)
+}
+
 fn appearance_colors(appearance: Appearance, system_is_dark: bool) -> (Color, Color, Color) {
     match appearance.palette {
         Palette::System if system_is_dark => (
@@ -2291,9 +2478,12 @@ fn render_layered() {
         return;
     }
 
-    let accent = claude_accent_color();
+    let accent = custom_color(appearance.claude_accent, claude_accent_color());
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = custom_color(
+        appearance.codex_accent,
+        provider_icons::codex_color(appearance.is_dark(is_dark)),
+    );
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -2520,9 +2710,13 @@ fn paint_content(
         let font = create_widget_font(appearance);
         let old_font = SelectObject(hdc, font);
 
-        // One provider mark per column, centered across the visible quota rows.
+        // Anchor provider marks to first row instead of floating at widget center.
         let icon_size = sc(provider_icons::SIZE);
-        let icon_y = (height - icon_size) / 2;
+        let icon_y = if show_session_window {
+            row1_y + (appearance.row_height() - icon_size) / 2
+        } else {
+            single_row_y + (appearance.row_height() - icon_size) / 2
+        };
         let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
         let model_width = model_usage_width(row_bar_segment_count(active_models), text_width)
             + sc(MODEL_RIGHT_MARGIN);
@@ -3190,6 +3384,10 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
+                TIMER_REOPEN_CONTEXT_MENU => {
+                    let _ = KillTimer(hwnd, TIMER_REOPEN_CONTEXT_MENU);
+                    show_context_menu(hwnd);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -3445,6 +3643,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                 }
+                IDM_UNINSTALL => confirm_and_begin_uninstall(hwnd),
                 2 => {
                     let hook = {
                         let state = lock_state();
@@ -3565,6 +3764,52 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     render_layered();
                     sync_tray_icons(hwnd);
+                }
+                IDM_COLOR_CLAUDE | IDM_COLOR_CODEX | IDM_COLOR_RESET => {
+                    if id == IDM_COLOR_RESET {
+                        if let Some(s) = lock_state().as_mut() {
+                            s.appearance.claude_accent = None;
+                            s.appearance.codex_accent = None;
+                        }
+                    } else {
+                        let initial = {
+                            let state = lock_state();
+                            let Some(s) = state.as_ref() else {
+                                return LRESULT(0);
+                            };
+                            if id == IDM_COLOR_CLAUDE {
+                                custom_color(s.appearance.claude_accent, claude_accent_color())
+                            } else {
+                                custom_color(
+                                    s.appearance.codex_accent,
+                                    provider_icons::codex_color(s.appearance.is_dark(s.is_dark)),
+                                )
+                            }
+                        };
+                        if let Some(color) = choose_accent_color(hwnd, initial) {
+                            if let Some(s) = lock_state().as_mut() {
+                                let value = Some([color.r, color.g, color.b]);
+                                if id == IDM_COLOR_CLAUDE {
+                                    s.appearance.claude_accent = value;
+                                } else {
+                                    s.appearance.codex_accent = value;
+                                }
+                            }
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
+                IDM_ABOUT_STAR => {
+                    let repository = native_interop::wide_str(env!("CARGO_PKG_REPOSITORY"));
+                    let _ = ShellExecuteW(
+                        hwnd,
+                        PCWSTR::null(),
+                        PCWSTR::from_raw(repository.as_ptr()),
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                        SW_SHOWNORMAL,
+                    );
                 }
                 IDM_APPEARANCE_RECOMMENDED
                 | IDM_APPEARANCE_RESET
@@ -3719,6 +3964,11 @@ unsafe extern "system" fn wnd_proc(
                 }
                 _ => {}
             }
+            if is_context_setting(id) {
+                // Native popup menus dismiss after WM_COMMAND. Reopen after its
+                // modal loop exits so users can adjust more than one setting.
+                SetTimer(hwnd, TIMER_REOPEN_CONTEXT_MENU, 100, None);
+            }
             LRESULT(0)
         }
         _ if msg == WM_APP_TRAY => {
@@ -3834,6 +4084,7 @@ fn show_context_menu(hwnd: HWND) {
         };
 
         let menu = CreatePopupMenu().unwrap();
+        let settings_menu = CreatePopupMenu().unwrap();
 
         let refresh_str = native_interop::wide_str(strings.refresh);
         let _ = AppendMenuW(
@@ -3886,11 +4137,12 @@ fn show_context_menu(hwnd: HWND) {
         );
         let freq_label = native_interop::wide_str(strings.update_frequency);
         let _ = AppendMenuW(
-            menu,
+            settings_menu,
             MF_POPUP,
             freq_menu.0 as usize,
             PCWSTR::from_raw(freq_label.as_ptr()),
         );
+        let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         // Models submenu
         let models_menu = CreatePopupMenu().unwrap();
@@ -4014,9 +4266,8 @@ fn show_context_menu(hwnd: HWND) {
             },
         );
         let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let palette_menu = CreatePopupMenu().unwrap();
         append_appearance_choice(
-            palette_menu,
+            appearance_menu,
             IDM_PALETTE_SYSTEM,
             appearance.palette == Palette::System,
             if chinese {
@@ -4026,7 +4277,7 @@ fn show_context_menu(hwnd: HWND) {
             },
         );
         append_appearance_choice(
-            palette_menu,
+            appearance_menu,
             IDM_PALETTE_DARK,
             appearance.palette == Palette::HighContrastDark,
             if chinese {
@@ -4036,7 +4287,7 @@ fn show_context_menu(hwnd: HWND) {
             },
         );
         append_appearance_choice(
-            palette_menu,
+            appearance_menu,
             IDM_PALETTE_LIGHT,
             appearance.palette == Palette::HighContrastLight,
             if chinese {
@@ -4045,19 +4296,40 @@ fn show_context_menu(hwnd: HWND) {
                 "High contrast light"
             },
         );
-        append_appearance_submenu(
+        let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        append_appearance_choice(
             appearance_menu,
-            palette_menu,
+            IDM_COLOR_CLAUDE,
+            false,
             if chinese {
-                "文字与颜色"
+                "自定义 Claude 颜色…"
             } else {
-                "Text and colors"
+                "Custom Claude color…"
             },
         );
-
-        let style_menu = CreatePopupMenu().unwrap();
         append_appearance_choice(
-            style_menu,
+            appearance_menu,
+            IDM_COLOR_CODEX,
+            false,
+            if chinese {
+                "自定义 Codex 颜色…"
+            } else {
+                "Custom Codex color…"
+            },
+        );
+        append_appearance_choice(
+            appearance_menu,
+            IDM_COLOR_RESET,
+            false,
+            if chinese {
+                "恢复品牌颜色"
+            } else {
+                "Reset provider colors"
+            },
+        );
+        let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        append_appearance_choice(
+            appearance_menu,
             IDM_BAR_CONTINUOUS,
             appearance.bar_style == BarStyle::Continuous,
             if chinese {
@@ -4067,67 +4339,43 @@ fn show_context_menu(hwnd: HWND) {
             },
         );
         append_appearance_choice(
-            style_menu,
+            appearance_menu,
             IDM_BAR_SEGMENTED,
             appearance.bar_style == BarStyle::Segmented,
             if chinese { "分段" } else { "Segmented" },
         );
-        append_appearance_submenu(
-            appearance_menu,
-            style_menu,
-            if chinese {
-                "进度条样式"
-            } else {
-                "Bar style"
-            },
-        );
-
-        let thickness_menu = CreatePopupMenu().unwrap();
+        let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
         append_appearance_choice(
-            thickness_menu,
+            appearance_menu,
             IDM_BAR_STANDARD,
             appearance.bar_thickness == BarThickness::Standard,
             if chinese { "标准" } else { "Standard" },
         );
         append_appearance_choice(
-            thickness_menu,
+            appearance_menu,
             IDM_BAR_SLIM,
             appearance.bar_thickness == BarThickness::Slim,
             if chinese { "细" } else { "Slim" },
         );
-        append_appearance_submenu(
-            appearance_menu,
-            thickness_menu,
-            if chinese {
-                "进度条粗细"
-            } else {
-                "Bar thickness"
-            },
-        );
-
-        let font_menu = CreatePopupMenu().unwrap();
+        let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
         append_appearance_choice(
-            font_menu,
+            appearance_menu,
             IDM_FONT_STANDARD,
             appearance.font_size == FontSize::Standard,
             if chinese { "标准" } else { "Standard" },
         );
         append_appearance_choice(
-            font_menu,
+            appearance_menu,
             IDM_FONT_LARGE,
             appearance.font_size == FontSize::Large,
             if chinese { "较大" } else { "Larger" },
         );
         append_appearance_submenu(
-            appearance_menu,
-            font_menu,
-            if chinese { "文字大小" } else { "Text size" },
-        );
-        append_appearance_submenu(
-            menu,
+            settings_menu,
             appearance_menu,
             if chinese { "外观" } else { "Appearance" },
         );
+        let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         // Low-quota alert threshold submenu. Zero means opt-out.
         let alert_menu = CreatePopupMenu().unwrap();
@@ -4189,14 +4437,12 @@ fn show_context_menu(hwnd: HWND) {
             "Quota alerts"
         });
         let _ = AppendMenuW(
-            menu,
+            settings_menu,
             MF_POPUP,
             alert_menu.0 as usize,
             PCWSTR::from_raw(alert_label.as_ptr()),
         );
-
-        // Settings submenu
-        let settings_menu = CreatePopupMenu().unwrap();
+        let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let startup_str = native_interop::wide_str(strings.start_with_windows);
         let startup_flags = if is_startup_enabled() {
@@ -4275,6 +4521,7 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label.as_ptr()),
             );
         }
+        let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let language_menu = CreatePopupMenu().unwrap();
         let system_label = native_interop::wide_str(strings.system_default);
@@ -4347,9 +4594,10 @@ fn show_context_menu(hwnd: HWND) {
         );
 
         let settings_label = native_interop::wide_str(strings.settings);
-        let _ = AppendMenuW(
+        let _ = InsertMenuW(
             menu,
-            MF_POPUP,
+            1,
+            MF_BYPOSITION | MF_POPUP,
             settings_menu.0 as usize,
             PCWSTR::from_raw(settings_label.as_ptr()),
         );
@@ -4367,6 +4615,44 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(widget_label.as_ptr()),
         );
 
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let about_menu = CreatePopupMenu().unwrap();
+        let star_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+            "如果觉得 Codex Usage 有用，欢迎在 GitHub 点星支持"
+        } else {
+            "If Codex Usage helps, please star it on GitHub"
+        });
+        let _ = AppendMenuW(
+            about_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_ABOUT_STAR as usize,
+            PCWSTR::from_raw(star_label.as_ptr()),
+        );
+        let about_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+            "关于"
+        } else {
+            "About"
+        });
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            about_menu.0 as usize,
+            PCWSTR::from_raw(about_label.as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let uninstall_label =
+            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+                "卸载…"
+            } else {
+                "Uninstall…"
+            });
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_UNINSTALL as usize,
+            PCWSTR::from_raw(uninstall_label.as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let exit_str = native_interop::wide_str(strings.exit);
@@ -4439,9 +4725,12 @@ fn paint(hdc: HDC, hwnd: HWND) {
         }
     };
 
-    let accent = claude_accent_color();
+    let accent = custom_color(appearance.claude_accent, claude_accent_color());
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = custom_color(
+        appearance.codex_accent,
+        provider_icons::codex_color(appearance.is_dark(is_dark)),
+    );
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -4687,52 +4976,160 @@ fn draw_usage_bar(
 }
 
 fn fill_rounded_bar(hdc: HDC, rect: &RECT, fraction: f64, color: &Color, radius: i32) {
-    let width = ((rect.right - rect.left) as f64 * fraction).round() as i32;
-    if width <= 0 {
-        return;
-    }
-    unsafe {
-        let clip = CreateRoundRectRgn(
-            rect.left,
-            rect.top,
-            rect.right + 1,
-            rect.bottom + 1,
-            radius * 2,
-            radius * 2,
-        );
-        let _ = SelectClipRgn(hdc, clip);
-        let fill = RECT {
-            right: rect.left + width,
-            ..*rect
-        };
-        let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
-        FillRect(hdc, &fill, brush);
-        let _ = DeleteObject(brush);
-        let _ = SelectClipRgn(hdc, HRGN::default());
-        let _ = DeleteObject(clip);
-    }
+    draw_rounded_shape(hdc, rect, color, radius, fraction);
 }
 
 fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
+    draw_rounded_shape(hdc, rect, color, radius, 1.0);
+}
+
+/// Supersample small bar shapes so their rounded ends stay smooth at taskbar scale.
+fn draw_rounded_shape(hdc: HDC, rect: &RECT, color: &Color, radius: i32, fraction: f64) {
+    const SCALE: i32 = 4;
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let scaled_width = width * SCALE;
+    let scaled_height = height * SCALE;
+    let scaled_fill_width = (scaled_width as f64 * fraction.clamp(0.0, 1.0)).round() as i32;
+    if scaled_fill_width <= 0 {
+        return;
+    }
     unsafe {
-        let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
-        let rgn = CreateRoundRectRgn(
+        let memory_dc = CreateCompatibleDC(hdc);
+        if memory_dc.is_invalid() {
+            return;
+        }
+        let bitmap = CreateCompatibleBitmap(hdc, width * SCALE, height * SCALE);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(memory_dc);
+            return;
+        }
+        let old_bitmap = SelectObject(memory_dc, bitmap);
+        let _ = SetStretchBltMode(memory_dc, HALFTONE);
+        let _ = StretchBlt(
+            memory_dc,
+            0,
+            0,
+            scaled_width,
+            scaled_height,
+            hdc,
             rect.left,
             rect.top,
-            rect.right + 1,
-            rect.bottom + 1,
-            radius * 2,
-            radius * 2,
+            width,
+            height,
+            SRCCOPY,
         );
-        let _ = FillRgn(hdc, rgn, brush);
+        let cap_diameter = (radius * 2 * SCALE)
+            .min(scaled_fill_width)
+            .min(scaled_height);
+        let rgn = CreateRoundRectRgn(
+            0,
+            0,
+            scaled_fill_width + 1,
+            scaled_height + 1,
+            cap_diameter,
+            cap_diameter,
+        );
+        let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+        let _ = FillRgn(memory_dc, rgn, brush);
+        let _ = SetStretchBltMode(hdc, HALFTONE);
+        let _ = StretchBlt(
+            hdc,
+            rect.left,
+            rect.top,
+            width,
+            height,
+            memory_dc,
+            0,
+            0,
+            scaled_width,
+            scaled_height,
+            SRCCOPY,
+        );
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+        SelectObject(memory_dc, old_bitmap);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(memory_dc);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_setting_ids_reopen_the_menu_without_matching_actions() {
+        for id in [
+            IDM_FREQ_1MIN,
+            IDM_FREQ_5MIN,
+            IDM_FREQ_15MIN,
+            IDM_FREQ_1HOUR,
+            IDM_ADAPTIVE_REFRESH,
+            IDM_START_WITH_WINDOWS,
+            IDM_RESET_POSITION,
+            IDM_ANCHOR_LEFT,
+            IDM_LANG_SYSTEM,
+            IDM_LANG_ENGLISH,
+            IDM_LANG_DUTCH,
+            IDM_LANG_SPANISH,
+            IDM_LANG_FRENCH,
+            IDM_LANG_GERMAN,
+            IDM_LANG_JAPANESE,
+            IDM_LANG_KOREAN,
+            IDM_LANG_TRADITIONAL_CHINESE,
+            IDM_LANG_RUSSIAN,
+            IDM_LANG_PORTUGUESE_BRAZIL,
+            IDM_LANG_SIMPLIFIED_CHINESE,
+            IDM_MODEL_CLAUDE_CODE,
+            IDM_MODEL_CODEX,
+            IDM_MODEL_ANTIGRAVITY,
+            IDM_SHOW_SESSION_WINDOW,
+            IDM_SHOW_WEEKLY_WINDOW,
+            IDM_ALERT_OFF,
+            IDM_ALERT_10,
+            IDM_ALERT_20,
+            IDM_ALERT_30,
+            IDM_PALETTE_SYSTEM,
+            IDM_PALETTE_DARK,
+            IDM_PALETTE_LIGHT,
+            IDM_BAR_CONTINUOUS,
+            IDM_BAR_SEGMENTED,
+            IDM_BAR_STANDARD,
+            IDM_BAR_SLIM,
+            IDM_FONT_STANDARD,
+            IDM_FONT_LARGE,
+            IDM_APPEARANCE_RECOMMENDED,
+            IDM_APPEARANCE_RESET,
+            IDM_COLOR_CLAUDE,
+            IDM_COLOR_CODEX,
+            IDM_COLOR_RESET,
+            IDM_MONITOR_FIRST,
+            IDM_MONITOR_FIRST + MAX_MONITOR_MENU_ITEMS as u16 - 1,
+        ] {
+            assert!(
+                is_context_setting(id),
+                "setting ID {id} must reopen the menu"
+            );
+        }
+
+        for id in [
+            IDM_VERSION_ACTION,
+            IDM_ABOUT_STAR,
+            IDM_UNINSTALL,
+            52,
+            63,
+            106,
+        ] {
+            assert!(
+                !is_context_setting(id),
+                "action ID {id} must not reopen the menu"
+            );
+        }
+    }
 
     #[test]
     fn unavailable_quota_has_no_bar_fill() {
@@ -4844,6 +5241,7 @@ mod tests {
     fn appearance_settings_preserve_legacy_defaults_and_round_trip() {
         let old: SettingsFile = serde_json::from_str(&test_settings_json("zh-CN")).unwrap();
         assert_eq!(old.appearance, Appearance::default());
+        assert_eq!(old.appearance.bar_thickness, BarThickness::Slim);
         assert_eq!(old.monitor_device, None);
 
         let customized = SettingsFile {
@@ -4854,6 +5252,23 @@ mod tests {
         let json = serde_json::to_string(&customized).unwrap();
         let restored: SettingsFile = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.appearance, Appearance::translucent_dark_taskbar());
+    }
+
+    #[test]
+    fn custom_provider_colors_survive_settings_round_trip() {
+        let settings = SettingsFile {
+            appearance: Appearance {
+                claude_accent: Some([0xD9, 0x77, 0x57]),
+                codex_accent: Some([0x34, 0xD3, 0x99]),
+                ..Appearance::default()
+            },
+            ..SettingsFile::default()
+        };
+        let serialized = serde_json::to_string(&settings).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(restored.appearance.claude_accent, Some([0xD9, 0x77, 0x57]));
+        assert_eq!(restored.appearance.codex_accent, Some([0x34, 0xD3, 0x99]));
     }
 
     #[test]
@@ -5054,18 +5469,6 @@ mod tests {
             resets_at: Some(first_reset),
         };
 
-        append_quota_alert(
-            &mut alerts,
-            &mut notified,
-            20,
-            LanguageId::SimplifiedChinese,
-            tray_icon::TrayIconKind::Codex,
-            "codex",
-            "Codex",
-            "session",
-            "5小时",
-            &first,
-        );
         append_quota_alert(
             &mut alerts,
             &mut notified,

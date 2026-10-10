@@ -5,12 +5,16 @@
 //! Duplex byte pipe: u32 little-endian byte length followed by UTF-8 JSON,
 //! 1..=65536 bytes. The server restricts access to the current token user,
 //! rejects remote clients, and checks the client PID against the spawned child.
-//! Requests: {"v":1,"id":42,"op":"get"}, or op="set" with "key" and
-//! "value", or op="action" with "action". Unknown fields/keys are rejected.
+//! Requests: {"v":1,"id":42,"op":"get"}, op="set" with "key" and
+//! "value", op="set_batch" with a sparse "changes" array (at most 20
+//! distinct settings), op="persist" to retry saving already-applied settings,
+//! or op="action" with "action". Unknown fields/keys are rejected.
 //! IDs are unsigned 32-bit integers. Send one request at a time.
 //! Replies: {"v":1,"id":42,"ok":true,"revision":N,"state":{...}} or
-//! {"v":1,"id":42,"ok":false,"revision":N,"state":{...},"error":"..."}.
-//! Errors include effective state: a save failure does not undo a live change.
+//! {"v":1,"id":42,"ok":false,"revision":N,"state":{...},"error":"...",
+//! "error_code":"save_failed"}.
+//! Errors include effective state: a save failure does not undo a live change
+//! and is reported with error_code="save_failed". Retry persistence with op="persist".
 //! Events: {"v":1,"event":"state","revision":N,"state":{...}},
 //! {"v":1,"event":"activate","page":"about"}, {"v":1,"event":"shutdown"}.
 //! Read continuously, including before sending get. EOF/shutdown/parent death
@@ -19,14 +23,16 @@
 //! Connection deadline: 15 seconds. Shutdown grace: 500ms, then terminate child.
 //!
 //! Set keys (snake_case): language ("system" or supported language code),
-//! startup, widget_visible, show_claude_code, show_codex, show_antigravity,
+//! startup, widget_visible, show_tray_icon, show_provider_icons,
+//! show_claude_code, show_codex, show_antigravity,
 //! show_session_window, show_weekly_window, adaptive_refresh, anchor_left
 //! (booleans); poll_interval_ms (60000..=3600000 integer),
 //! alert_threshold_percent (0|10|20|30); palette
 //! (system|high_contrast_dark|high_contrast_light), bar_style
 //! (continuous|segmented), bar_thickness (standard|slim), font_size
 //! (standard|large), claude_accent/codex_accent (null or [u8,u8,u8]),
-//! monitor_device (a device string present in state.monitors).
+//! monitor_device (null for automatic/primary selection, or a device string
+//! present in state.monitors).
 //! Actions: refresh, update, uninstall, repository, exit, recommended,
 //! reset_appearance, reset_colors, reset_position. URLs/paths/commands cannot
 //! be supplied. Update/uninstall retain the widget's confirmation flows.
@@ -59,6 +65,7 @@ use std::time::{Duration, Instant};
 
 pub const WM_SETTINGS: u32 = 0x8000 + 20;
 const MAX_FRAME: usize = 65_536;
+pub const MAX_BATCH_CHANGES: usize = 20;
 
 #[derive(Clone, Copy, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +82,8 @@ pub enum Page {
 pub enum Operation {
     Get,
     Set { key: Key, value: Value },
+    SetBatch { changes: Vec<Change> },
+    Persist,
     Action { action: Action },
 }
 
@@ -86,12 +95,14 @@ pub struct Request {
     pub operation: Operation,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Key {
     Language,
     Startup,
     WidgetVisible,
+    ShowTrayIcon,
+    ShowProviderIcons,
     ShowClaudeCode,
     ShowCodex,
     ShowAntigravity,
@@ -108,6 +119,13 @@ pub enum Key {
     CodexAccent,
     MonitorDevice,
     AnchorLeft,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Change {
+    pub key: Key,
+    pub value: Value,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -341,6 +359,15 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
             key: Key,
             value: Value,
         },
+        SetBatch {
+            v: u32,
+            id: u32,
+            changes: Vec<Change>,
+        },
+        Persist {
+            v: u32,
+            id: u32,
+        },
         Action {
             v: u32,
             id: u32,
@@ -358,6 +385,23 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
             v,
             id,
             operation: Operation::Set { key, value },
+        },
+        WireRequest::SetBatch { v, id, changes } => {
+            if changes.len() > MAX_BATCH_CHANGES {
+                return Err(format!(
+                    "A settings batch may contain at most {MAX_BATCH_CHANGES} changes"
+                ));
+            }
+            Request {
+                v,
+                id,
+                operation: Operation::SetBatch { changes },
+            }
+        }
+        WireRequest::Persist { v, id } => Request {
+            v,
+            id,
+            operation: Operation::Persist,
         },
         WireRequest::Action { v, id, action } => Request {
             v,
@@ -771,16 +815,34 @@ mod tests {
     #[test]
     fn strict_requests() {
         assert!(parse_request(br#"{"v":1,"id":1,"op":"get"}"#).is_ok());
+        assert!(parse_request(
+            br#"{"v":1,"id":1,"op":"set_batch","changes":[{"key":"show_codex","value":false}]}"#
+        )
+        .is_ok());
+        assert!(parse_request(
+            br#"{"v":1,"id":2,"op":"set_batch","changes":[{"key":"show_tray_icon","value":false},{"key":"show_provider_icons","value":false},{"key":"claude_accent","value":null}]}"#
+        )
+        .is_ok());
+        assert!(parse_request(br#"{"v":1,"id":1,"op":"persist"}"#).is_ok());
         for input in [
             r#"{"v":2,"id":1,"op":"get"}"#,
             r#"{"v":1,"id":1,"op":"get","path":"x"}"#,
             r#"{"v":1,"id":1,"op":"action","action":"shell"}"#,
             r#"{"v":1,"id":1,"op":"set","key":"path","value":"x"}"#,
+            r#"{"v":1,"id":1,"op":"set_batch","changes":[{"key":"show_codex","value":false,"extra":true}]}"#,
+            r#"{"v":1,"id":1,"op":"set_batch","changes":[],"extra":true}"#,
         ] {
             assert!(parse_request(input.as_bytes()).is_err(), "{input}");
         }
         assert!(parse_request(&vec![b' '; MAX_FRAME + 1]).is_err());
         assert!(parse_request(&[0xff]).is_err());
+        let too_many = json!({
+            "v": 1,
+            "id": 1,
+            "op": "set_batch",
+            "changes": (0..=MAX_BATCH_CHANGES).map(|_| json!({"key":"show_codex","value":true})).collect::<Vec<_>>()
+        });
+        assert!(parse_request(&serde_json::to_vec(&too_many).unwrap()).is_err());
     }
     #[test]
     fn little_endian_framing() {

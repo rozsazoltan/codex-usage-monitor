@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -55,6 +55,7 @@ impl SendHwnd {
 /// Shared application state
 struct AppState {
     hwnd: SendHwnd,
+    taskbar_broadcast_hwnd: Option<HWND>,
     taskbar_hwnd: Option<HWND>,
     tray_notify_hwnd: Option<HWND>,
     win_event_hook: Option<HWINEVENTHOOK>,
@@ -81,6 +82,8 @@ struct AppState {
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_tray_icon: bool,
+    show_provider_icons: bool,
     show_session_window: bool,
     show_weekly_window: bool,
     alert_threshold_percent: u8,
@@ -177,6 +180,7 @@ const IDM_APPEARANCE_PAGE: u16 = 107;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+const WM_APP_TASKBAR_CREATED: u32 = WM_APP + 4;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -501,6 +505,10 @@ struct SettingsFile {
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
     widget_visible: bool,
+    #[serde(default = "default_show_tray_icon")]
+    show_tray_icon: bool,
+    #[serde(default = "default_show_provider_icons")]
+    show_provider_icons: bool,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
@@ -530,6 +538,8 @@ impl Default for SettingsFile {
             appearance: Appearance::default(),
             last_update_check_unix: None,
             widget_visible: true,
+            show_tray_icon: default_show_tray_icon(),
+            show_provider_icons: default_show_provider_icons(),
             show_claude_code: false,
             show_codex: true,
             show_antigravity: false,
@@ -550,6 +560,14 @@ fn default_poll_interval() -> u32 {
 }
 
 fn default_widget_visible() -> bool {
+    true
+}
+
+fn default_show_tray_icon() -> bool {
+    true
+}
+
+fn default_show_provider_icons() -> bool {
     true
 }
 
@@ -648,7 +666,23 @@ fn save_settings(settings: &SettingsFile) {
 }
 
 fn save_state_settings() {
-    let result = settings_store::save(&settings_path(), || {
+    if let Err(error) = persist_state_settings() {
+        SETTINGS_SAVE_ERROR.with(|slot| *slot.borrow_mut() = Some(error.clone()));
+    }
+    if let Some(s) = lock_state().as_ref() {
+        unsafe {
+            let _ = PostMessageW(
+                s.hwnd.to_hwnd(),
+                settings_ui::WM_SETTINGS,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+fn persist_state_settings() -> Result<(), String> {
+    settings_store::save(&settings_path(), || {
         let state = lock_state();
         state.as_ref().map(|s| SettingsFile {
             tray_offset: s.tray_offset,
@@ -663,6 +697,8 @@ fn save_state_settings() {
             appearance: s.appearance,
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
+            show_tray_icon: s.show_tray_icon,
+            show_provider_icons: s.show_provider_icons,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
@@ -671,25 +707,11 @@ fn save_state_settings() {
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
         })
-    });
-    if let Err(error) = result {
-        SETTINGS_SAVE_ERROR.with(|slot| {
-            *slot.borrow_mut() = Some(format!(
-                "The setting was applied but could not be saved: {error}"
-            ))
-        });
-        diagnose::log_error("unable to save settings", error);
-    }
-    if let Some(s) = lock_state().as_ref() {
-        unsafe {
-            let _ = PostMessageW(
-                s.hwnd.to_hwnd(),
-                settings_ui::WM_SETTINGS,
-                WPARAM(0),
-                LPARAM(0),
-            );
-        }
-    }
+    })
+    .map_err(|error| {
+        diagnose::log_error("unable to save settings", &error);
+        format!("The setting was applied but could not be saved: {error}")
+    })
 }
 
 thread_local! {
@@ -934,8 +956,20 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
 }
 
 fn sync_tray_icons(hwnd: HWND) {
-    let icon = tray_icon_data_from_state();
+    let enabled = lock_state()
+        .as_ref()
+        .map(|state| state.show_tray_icon)
+        .unwrap_or(false);
+    let icon = enabled.then(tray_icon_data_from_state).flatten();
     tray_icon::sync(hwnd, icon.as_ref());
+}
+
+fn taskbar_created_message() -> u32 {
+    static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TASKBAR_CREATED.get_or_init(|| {
+        let name = native_interop::wide_str("TaskbarCreated");
+        unsafe { RegisterWindowMessageW(PCWSTR::from_raw(name.as_ptr())) }
+    })
 }
 
 fn toggle_widget_visibility(hwnd: HWND) {
@@ -960,14 +994,76 @@ fn toggle_widget_visibility(hwnd: HWND) {
     }
 }
 
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
+#[derive(Clone, Debug)]
+enum TaskbarTarget {
+    MonitorDevice(String),
+    Primary,
+    LegacyIndex(usize),
+}
+
+fn taskbar_target_for_index(
+    taskbars: &[native_interop::TaskbarWindow],
+    index: usize,
+) -> TaskbarTarget {
+    taskbars
+        .get(index)
+        .map(|taskbar| taskbar_target_for_window(taskbar, index))
+        .unwrap_or(TaskbarTarget::LegacyIndex(index))
+}
+
+fn taskbar_target_for_window(
+    taskbar: &native_interop::TaskbarWindow,
+    fallback_index: usize,
+) -> TaskbarTarget {
+    native_interop::taskbar_monitor_device(taskbar)
+        .map(TaskbarTarget::MonitorDevice)
+        .unwrap_or(TaskbarTarget::LegacyIndex(fallback_index))
+}
+
+fn automatic_taskbar_index(taskbars: &[native_interop::TaskbarWindow]) -> usize {
+    taskbars
+        .iter()
+        .position(|taskbar| taskbar.is_primary)
+        .unwrap_or(0)
+}
+
+fn preferred_taskbar_target(
+    taskbars: &[native_interop::TaskbarWindow],
+    monitor_device: Option<&str>,
+    legacy_index: usize,
+) -> TaskbarTarget {
+    taskbar_target_for_index(
+        taskbars,
+        preferred_taskbar_index(taskbars, monitor_device, legacy_index),
+    )
+}
+
+fn attach_to_taskbar(hwnd: HWND, target: TaskbarTarget) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
         diagnose::log("taskbar not found; using fallback popup window");
         return false;
     }
 
-    let index = requested_index.min(taskbars.len().saturating_sub(1));
+    let index = match &target {
+        TaskbarTarget::MonitorDevice(device) => {
+            let Some(index) = native_interop::taskbar_index_for_monitor_device(
+                &taskbars,
+                device,
+                native_interop::taskbar_monitor_device,
+            ) else {
+                diagnose::log(format!(
+                    "taskbar monitor device no longer available: {device}"
+                ));
+                return false;
+            };
+            index
+        }
+        TaskbarTarget::Primary => automatic_taskbar_index(&taskbars),
+        TaskbarTarget::LegacyIndex(requested_index) => {
+            (*requested_index).min(taskbars.len().saturating_sub(1))
+        }
+    };
     let taskbar = taskbars[index];
     diagnose::log(format!(
         "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
@@ -1048,9 +1144,10 @@ fn refresh_taskbar_selection(hwnd: HWND) {
         let Some(s) = state.as_ref() else { return };
         (s.monitor_device.clone(), s.taskbar_index, s.taskbar_hwnd)
     };
+    let target = preferred_taskbar_target(&taskbars, preferred.as_deref(), legacy_index);
     let index = preferred_taskbar_index(&taskbars, preferred.as_deref(), legacy_index);
     if current != Some(taskbars[index].hwnd) {
-        attach_to_taskbar(hwnd, index);
+        attach_to_taskbar(hwnd, target);
     }
 }
 
@@ -1778,6 +1875,15 @@ fn set_startup_enabled(enable: bool) {
     }
 }
 
+fn restore_startup_registration(enabled: bool) -> bool {
+    set_startup_enabled(enabled);
+    let restored = is_startup_enabled() == enabled;
+    if !restored {
+        diagnose::log("failed to restore the previous Windows startup registration");
+    }
+    restored
+}
+
 // Dimensions matching the C# version
 const SEGMENT_W: i32 = 10;
 const SEGMENT_H: i32 = 13;
@@ -2168,6 +2274,7 @@ pub fn run() {
             let mut state = lock_state();
             *state = Some(AppState {
                 hwnd: SendHwnd::from_hwnd(hwnd),
+                taskbar_broadcast_hwnd: None,
                 taskbar_hwnd: None,
                 tray_notify_hwnd: None,
                 win_event_hook: None,
@@ -2193,6 +2300,8 @@ pub fn run() {
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
+                show_tray_icon: settings.show_tray_icon,
+                show_provider_icons: settings.show_provider_icons,
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
                 alert_threshold_percent: settings.alert_threshold_percent,
@@ -2225,6 +2334,29 @@ pub fn run() {
             });
         }
 
+        // The taskbar widget becomes a WS_CHILD window after attachment and
+        // therefore no longer receives Explorer's top-level broadcasts. Keep
+        // a hidden top-level window alive to relay TaskbarCreated promptly.
+        let broadcast_title = native_interop::wide_str("Codex Usage taskbar monitor");
+        let broadcast_hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::from_raw(broadcast_title.as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        )
+        .expect("failed to create the taskbar broadcast receiver window");
+        if let Some(state) = lock_state().as_mut() {
+            state.taskbar_broadcast_hwnd = Some(broadcast_hwnd);
+        }
+
         // Try to embed in taskbar
         let taskbars = native_interop::find_taskbars();
         let selected_index = preferred_taskbar_index(
@@ -2232,7 +2364,8 @@ pub fn run() {
             settings.monitor_device.as_deref(),
             settings.taskbar_index,
         );
-        if attach_to_taskbar(hwnd, selected_index) {
+        let target = taskbar_target_for_index(&taskbars, selected_index);
+        if attach_to_taskbar(hwnd, target) {
             embedded = true;
         } else {
             // During login Explorer may create its taskbar after this app starts.
@@ -2415,6 +2548,7 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_provider_icons,
         show_session_window,
         show_weekly_window,
     ) = {
@@ -2442,6 +2576,7 @@ fn render_layered() {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_provider_icons,
                 s.show_session_window,
                 s.show_weekly_window,
             ),
@@ -2537,6 +2672,7 @@ fn render_layered() {
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_provider_icons,
             show_session_window,
             show_weekly_window,
             &codex_accent,
@@ -2622,6 +2758,7 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_provider_icons: bool,
     show_session_window: bool,
     show_weekly_window: bool,
     codex_accent: &Color,
@@ -2713,10 +2850,12 @@ fn paint_content(
             + sc(MODEL_RIGHT_MARGIN);
         let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
-            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Claude);
+            if show_provider_icons {
+                provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Claude);
+            }
             icon_x += model_width;
         }
-        if show_codex {
+        if show_codex && show_provider_icons {
             provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
         }
 
@@ -3092,6 +3231,14 @@ fn tray_reposition_is_suppressed() -> bool {
 }
 
 fn position_at_taskbar() {
+    position_at_taskbar_with_save(true);
+}
+
+fn position_at_taskbar_without_save() {
+    position_at_taskbar_with_save(false);
+}
+
+fn position_at_taskbar_with_save(save_offset: bool) {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
@@ -3159,7 +3306,7 @@ fn position_at_taskbar() {
             false
         }
     };
-    if offset_changed {
+    if offset_changed && save_offset {
         save_state_settings();
     }
 
@@ -3289,6 +3436,32 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let taskbar_created = taskbar_created_message();
+    if taskbar_created != 0 && msg == taskbar_created {
+        let (main_hwnd, broadcast_hwnd) = {
+            let state = lock_state();
+            state.as_ref().map_or((None, None), |app_state| {
+                (
+                    Some(app_state.hwnd.to_hwnd()),
+                    app_state.taskbar_broadcast_hwnd,
+                )
+            })
+        };
+        if let Some(main_hwnd) = main_hwnd {
+            if broadcast_hwnd == Some(hwnd) {
+                let _ = PostMessageW(main_hwnd, WM_APP_TASKBAR_CREATED, WPARAM(0), LPARAM(0));
+            } else if main_hwnd == hwnd {
+                sync_tray_icons(hwnd);
+            }
+        }
+        return LRESULT(0);
+    }
+    let is_broadcast_receiver = lock_state()
+        .as_ref()
+        .is_some_and(|state| state.taskbar_broadcast_hwnd == Some(hwnd));
+    if is_broadcast_receiver {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
     match msg {
         WM_PAINT => {
             // For non-embedded fallback, paint normally
@@ -3352,14 +3525,19 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_TASKBAR_RETRY => {
                     let attachment = {
                         let state = lock_state();
-                        state.as_ref().map(|s| (s.embedded, s.taskbar_index))
+                        state
+                            .as_ref()
+                            .map(|s| (s.embedded, s.monitor_device.clone(), s.taskbar_index))
                     };
                     match attachment {
-                        Some((true, _)) | None => {
+                        Some((true, _, _)) | None => {
                             let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
                         }
-                        Some((false, index)) => {
-                            if attach_to_taskbar(hwnd, index) {
+                        Some((false, device, index)) => {
+                            let taskbars = native_interop::find_taskbars();
+                            let target =
+                                preferred_taskbar_target(&taskbars, device.as_deref(), index);
+                            if attach_to_taskbar(hwnd, target) {
                                 let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
                                 position_at_taskbar();
                                 render_layered();
@@ -3393,6 +3571,10 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_UPDATE_CHECK_COMPLETE => {
             schedule_auto_update_check(hwnd);
             publish_settings();
+            LRESULT(0)
+        }
+        WM_APP_TASKBAR_CREATED => {
+            sync_tray_icons(hwnd);
             LRESULT(0)
         }
         WM_SETCURSOR => {
@@ -3562,7 +3744,8 @@ unsafe extern "system" fn wnd_proc(
                                 s.tray_offset = new_offset;
                             }
                         }
-                        if attach_to_taskbar(hwnd, target_index) {
+                        let target = taskbar_target_for_window(&target_taskbar, target_index);
+                        if attach_to_taskbar(hwnd, target) {
                             let mut state = lock_state();
                             if let Some(s) = state.as_mut() {
                                 s.monitor_device =
@@ -3604,18 +3787,28 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            let watch = {
+            let (is_main_window, watch, hook, broadcast_hwnd) = {
                 let mut state = lock_state();
-                state.as_mut().and_then(|s| s.recovery_watch.take())
+                match state.as_mut() {
+                    Some(app_state) if app_state.hwnd.to_hwnd() == hwnd => (
+                        true,
+                        app_state.recovery_watch.take(),
+                        app_state.win_event_hook,
+                        app_state.taskbar_broadcast_hwnd.take(),
+                    ),
+                    _ => (false, None, None, None),
+                }
             };
+            if !is_main_window {
+                return LRESULT(0);
+            }
             drop(watch);
             quota_tooltip::clear();
-            let hook = {
-                let state = lock_state();
-                state.as_ref().and_then(|s| s.win_event_hook)
-            };
             if let Some(h) = hook {
                 native_interop::unhook_win_event(h);
+            }
+            if let Some(broadcast_hwnd) = broadcast_hwnd {
+                let _ = DestroyWindow(broadcast_hwnd);
             }
             tray_icon::remove_all(hwnd);
             settings_ui::shutdown();
@@ -3698,6 +3891,7 @@ fn settings_snapshot() -> serde_json::Value {
         "settings": {
             "language":s.language_override.map_or("system", LanguageId::code),
             "startup":is_startup_enabled(), "widget_visible":s.widget_visible,
+            "show_tray_icon":s.show_tray_icon,"show_provider_icons":s.show_provider_icons,
             "show_claude_code":s.show_claude_code,"show_codex":s.show_codex,
             "show_antigravity":s.show_antigravity,"show_session_window":s.show_session_window,
             "show_weekly_window":s.show_weekly_window,"poll_interval_ms":s.poll_interval_ms,
@@ -3733,208 +3927,510 @@ fn handle_settings_requests(hwnd: HWND) {
     if let Some(error) = settings_ui::take_error() {
         show_error_message(hwnd, "Settings unavailable", &error);
     }
+    let mut handled_request = false;
     for pending in settings_ui::drain() {
         if pending.cancelled.load(Ordering::Acquire) {
             continue;
         }
+        handled_request = true;
         SETTINGS_SAVE_ERROR.with(|slot| slot.borrow_mut().take());
         let result = match pending.request.operation {
             Operation::Get => Ok(()),
-            Operation::Set { key, value } => apply_setting(hwnd, key, value),
-            Operation::Action { action } => apply_settings_action(hwnd, action),
-        }
-        .and_then(|()| {
-            SETTINGS_SAVE_ERROR.with(|slot| slot.borrow_mut().take().map_or(Ok(()), Err))
-        });
+            Operation::Set { key, value } => {
+                apply_settings_batch(hwnd, &[settings_ui::Change { key, value }])
+            }
+            Operation::SetBatch { changes } => apply_settings_batch(hwnd, &changes),
+            Operation::Persist => persist_settings_request(),
+            Operation::Action { action } => apply_settings_action(hwnd, action)
+                .map_err(|message| SettingsApplyError::new("action_failed", message))
+                .and_then(|()| {
+                    SETTINGS_SAVE_ERROR
+                        .with(|slot| slot.borrow_mut().take())
+                        .map_or(Ok(()), |message| {
+                            Err(SettingsApplyError::new("save_failed", message))
+                        })
+                }),
+        };
         let state = settings_snapshot();
         settings_ui::publish(state.clone());
-        let mut reply = serde_json::json!({"v":1,"id":pending.request.id,"ok":result.is_ok(),"revision":settings_ui::revision(),"state":state});
-        if let Err(error) = result {
-            reply["error"] = error.into();
-        }
+        let reply = settings_reply(pending.request.id, settings_ui::revision(), state, result);
         let _ = pending.reply.try_send(reply);
     }
-    publish_settings();
-}
-
-fn setting_value<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T, String> {
-    serde_json::from_value(value).map_err(|error| format!("Invalid setting value: {error}"))
-}
-
-fn apply_setting(hwnd: HWND, key: Key, value: serde_json::Value) -> Result<(), String> {
-    let command = match key {
-        Key::Language => {
-            let code: String = setting_value(value)?;
-            let language = if code == "system" {
-                None
-            } else {
-                Some(
-                    LanguageId::from_code(&code)
-                        .filter(|l| l.code() == code)
-                        .ok_or("Unsupported language")?,
-                )
-            };
-            if let Some(s) = lock_state().as_mut() {
-                apply_language_to_state(s, language);
-            }
-            save_state_settings();
-            render_layered();
-            return Ok(());
-        }
-        Key::Startup => {
-            let enabled: bool = setting_value(value)?;
-            set_startup_enabled(enabled);
-            if is_startup_enabled() != enabled {
-                return Err("Windows startup registration could not be changed. Check registry permissions.".into());
-            }
-            return Ok(());
-        }
-        Key::WidgetVisible
-        | Key::ShowClaudeCode
-        | Key::ShowCodex
-        | Key::ShowAntigravity
-        | Key::ShowSessionWindow
-        | Key::ShowWeeklyWindow
-        | Key::AdaptiveRefresh
-        | Key::AnchorLeft => {
-            let desired: bool = setting_value(value)?;
-            let state = lock_state();
-            let s = state.as_ref().ok_or("Widget is shutting down")?;
-            let (current, command) = match key {
-                Key::WidgetVisible => (s.widget_visible, tray_icon::IDM_TOGGLE_WIDGET),
-                Key::ShowClaudeCode => {
-                    if desired && !s.claude_code_available {
-                        return Err(
-                            "Sign in to the Claude CLI before enabling Claude Code monitoring."
-                                .into(),
-                        );
-                    }
-                    if !desired && !s.show_codex && !s.show_antigravity {
-                        return Err("At least one provider must remain enabled.".into());
-                    }
-                    (s.show_claude_code, IDM_MODEL_CLAUDE_CODE)
-                }
-                Key::ShowCodex => {
-                    if !desired && !s.show_claude_code && !s.show_antigravity {
-                        return Err("At least one provider must remain enabled.".into());
-                    }
-                    (s.show_codex, IDM_MODEL_CODEX)
-                }
-                Key::ShowAntigravity => {
-                    if !desired && !s.show_claude_code && !s.show_codex {
-                        return Err("At least one provider must remain enabled.".into());
-                    }
-                    (s.show_antigravity, IDM_MODEL_ANTIGRAVITY)
-                }
-                Key::ShowSessionWindow => {
-                    if !desired && !s.show_weekly_window {
-                        return Err("At least one usage window must remain enabled.".into());
-                    }
-                    (s.show_session_window, IDM_SHOW_SESSION_WINDOW)
-                }
-                Key::ShowWeeklyWindow => {
-                    if !desired && !s.show_session_window {
-                        return Err("At least one usage window must remain enabled.".into());
-                    }
-                    (s.show_weekly_window, IDM_SHOW_WEEKLY_WINDOW)
-                }
-                Key::AdaptiveRefresh => (s.adaptive_refresh, IDM_ADAPTIVE_REFRESH),
-                Key::AnchorLeft => (s.anchor_left, IDM_ANCHOR_LEFT),
-                _ => unreachable!(),
-            };
-            if desired == current {
-                drop(state);
-                save_state_settings();
-                return Ok(());
-            }
-            command
-        }
-        Key::PollIntervalMs => {
-            let interval: u32 = setting_value(value)?;
-            if !(POLL_1_MIN..=POLL_1_HOUR).contains(&interval) {
-                return Err(
-                    "Polling interval must be between 60000 and 3600000 milliseconds.".into(),
-                );
-            }
-            {
-                let mut state = lock_state();
-                let s = state.as_mut().ok_or("Widget is shutting down")?;
-                s.poll_interval_ms = interval;
-                if s.has_poll_result {
-                    s.monitor.reconfigure(
-                        interval,
-                        s.adaptive_refresh,
-                        Instant::now(),
-                        SystemTime::now(),
-                    );
-                    unsafe {
-                        SetTimer(hwnd, TIMER_POLL, effective_poll_interval(s), None);
-                    }
-                }
-            }
-            save_state_settings();
-            return Ok(());
-        }
-        Key::AlertThresholdPercent => match setting_value::<u8>(value)? {
-            0 => IDM_ALERT_OFF,
-            10 => IDM_ALERT_10,
-            20 => IDM_ALERT_20,
-            30 => IDM_ALERT_30,
-            _ => return Err("Alert threshold must be 0, 10, 20, or 30.".into()),
-        },
-        Key::Palette => match setting_value::<Palette>(value)? {
-            Palette::System => IDM_PALETTE_SYSTEM,
-            Palette::HighContrastDark => IDM_PALETTE_DARK,
-            Palette::HighContrastLight => IDM_PALETTE_LIGHT,
-        },
-        Key::BarStyle => match setting_value::<BarStyle>(value)? {
-            BarStyle::Continuous => IDM_BAR_CONTINUOUS,
-            BarStyle::Segmented => IDM_BAR_SEGMENTED,
-        },
-        Key::BarThickness => match setting_value::<BarThickness>(value)? {
-            BarThickness::Standard => IDM_BAR_STANDARD,
-            BarThickness::Slim => IDM_BAR_SLIM,
-        },
-        Key::FontSize => match setting_value::<FontSize>(value)? {
-            FontSize::Standard => IDM_FONT_STANDARD,
-            FontSize::Large => IDM_FONT_LARGE,
-        },
-        Key::ClaudeAccent | Key::CodexAccent => {
-            let color: Option<[u8; 3]> = setting_value(value)?;
-            if let Some(s) = lock_state().as_mut() {
-                match key {
-                    Key::ClaudeAccent => s.appearance.claude_accent = color,
-                    _ => s.appearance.codex_accent = color,
-                }
-            }
-            save_state_settings();
-            render_layered();
-            return Ok(());
-        }
-        Key::MonitorDevice => {
-            let device: String = setting_value(value)?;
-            let taskbars = native_interop::find_taskbars();
-            let index = taskbars
-                .iter()
-                .position(|t| native_interop::taskbar_monitor_device(t).as_deref() == Some(&device))
-                .ok_or("The selected monitor is no longer available.")?;
-            if !attach_to_taskbar(hwnd, index) {
-                return Err("Could not attach to the selected monitor.".into());
-            }
-            if let Some(s) = lock_state().as_mut() {
-                s.monitor_device = Some(device);
-                s.tray_offset = 0;
-            }
-            save_state_settings();
-            position_at_taskbar();
-            render_layered();
-            return Ok(());
-        }
-    };
-    unsafe {
-        handle_command(hwnd, command);
+    if !handled_request {
+        publish_settings();
     }
-    Ok(())
+}
+
+#[derive(Debug)]
+struct SettingsApplyError {
+    code: &'static str,
+    message: String,
+}
+
+impl SettingsApplyError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+fn settings_reply(
+    id: u32,
+    revision: u64,
+    state: serde_json::Value,
+    result: Result<(), SettingsApplyError>,
+) -> serde_json::Value {
+    let mut reply = serde_json::json!({
+        "v": 1,
+        "id": id,
+        "ok": result.is_ok(),
+        "revision": revision,
+        "state": state
+    });
+    if let Err(error) = result {
+        reply["error"] = error.message.into();
+        reply["error_code"] = error.code.into();
+    }
+    reply
+}
+
+fn invalid_setting(message: impl Into<String>) -> SettingsApplyError {
+    SettingsApplyError::new("invalid_setting", message)
+}
+
+fn setting_value<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<T, SettingsApplyError> {
+    serde_json::from_value(value)
+        .map_err(|error| invalid_setting(format!("Invalid setting value: {error}")))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsCandidate {
+    language_override: Option<LanguageId>,
+    startup: bool,
+    widget_visible: bool,
+    show_tray_icon: bool,
+    show_provider_icons: bool,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_session_window: bool,
+    show_weekly_window: bool,
+    poll_interval_ms: u32,
+    adaptive_refresh: bool,
+    alert_threshold_percent: u8,
+    appearance: Appearance,
+    monitor_device: Option<String>,
+    anchor_left: bool,
+}
+
+impl SettingsCandidate {
+    #[cfg(test)]
+    fn from_settings(settings: &SettingsFile, startup: bool) -> Self {
+        Self {
+            language_override: settings.language.as_deref().and_then(LanguageId::from_code),
+            startup,
+            widget_visible: settings.widget_visible,
+            show_tray_icon: settings.show_tray_icon,
+            show_provider_icons: settings.show_provider_icons,
+            show_claude_code: settings.show_claude_code,
+            show_codex: settings.show_codex,
+            show_antigravity: settings.show_antigravity,
+            show_session_window: settings.show_session_window,
+            show_weekly_window: settings.show_weekly_window,
+            poll_interval_ms: settings.poll_interval_ms,
+            adaptive_refresh: settings.adaptive_refresh,
+            alert_threshold_percent: settings.alert_threshold_percent,
+            appearance: settings.appearance,
+            monitor_device: settings.monitor_device.clone(),
+            anchor_left: settings.anchor_left,
+        }
+    }
+
+    fn from_app_state(state: &AppState, startup: bool) -> Self {
+        Self {
+            language_override: state.language_override,
+            startup,
+            widget_visible: state.widget_visible,
+            show_tray_icon: state.show_tray_icon,
+            show_provider_icons: state.show_provider_icons,
+            show_claude_code: state.show_claude_code,
+            show_codex: state.show_codex,
+            show_antigravity: state.show_antigravity,
+            show_session_window: state.show_session_window,
+            show_weekly_window: state.show_weekly_window,
+            poll_interval_ms: state.poll_interval_ms,
+            adaptive_refresh: state.adaptive_refresh,
+            alert_threshold_percent: state.alert_threshold_percent,
+            appearance: state.appearance,
+            monitor_device: state.monitor_device.clone(),
+            anchor_left: state.anchor_left,
+        }
+    }
+}
+
+/// Validate all edits against one final candidate. No application state or OS
+/// side effect is touched until this succeeds.
+fn validate_settings_changes(
+    current: &SettingsCandidate,
+    changes: &[settings_ui::Change],
+    claude_code_available: bool,
+    monitor_devices: &[String],
+) -> Result<SettingsCandidate, SettingsApplyError> {
+    if changes.len() > settings_ui::MAX_BATCH_CHANGES {
+        return Err(invalid_setting(format!(
+            "A settings batch may contain at most {} changes.",
+            settings_ui::MAX_BATCH_CHANGES
+        )));
+    }
+
+    let mut candidate = current.clone();
+    let mut seen = HashSet::with_capacity(changes.len());
+    for change in changes {
+        if !seen.insert(change.key) {
+            return Err(invalid_setting(format!(
+                "The setting {:?} occurs more than once in the batch.",
+                change.key
+            )));
+        }
+        match change.key {
+            Key::Language => {
+                let code: String = setting_value(change.value.clone())?;
+                candidate.language_override = if code == "system" {
+                    None
+                } else {
+                    Some(
+                        LanguageId::from_code(&code)
+                            .filter(|language| language.code() == code)
+                            .ok_or_else(|| invalid_setting("Unsupported language"))?,
+                    )
+                };
+            }
+            Key::Startup => candidate.startup = setting_value(change.value.clone())?,
+            Key::WidgetVisible => candidate.widget_visible = setting_value(change.value.clone())?,
+            Key::ShowTrayIcon => candidate.show_tray_icon = setting_value(change.value.clone())?,
+            Key::ShowProviderIcons => {
+                candidate.show_provider_icons = setting_value(change.value.clone())?
+            }
+            Key::ShowClaudeCode => {
+                candidate.show_claude_code = setting_value(change.value.clone())?
+            }
+            Key::ShowCodex => candidate.show_codex = setting_value(change.value.clone())?,
+            Key::ShowAntigravity => {
+                candidate.show_antigravity = setting_value(change.value.clone())?
+            }
+            Key::ShowSessionWindow => {
+                candidate.show_session_window = setting_value(change.value.clone())?
+            }
+            Key::ShowWeeklyWindow => {
+                candidate.show_weekly_window = setting_value(change.value.clone())?
+            }
+            Key::AdaptiveRefresh => {
+                candidate.adaptive_refresh = setting_value(change.value.clone())?
+            }
+            Key::AnchorLeft => candidate.anchor_left = setting_value(change.value.clone())?,
+            Key::PollIntervalMs => {
+                let interval: u32 = setting_value(change.value.clone())?;
+                if !(POLL_1_MIN..=POLL_1_HOUR).contains(&interval) {
+                    return Err(invalid_setting(
+                        "Polling interval must be between 60000 and 3600000 milliseconds.",
+                    ));
+                }
+                candidate.poll_interval_ms = interval;
+            }
+            Key::AlertThresholdPercent => {
+                let threshold: u8 = setting_value(change.value.clone())?;
+                if !matches!(threshold, 0 | 10 | 20 | 30) {
+                    return Err(invalid_setting("Alert threshold must be 0, 10, 20, or 30."));
+                }
+                candidate.alert_threshold_percent = threshold;
+            }
+            Key::Palette => candidate.appearance.palette = setting_value(change.value.clone())?,
+            Key::BarStyle => candidate.appearance.bar_style = setting_value(change.value.clone())?,
+            Key::BarThickness => {
+                candidate.appearance.bar_thickness = setting_value(change.value.clone())?
+            }
+            Key::FontSize => candidate.appearance.font_size = setting_value(change.value.clone())?,
+            Key::ClaudeAccent => {
+                candidate.appearance.claude_accent = setting_value(change.value.clone())?
+            }
+            Key::CodexAccent => {
+                candidate.appearance.codex_accent = setting_value(change.value.clone())?
+            }
+            Key::MonitorDevice => {
+                let device: Option<String> = setting_value(change.value.clone())?;
+                if let Some(device) = device {
+                    if !monitor_devices.iter().any(|available| available == &device) {
+                        return Err(invalid_setting(
+                            "The selected monitor is no longer available.",
+                        ));
+                    }
+                    candidate.monitor_device = Some(device);
+                } else {
+                    candidate.monitor_device = None;
+                }
+            }
+        }
+    }
+
+    if !candidate.show_claude_code && !candidate.show_codex && !candidate.show_antigravity {
+        return Err(invalid_setting(
+            "At least one provider must remain enabled.",
+        ));
+    }
+    if !candidate.show_session_window && !candidate.show_weekly_window {
+        return Err(invalid_setting(
+            "At least one usage window must remain enabled.",
+        ));
+    }
+    if candidate.show_claude_code && !current.show_claude_code && !claude_code_available {
+        return Err(invalid_setting(
+            "Sign in to the Claude CLI before enabling Claude Code monitoring.",
+        ));
+    }
+    Ok(candidate)
+}
+
+fn apply_settings_batch(
+    hwnd: HWND,
+    changes: &[settings_ui::Change],
+) -> Result<(), SettingsApplyError> {
+    let startup = is_startup_enabled();
+    let (current, claude_code_available) = {
+        let state = lock_state();
+        let app_state = state
+            .as_ref()
+            .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
+        (
+            SettingsCandidate::from_app_state(app_state, startup),
+            app_state.claude_code_available,
+        )
+    };
+    let needs_monitor_list = changes
+        .iter()
+        .any(|change| matches!(change.key, Key::MonitorDevice));
+    let taskbars = if needs_monitor_list {
+        native_interop::find_taskbars()
+    } else {
+        Vec::new()
+    };
+    let monitor_devices: Vec<String> = taskbars
+        .iter()
+        .filter_map(native_interop::taskbar_monitor_device)
+        .collect();
+    let candidate =
+        validate_settings_changes(&current, changes, claude_code_available, &monitor_devices)?;
+
+    let startup_changed = candidate.startup != current.startup;
+    let monitor_changed = candidate.monitor_device != current.monitor_device;
+    let provider_changed = [
+        candidate.show_claude_code != current.show_claude_code,
+        candidate.show_codex != current.show_codex,
+        candidate.show_antigravity != current.show_antigravity,
+    ]
+    .into_iter()
+    .any(|changed| changed);
+    let windows_changed = candidate.show_session_window != current.show_session_window
+        || candidate.show_weekly_window != current.show_weekly_window;
+    let language_changed = candidate.language_override != current.language_override;
+    let appearance_changed = candidate.appearance != current.appearance;
+    let position_changed = monitor_changed
+        || candidate.anchor_left != current.anchor_left
+        || provider_changed
+        || language_changed
+        || appearance_changed;
+    let tooltip_changed = candidate.show_tray_icon != current.show_tray_icon
+        || provider_changed
+        || windows_changed
+        || language_changed;
+
+    // Validate explicit monitor selections before touching the registry or
+    // native window state. Attach resolves explicit devices by ID in its fresh
+    // enumeration, while automatic mode chooses the current primary taskbar.
+    let monitor_target = if monitor_changed {
+        match candidate.monitor_device.as_deref() {
+            Some(device) => {
+                if native_interop::taskbar_index_for_monitor_device(
+                    &taskbars,
+                    device,
+                    native_interop::taskbar_monitor_device,
+                )
+                .is_none()
+                {
+                    return Err(SettingsApplyError::new(
+                        "monitor_unavailable",
+                        "The selected monitor is no longer available.",
+                    ));
+                }
+                Some(TaskbarTarget::MonitorDevice(device.to_string()))
+            }
+            None => Some(TaskbarTarget::Primary),
+        }
+    } else {
+        None
+    };
+    let previous_taskbar_target = if monitor_changed {
+        let state = lock_state();
+        state.as_ref().map(|app_state| {
+            taskbars
+                .iter()
+                .position(|taskbar| Some(taskbar.hwnd) == app_state.taskbar_hwnd)
+                .map(|index| taskbar_target_for_index(&taskbars, index))
+                .or_else(|| {
+                    app_state
+                        .monitor_device
+                        .clone()
+                        .map(TaskbarTarget::MonitorDevice)
+                })
+                .unwrap_or(TaskbarTarget::LegacyIndex(app_state.taskbar_index))
+        })
+    } else {
+        None
+    };
+
+    // Registry registration and taskbar attachment are the only OS-side
+    // effects here. If a later step fails, restore any effect already applied.
+    if startup_changed {
+        set_startup_enabled(candidate.startup);
+        if is_startup_enabled() != candidate.startup {
+            let restored = restore_startup_registration(current.startup);
+            let rollback_note = if restored {
+                ""
+            } else {
+                " The previous startup registration could not be restored."
+            };
+            return Err(SettingsApplyError::new(
+                "startup_failed",
+                format!(
+                    "Windows startup registration could not be changed. Check registry permissions.{rollback_note}"
+                ),
+            ));
+        }
+    }
+    if let Some(target) = monitor_target {
+        if !attach_to_taskbar(hwnd, target) {
+            let startup_restored =
+                !startup_changed || restore_startup_registration(current.startup);
+            let rollback_note = if startup_restored {
+                ""
+            } else {
+                " The previous startup registration could not be restored."
+            };
+            return Err(SettingsApplyError::new(
+                "monitor_attach_failed",
+                format!("Could not attach to the selected monitor.{rollback_note}"),
+            ));
+        }
+    }
+
+    let (reconfigure_poll, show_widget) = {
+        let mut state = lock_state();
+        let Some(app_state) = state.as_mut() else {
+            drop(state);
+            let startup_restored =
+                !startup_changed || restore_startup_registration(current.startup);
+            let monitor_restored = !monitor_changed
+                || previous_taskbar_target
+                    .clone()
+                    .is_some_and(|target| attach_to_taskbar(hwnd, target));
+            if !startup_restored || !monitor_restored {
+                diagnose::log(format!(
+                    "settings batch compensation incomplete (startup_restored={startup_restored}, monitor_restored={monitor_restored})"
+                ));
+            }
+            let rollback_note = if startup_restored && monitor_restored {
+                ""
+            } else {
+                "; one or more OS settings could not be restored"
+            };
+            return Err(SettingsApplyError::new(
+                "unavailable",
+                format!("Widget is shutting down{rollback_note}"),
+            ));
+        };
+        app_state.widget_visible = candidate.widget_visible;
+        app_state.show_tray_icon = candidate.show_tray_icon;
+        app_state.show_provider_icons = candidate.show_provider_icons;
+        app_state.show_claude_code = candidate.show_claude_code;
+        app_state.show_codex = candidate.show_codex;
+        app_state.show_antigravity = candidate.show_antigravity;
+        app_state.show_session_window = candidate.show_session_window;
+        app_state.show_weekly_window = candidate.show_weekly_window;
+        app_state.poll_interval_ms = candidate.poll_interval_ms;
+        app_state.adaptive_refresh = candidate.adaptive_refresh;
+        app_state.alert_threshold_percent = candidate.alert_threshold_percent;
+        app_state.appearance = candidate.appearance;
+        app_state.monitor_device = candidate.monitor_device.clone();
+        app_state.anchor_left = candidate.anchor_left;
+        if monitor_changed {
+            app_state.tray_offset = 0;
+        }
+        if provider_changed {
+            app_state.session_text = "...".to_string();
+            app_state.weekly_text = "...".to_string();
+            app_state.codex_session_text = "...".to_string();
+            app_state.codex_weekly_text = "...".to_string();
+            app_state.antigravity_session_text = "...".to_string();
+            app_state.antigravity_weekly_text = "...".to_string();
+        }
+        if language_changed {
+            apply_language_to_state(app_state, candidate.language_override);
+        }
+        let reconfigure_poll = (candidate.poll_interval_ms != current.poll_interval_ms
+            || candidate.adaptive_refresh != current.adaptive_refresh)
+            && app_state.has_poll_result;
+        if reconfigure_poll {
+            app_state.monitor.reconfigure(
+                candidate.poll_interval_ms,
+                candidate.adaptive_refresh,
+                Instant::now(),
+                SystemTime::now(),
+            );
+        }
+        (reconfigure_poll, candidate.widget_visible)
+    };
+
+    if reconfigure_poll {
+        let interval = lock_state()
+            .as_ref()
+            .map(effective_poll_interval)
+            .unwrap_or(candidate.poll_interval_ms);
+        unsafe {
+            SetTimer(hwnd, TIMER_POLL, interval, None);
+        }
+    }
+    if position_changed {
+        position_at_taskbar_without_save();
+    }
+    if current.widget_visible != candidate.widget_visible {
+        unsafe {
+            if show_widget {
+                position_at_taskbar_without_save();
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            } else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+    render_layered();
+    if tooltip_changed {
+        sync_tray_icons(hwnd);
+    }
+    if provider_changed {
+        request_poll(SendHwnd::from_hwnd(hwnd), true);
+    }
+
+    // Persistence happens after the live batch is committed. A failed save is
+    // reported to the caller, but must not roll back any applied setting or OS
+    // effect; a later `persist` request snapshots this same effective state.
+    persist_settings_request()
+}
+
+fn persist_settings_request() -> Result<(), SettingsApplyError> {
+    persist_state_settings().map_err(|message| SettingsApplyError::new("save_failed", message))
 }
 
 fn apply_settings_action(hwnd: HWND, action: Action) -> Result<(), String> {
@@ -3998,6 +4494,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_provider_icons,
         show_session_window,
         show_weekly_window,
     ) = {
@@ -4023,6 +4520,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_provider_icons,
                 s.show_session_window,
                 s.show_weekly_window,
             ),
@@ -4079,6 +4577,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_provider_icons,
             show_session_window,
             show_weekly_window,
             &codex_accent,
@@ -4369,11 +4868,13 @@ mod tests {
     #[test]
     fn settings_protocol_rejects_invalid_values_before_mutating_windows() {
         use serde_json::json;
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
         for (key, value) in [
             (Key::PollIntervalMs, json!(0)),
             (Key::PollIntervalMs, json!(3_600_001)),
             (Key::PollIntervalMs, json!(60_000.5)),
             (Key::AdaptiveRefresh, json!("true")),
+            (Key::ShowTrayIcon, json!("true")),
             (Key::AlertThresholdPercent, json!(15)),
             (Key::Language, json!("../../arbitrary")),
             (Key::Palette, json!("custom")),
@@ -4382,12 +4883,262 @@ mod tests {
             (Key::FontSize, json!("unknown")),
             (Key::ClaudeAccent, json!([256, 0, 0])),
             (Key::CodexAccent, json!([0, 0])),
+            (Key::MonitorDevice, json!(r"\\.\DISPLAY99")),
         ] {
-            assert!(
-                apply_setting(HWND::default(), key, value).is_err(),
-                "{key:?}"
-            );
+            let changes = [settings_ui::Change { key, value }];
+            let mut save_calls = 0;
+            if let Ok(candidate) = validate_settings_changes(&current, &changes, false, &[]) {
+                assert_ne!(
+                    candidate, current,
+                    "invalid {key:?} unexpectedly changed state"
+                );
+                save_calls += 1;
+            }
+            assert_eq!(save_calls, 0, "invalid {key:?} must not save");
         }
+    }
+
+    #[test]
+    fn monitor_null_restores_automatic_selection_and_uses_primary_taskbar() {
+        use serde_json::json;
+
+        let current = SettingsCandidate::from_settings(
+            &SettingsFile {
+                taskbar_index: 0,
+                monitor_device: Some(r"\\.\DISPLAY2".to_string()),
+                ..SettingsFile::default()
+            },
+            false,
+        );
+        let candidate = validate_settings_changes(
+            &current,
+            &[settings_ui::Change {
+                key: Key::MonitorDevice,
+                value: json!(null),
+            }],
+            false,
+            &[],
+        )
+        .expect("null selects automatic monitor mode");
+        assert_eq!(candidate.monitor_device, None);
+
+        // Automatic mode chooses the primary taskbar, not the legacy index
+        // that happened to identify the previously selected explicit device.
+        let taskbars = [
+            native_interop::TaskbarWindow {
+                hwnd: HWND::default(),
+                rect: RECT::default(),
+                is_primary: false,
+            },
+            native_interop::TaskbarWindow {
+                hwnd: HWND::default(),
+                rect: RECT::default(),
+                is_primary: true,
+            },
+        ];
+        assert_eq!(automatic_taskbar_index(&taskbars), 1);
+        assert_eq!(
+            serde_json::json!({"monitor_device": candidate.monitor_device})["monitor_device"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn invalid_or_removed_monitor_devices_are_rejected() {
+        use serde_json::json;
+
+        let current = SettingsCandidate::from_settings(
+            &SettingsFile {
+                monitor_device: Some(r"\\.\DISPLAY2".to_string()),
+                ..SettingsFile::default()
+            },
+            false,
+        );
+        for value in [json!(42), json!(r"\\.\DISPLAY2"), json!(r"\\.\DISPLAY99")] {
+            assert!(validate_settings_changes(
+                &current,
+                &[settings_ui::Change {
+                    key: Key::MonitorDevice,
+                    value,
+                }],
+                false,
+                &[],
+            )
+            .is_err());
+        }
+        assert_eq!(current.monitor_device.as_deref(), Some(r"\\.\DISPLAY2"));
+    }
+
+    #[test]
+    fn save_failure_reply_contains_the_effective_state_for_persist_retry() {
+        use serde_json::json;
+
+        let effective_state = json!({
+            "settings": {
+                "startup": true,
+                "monitor_device": null,
+                "show_tray_icon": false,
+                "show_provider_icons": false
+            }
+        });
+        let reply = settings_reply(
+            17,
+            23,
+            effective_state.clone(),
+            Err(SettingsApplyError::new(
+                "save_failed",
+                "The setting was applied but could not be saved.",
+            )),
+        );
+
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error_code"], "save_failed");
+        assert_eq!(reply["state"], effective_state);
+    }
+
+    #[test]
+    fn lost_claude_credentials_only_block_enabling_from_disabled_state() {
+        use serde_json::json;
+        let enabled_current = SettingsCandidate::from_settings(
+            &SettingsFile {
+                show_claude_code: true,
+                ..SettingsFile::default()
+            },
+            false,
+        );
+
+        let unrelated_change = [settings_ui::Change {
+            key: Key::WidgetVisible,
+            value: json!(false),
+        }];
+        assert!(validate_settings_changes(&enabled_current, &unrelated_change, false, &[]).is_ok());
+
+        let keep_enabled = [settings_ui::Change {
+            key: Key::ShowClaudeCode,
+            value: json!(true),
+        }];
+        assert!(validate_settings_changes(&enabled_current, &keep_enabled, false, &[]).is_ok());
+
+        let disable = [settings_ui::Change {
+            key: Key::ShowClaudeCode,
+            value: json!(false),
+        }];
+        assert!(validate_settings_changes(&enabled_current, &disable, false, &[]).is_ok());
+
+        let disabled_current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        let enable = [settings_ui::Change {
+            key: Key::ShowClaudeCode,
+            value: json!(true),
+        }];
+        assert!(validate_settings_changes(&disabled_current, &enable, false, &[]).is_err());
+    }
+
+    #[test]
+    fn settings_batch_provider_changes_validate_against_final_candidate_in_either_order() {
+        use serde_json::json;
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        let codex_off = settings_ui::Change {
+            key: Key::ShowCodex,
+            value: json!(false),
+        };
+        let claude_on = settings_ui::Change {
+            key: Key::ShowClaudeCode,
+            value: json!(true),
+        };
+
+        for changes in [
+            vec![codex_off.clone(), claude_on.clone()],
+            vec![claude_on.clone(), codex_off.clone()],
+        ] {
+            let candidate = validate_settings_changes(&current, &changes, true, &[]).unwrap();
+            assert!(!candidate.show_codex);
+            assert!(candidate.show_claude_code);
+        }
+    }
+
+    #[test]
+    fn settings_batch_window_changes_validate_against_final_candidate_in_either_order() {
+        use serde_json::json;
+        let current = SettingsCandidate::from_settings(
+            &SettingsFile {
+                show_session_window: true,
+                show_weekly_window: false,
+                ..SettingsFile::default()
+            },
+            false,
+        );
+        let session_off = settings_ui::Change {
+            key: Key::ShowSessionWindow,
+            value: json!(false),
+        };
+        let weekly_on = settings_ui::Change {
+            key: Key::ShowWeeklyWindow,
+            value: json!(true),
+        };
+
+        for changes in [
+            vec![session_off.clone(), weekly_on.clone()],
+            vec![weekly_on.clone(), session_off.clone()],
+        ] {
+            let candidate = validate_settings_changes(&current, &changes, false, &[]).unwrap();
+            assert!(!candidate.show_session_window);
+            assert!(candidate.show_weekly_window);
+        }
+    }
+
+    #[test]
+    fn duplicate_and_over_limit_batches_are_rejected_without_changing_candidate() {
+        use serde_json::json;
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        let duplicate = [
+            settings_ui::Change {
+                key: Key::WidgetVisible,
+                value: json!(false),
+            },
+            settings_ui::Change {
+                key: Key::WidgetVisible,
+                value: json!(true),
+            },
+        ];
+        assert!(validate_settings_changes(&current, &duplicate, true, &[]).is_err());
+
+        let too_many: Vec<_> = (0..=settings_ui::MAX_BATCH_CHANGES)
+            .map(|_| settings_ui::Change {
+                key: Key::WidgetVisible,
+                value: json!(false),
+            })
+            .collect();
+        assert!(validate_settings_changes(&current, &too_many, true, &[]).is_err());
+        assert_eq!(
+            current,
+            SettingsCandidate::from_settings(&SettingsFile::default(), false)
+        );
+    }
+
+    #[test]
+    fn null_accents_are_valid_and_clear_custom_colors() {
+        use serde_json::json;
+        let current = SettingsCandidate::from_settings(
+            &SettingsFile {
+                appearance: Appearance {
+                    claude_accent: Some([1, 2, 3]),
+                    ..Appearance::default()
+                },
+                ..SettingsFile::default()
+            },
+            false,
+        );
+        let candidate = validate_settings_changes(
+            &current,
+            &[settings_ui::Change {
+                key: Key::ClaudeAccent,
+                value: json!(null),
+            }],
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(candidate.appearance.claude_accent, None);
     }
 
     #[test]
@@ -4486,6 +5237,8 @@ mod tests {
         assert_eq!(old.appearance, Appearance::default());
         assert_eq!(old.appearance.bar_thickness, BarThickness::Slim);
         assert_eq!(old.monitor_device, None);
+        assert!(old.show_tray_icon);
+        assert!(old.show_provider_icons);
 
         let customized = SettingsFile {
             appearance: Appearance::translucent_dark_taskbar(),
@@ -4512,6 +5265,22 @@ mod tests {
 
         assert_eq!(restored.appearance.claude_accent, Some([0xD9, 0x77, 0x57]));
         assert_eq!(restored.appearance.codex_accent, Some([0x34, 0xD3, 0x99]));
+    }
+
+    #[test]
+    fn tray_and_widget_provider_icon_preferences_round_trip_independently() {
+        let settings = SettingsFile {
+            show_tray_icon: false,
+            show_provider_icons: false,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
+
+        assert!(!restored.show_tray_icon);
+        assert!(!restored.show_provider_icons);
+        assert!(SettingsFile::default().show_tray_icon);
+        assert!(SettingsFile::default().show_provider_icons);
     }
 
     #[test]
@@ -4832,8 +5601,10 @@ unsafe fn handle_command(hwnd: HWND, id: u16) {
             .contains(&id) =>
         {
             let index = (id - IDM_MONITOR_FIRST) as usize;
-            if let Some(taskbar) = native_interop::find_taskbars().get(index).copied() {
-                if attach_to_taskbar(hwnd, index) {
+            let taskbars = native_interop::find_taskbars();
+            if let Some(taskbar) = taskbars.get(index).copied() {
+                let target = taskbar_target_for_index(&taskbars, index);
+                if attach_to_taskbar(hwnd, target) {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {

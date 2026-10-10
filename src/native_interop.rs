@@ -84,6 +84,21 @@ pub fn taskbar_monitor_device(taskbar: &TaskbarWindow) -> Option<String> {
     }
 }
 
+/// Find the taskbar for an exact monitor device name without using its
+/// enumeration index as a fallback.
+pub fn taskbar_index_for_monitor_device<F>(
+    taskbars: &[TaskbarWindow],
+    device: &str,
+    mut resolve_device: F,
+) -> Option<usize>
+where
+    F: FnMut(&TaskbarWindow) -> Option<String>,
+{
+    taskbars
+        .iter()
+        .position(|taskbar| resolve_device(taskbar).as_deref() == Some(device))
+}
+
 pub fn find_taskbars() -> Vec<TaskbarWindow> {
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let taskbars = &mut *(lparam.0 as *mut Vec<TaskbarWindow>);
@@ -285,6 +300,47 @@ mod attachment_tests {
                 "fallback alpha mode must not prevent taskbar rendering: {rendered:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod taskbar_selection_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_device_selection_requires_an_exact_match() {
+        let taskbars = [
+            TaskbarWindow {
+                hwnd: HWND::default(),
+                rect: RECT {
+                    left: 1,
+                    ..Default::default()
+                },
+                is_primary: true,
+            },
+            TaskbarWindow {
+                hwnd: HWND::default(),
+                rect: RECT {
+                    left: 2,
+                    ..Default::default()
+                },
+                is_primary: false,
+            },
+        ];
+        let resolve_device = |taskbar: &TaskbarWindow| match taskbar.rect.left {
+            1 => Some(r"\\.\DISPLAY1".to_string()),
+            2 => Some(r"\\.\DISPLAY2".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(
+            taskbar_index_for_monitor_device(&taskbars, r"\\.\DISPLAY2", resolve_device),
+            Some(1)
+        );
+        assert_eq!(
+            taskbar_index_for_monitor_device(&taskbars, r"\\.\DISPLAY3", resolve_device),
+            None
+        );
     }
 }
 

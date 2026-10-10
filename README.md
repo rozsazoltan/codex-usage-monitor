@@ -1,6 +1,3 @@
-![Windows only](https://img.shields.io/badge/platform-Windows-blue)
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](LICENSE)
-
 # Codex Usage
 
 Codex Usage is a native Windows taskbar widget for viewing Codex and Claude Code quota usage and reset times.

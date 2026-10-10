@@ -117,7 +117,7 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::InitializePipe()
     {
-        auto get = Request(L"get"); inFlight_ = nextId_++;
+        auto get = Request(L"get"); inFlight_ = nextId_++; initialGetPending_ = true;
         get.Insert(L"id", JsonValue::CreateNumberValue(inFlight_));
         const auto initialRequest = Utf8(get.Stringify().c_str());
         ioThread_ = std::thread([this, initialRequest]()
@@ -270,12 +270,14 @@ namespace winrt::SettingsUI::implementation
             return;
         }
         if (!message.HasKey(L"id") || message.GetNamedNumber(L"id", 0) != inFlight_) return;
+        const bool isInitialGet = initialGetPending_;
+        initialGetPending_ = false;
         inFlight_ = 0;
         if (message.HasKey(L"state") && message.GetNamedValue(L"state").ValueType() == JsonValueType::Object) state_ = message.GetNamedObject(L"state");
         Hydrate();
         const bool ok = message.GetNamedBoolean(L"ok", false);
         if (!ok) ShowMessage(std::wstring(message.GetNamedString(L"error", L"The setting could not be applied.").c_str()), true);
-        else ShowMessage(L"Saved. Changes are now in effect.");
+        else if (!isInitialGet) ShowMessage(L"Saved. Changes are now in effect.");
     }
 
     JsonObject MainWindow::State() const { return state_ ? state_.GetNamedObject(L"settings", JsonObject()) : JsonObject(); }

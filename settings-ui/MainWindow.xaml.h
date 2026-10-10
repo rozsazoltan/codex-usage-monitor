@@ -47,6 +47,7 @@ namespace winrt::SettingsUI::implementation
         std::queue<std::string> requests_;
         uint32_t nextId_{ 1 };
         uint32_t inFlight_{ 0 };
+        bool initialGetPending_{};
         std::thread ioThread_;
         std::atomic<HANDLE> pipeHandle_{ INVALID_HANDLE_VALUE };
         HWND hwnd_{};

@@ -404,8 +404,38 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::BuildAbout()
     {
-        auto hero=Card();auto h=StackPanel();h.Spacing(10);auto mark=Border();mark.Width(54);mark.Height(54);mark.CornerRadius(CornerRadiusHelper::FromUniformRadius(16));mark.Background(Application::Current().Resources().Lookup(box_value(L"AccentFillColorDefaultBrush")).as<Media::Brush>());auto glyph=TextBlock();glyph.Text(L"C");glyph.FontSize(28);glyph.HorizontalAlignment(HorizontalAlignment::Center);glyph.VerticalAlignment(VerticalAlignment::Center);mark.Child(glyph);h.Children().Append(mark);h.Children().Append(Label(L"Codex Usage",25));h.Children().Append(Label(L"A calm, native taskbar view of your AI coding quota.",14));h.Children().Append(Label(state_?std::wstring((std::wstring(L"Version ")+state_.GetNamedString(L"version",L"unknown").c_str()).c_str()):std::wstring(L"Connecting to the widget…"),12));hero.Child(h);PageHost().Children().Append(hero);
-        auto info=Card();auto s=StackPanel();s.Spacing(12);s.Children().Append(Label(L"Project",19));s.Children().Append(Label(L"Open source, built for Windows. Licensed under AGPL-3.0-or-later.",13));auto repo=Button();repo.Content(box_value(L"View project on GitHub"));repo.Click([this](auto const&,auto const&){Action(L"repository");});s.Children().Append(repo);info.Child(s);PageHost().Children().Append(info);
+        auto hero = Card();
+        auto h = StackPanel(); h.Spacing(10);
+        auto mark = Border(); mark.Width(54); mark.Height(54); mark.CornerRadius(CornerRadiusHelper::FromUniformRadius(16));
+        mark.Background(Application::Current().Resources().Lookup(box_value(L"AccentFillColorDefaultBrush")).as<Media::Brush>());
+        auto glyph = TextBlock(); glyph.Text(L"C"); glyph.FontSize(28); glyph.HorizontalAlignment(HorizontalAlignment::Center); glyph.VerticalAlignment(VerticalAlignment::Center); mark.Child(glyph);
+        h.Children().Append(mark); h.Children().Append(Label(L"Codex Usage", 25));
+        h.Children().Append(Label(L"A lightweight, portable Windows quota monitor for Codex and Claude Code.", 14));
+        h.Children().Append(Label(L"Developed by Zoltán Rózsa", 13));
+        h.Children().Append(Label(state_ ? std::wstring(std::wstring(L"Version ") + state_.GetNamedString(L"version", L"unknown").c_str()) : std::wstring(L"Connecting to the widget…"), 12));
+        hero.Child(h); PageHost().Children().Append(hero);
+
+        auto how = Card(); auto howStack = StackPanel(); howStack.Spacing(10);
+        howStack.Children().Append(Label(L"How it works", 19));
+        howStack.Children().Append(Label(L"Codex Usage runs locally and reuses sign-ins from the Codex CLI and Claude Code CLI already installed on your PC. There is no separate Codex Usage account, login, or API-key setup.", 13));
+        howStack.Children().Append(Label(L"It reads quota and reset information from provider services and shows the available usage windows in your taskbar. Quota requests go directly from this app to those services; they do not pass through a Codex Usage server.", 13));
+        how.Child(howStack); PageHost().Children().Append(how);
+
+        auto info = Card(); auto s = StackPanel(); s.Spacing(12);
+        s.Children().Append(Label(L"Project", 19));
+        auto projectRow = StackPanel(); projectRow.Orientation(Orientation::Horizontal); projectRow.Spacing(12); projectRow.VerticalAlignment(VerticalAlignment::Center);
+        auto repo = Button(); repo.Content(box_value(L"View project")); repo.Click([this](auto const&, auto const&) { Action(L"repository"); });
+        auto license = Label(L"Licensed under AGPL-3.0-or-later", 13);
+        license.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        projectRow.Children().Append(repo); projectRow.Children().Append(license); s.Children().Append(projectRow);
+
+        s.Children().Append(Label(L"Credits & licenses", 17));
+        s.Children().Append(Label(L"upstream-ray/codex-usage-monitor — idea and source basis; this fork branched from v1.10 and is now independently developed. MIT.", 13));
+        s.Children().Append(Label(L"lobehub/lobe-icons — provider icons. MIT.", 13));
+        s.Children().Append(Label(L"CodeZeno/Claude-Code-Usage-Monitor — MIT.", 13));
+        s.Children().Append(Label(L"Codex Usage is a maintained derivative of CodeZeno/Claude-Code-Usage-Monitor. Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.", 13));
+        info.Child(s); PageHost().Children().Append(info);
+
         auto update=Card();auto u=StackPanel();u.Spacing(10);u.Children().Append(Label(L"Updates",19));u.Children().Append(Label(state_?std::wstring(state_.GetNamedString(L"update_status",L"Update status unavailable").c_str()):std::wstring(L"Checking update status…"),13));auto check=Button();check.Content(box_value(L"Check for updates"));check.IsEnabled(!(state_&&state_.GetNamedBoolean(L"update_busy",false)));check.Click([this](auto const&,auto const&){Action(L"update");});u.Children().Append(check);update.Child(u);PageHost().Children().Append(update);
         auto channel=state_?state_.GetNamedString(L"install_channel",L"portable"):L"portable";auto uninstallCard=Card();auto us=StackPanel();us.Spacing(10);us.Children().Append(Label(L"Uninstall",19));us.Children().Append(Label(channel==L"winget"?L"This app was installed with WinGet. Uninstalling opens the app’s safe, confirmed removal flow.":L"Remove Codex Usage using its built-in confirmation flow.",13));auto uninstall=Button();uninstall.Content(box_value(L"Uninstall Codex Usage"));uninstall.Click([this](auto const&,auto const&){Action(L"uninstall");});us.Children().Append(uninstall);uninstallCard.Child(us);PageHost().Children().Append(uninstallCard);
     }

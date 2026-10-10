@@ -2,6 +2,12 @@
 
 Codex Usage is a native Windows taskbar widget for viewing Codex and Claude Code quota usage and reset times.
 
+Developed by **Zoltán Rózsa** · [View project](https://github.com/rozsazoltan/codex-usage-monitor) · Licensed under [AGPL-3.0-or-later](LICENSE).
+
+## How it works
+
+Codex Usage is a portable Windows app that runs locally. For Codex and Claude Code, it reuses credentials from your existing CLI sign-ins; there is no separate Codex Usage account, app login, or API-key setup. It sends authenticated HTTPS requests directly to provider services to read quota usage and reset information; quota requests do not pass through a Codex Usage server. If Anthropic's usage endpoint does not provide reset information, Claude Code polling may fall back to a minimal `.` request to the Anthropic Messages API to read rate-limit headers. Update checks separately contact GitHub Releases.
+
 ## Requirements
 
 - Windows 10 or Windows 11.
@@ -29,17 +35,19 @@ bin install github.com/rozsazoltan/codex-usage-monitor
 
 ## Use
 
-The widget appears on the taskbar, with one icon in the notification area. Right-click the widget or tray icon to open its menu. Use **Models** to enable Codex, Claude Code, or both; each provider displays its own quota data. Codex is enabled by default. Claude Code is unavailable until Claude Code CLI credentials are present.
+The widget appears on the taskbar, with one icon in the notification area. Right-click the widget or tray icon to open its menu. Use **Settings** to choose which providers to monitor; Codex is enabled by default. Claude Code is available when Claude Code CLI credentials are present.
 
-The widget shows available 5-hour and weekly quota windows. Use **Settings → Appearance** to select **High contrast dark** or **High contrast light** and customize provider colors. Left-click the tray icon to hide or show the widget. Enable **Start with Windows** in the menu for automatic startup.
+The widget shows available 5-hour and weekly quota windows.
+
+Use **Appearance** to choose **System**, **Dark**, or **Light** and customize provider colors. Left-click the tray icon to hide or show the widget. Enable **Start with Windows** in Settings for automatic startup.
 
 To print the app version in a terminal, run `.\codex-usage.exe --version` or `.\codex-usage.exe -v` from the folder containing the executable.
 
 ## Update and remove
 
-Right-click the widget or tray icon and choose **Settings → Check for Updates**. Confirm the prompt to apply an available update.
+To check for updates, right-click the widget or tray icon, choose **About**, then select **Check for updates**. Confirm the prompt to apply an available update.
 
-Choose **Uninstall…** from the context menu to remove the app. Settings are kept by default; choose to remove them in the second confirmation prompt. A portable copy removes only its executable and matching startup entries, not its containing folder. A managed installation also removes its shortcuts, startup entries, and uninstall registration.
+To uninstall the app, choose **About** from the context menu and select **Uninstall Codex Usage**. Settings are kept by default; choose whether to remove them in the second confirmation prompt. A portable copy removes only its executable and matching startup entries, not its containing folder. A managed installation also removes its shortcuts, startup entries, and uninstall registration.
 
 For a WinGet installation, use:
 
@@ -90,8 +98,12 @@ The script restores/rebuilds native XAML with full VS MSBuild (not `dotnet build
 
 `build.rs` only embeds pre-generated files and never restores packages or accesses the network. A plain `cargo build --release` deliberately fails without `CODEX_SETTINGS_PAYLOAD` pointing to generated `manifest.json` and `payload.bin`; use the release script rather than publishing a build without settings. After any native change, rerun the full release script. GitHub releases still contain only the portable EXE and its SHA-256 checksum.
 
-## License and acknowledgment
+## Credits and licenses
 
-Codex Usage is licensed under [AGPL-3.0-or-later](LICENSE).
+This repository is licensed under [AGPL-3.0-or-later](LICENSE).
 
-Thanks to [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor) for the initial structure and idea.
+- [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor) is the original idea and source basis. This repository branched from v1.10 and is now independently developed. The upstream project is licensed under MIT.
+- [lobehub/lobe-icons](https://github.com/lobehub/lobe-icons) provides the provider icon sources and is licensed under MIT.
+- [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) is licensed under MIT.
+
+Codex Usage is a maintained derivative of CodeZeno/Claude-Code-Usage-Monitor. Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.

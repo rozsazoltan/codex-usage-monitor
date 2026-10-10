@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_ASSET_NAME: codex-usage.exe
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/codex-usage.exe dist/codex-usage.exe
+
+          $hash = (Get-FileHash -Algorithm SHA256 dist/codex-usage.exe).Hash.ToLowerInvariant()
+          "$hash  codex-usage.exe" | Set-Content -Encoding ascii dist/codex-usage.exe.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/codex-usage.exe
+            dist/codex-usage.exe.sha256
+          generate_release_notes: true

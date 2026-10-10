@@ -5,6 +5,7 @@
 #include <shellapi.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <map>
@@ -57,7 +58,12 @@ namespace winrt::SettingsUI::implementation
     {
         InitializeComponent();
         dispatcher_ = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+        debounceTimer_ = dispatcher_.CreateTimer();
+        debounceTimer_.Interval(std::chrono::seconds(4));
+        debounceTimer_.IsRepeating(false);
+        debounceTimer_.Tick([this](auto const&, auto const&) { debounceElapsed_ = true; SendNextMutation(); });
         check_hresult(m_inner.as<::IWindowNative>()->get_WindowHandle(&hwnd_));
+        closingToken_ = AppWindow().Closing([this](auto const& sender, auto const& args) { OnWindowClosing(sender, args); });
         MONITORINFO monitor{ sizeof(monitor) };
         if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor))
         {
@@ -236,13 +242,85 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::Send(JsonObject request)
     {
         if (stopping_) return;
-        if (inFlight_ != 0) { ShowMessage(L"Please wait for the current setting to finish applying."); return; }
+        if (inFlight_ != 0) return;
         inFlight_ = nextId_++;
         request.Insert(L"id", JsonValue::CreateNumberValue(inFlight_));
         const auto text = Utf8(request.Stringify().c_str());
         if (text.empty() || text.size() > 65536) { inFlight_ = 0; ShowMessage(L"The request could not be sent.", true); return; }
         { std::lock_guard lock(requestsMutex_); requests_.push(text); }
-        requestsChanged_.notify_one(); ShowMessage(L"Applying…");
+        requestsChanged_.notify_one();
+    }
+
+    bool MainWindow::HasPendingChanges() const { return pendingChanges_ && pendingChanges_.Size() != 0; }
+
+    void MainWindow::FlushPending()
+    {
+        if (debounceTimer_) debounceTimer_.Stop();
+        debounceElapsed_ = true;
+        flushRequested_ = true;
+        SendNextMutation();
+    }
+
+    void MainWindow::SendNextMutation()
+    {
+        if (stopping_ || inFlight_ != 0) return;
+        if (HasPendingChanges())
+        {
+            auto server = state_ ? state_.GetNamedObject(L"settings", JsonObject()) : JsonObject();
+            auto changes = JsonArray();
+            auto snapshot = JsonObject();
+            auto remainder = JsonObject();
+            for (auto const& pair : pendingChanges_)
+            {
+                const auto key = std::wstring(pair.Key().c_str());
+                if ((!flightChanges_ || !flightChanges_.HasKey(key)) && server.HasKey(key) && server.GetNamedValue(key).Stringify() == pair.Value().Stringify()) continue;
+                if (changes.Size() == 20) { remainder.Insert(key, pair.Value()); continue; }
+                auto change = JsonObject(); change.Insert(L"key", JsonValue::CreateStringValue(key)); change.Insert(L"value", pair.Value()); changes.Append(change);
+                snapshot.Insert(key, pair.Value());
+            }
+            pendingChanges_ = remainder;
+            if (changes.Size() != 0)
+            {
+                auto request = Request(L"set_batch"); request.Insert(L"changes", changes);
+                flightChanges_ = snapshot; mutationInFlight_ = true;
+                ShowMessage(L"Applying changes…");
+                Send(request);
+                return;
+            }
+        }
+        if (persistNeeded_ && flushRequested_)
+        {
+            mutationInFlight_ = false;
+            auto request = Request(L"persist");
+            persistInFlight_ = true;
+            ShowMessage(L"Saving changes…");
+            Send(request);
+            return;
+        }
+        if (flushRequested_) { flushRequested_ = false; ContinueDeferredWork(); }
+    }
+
+    void MainWindow::ContinueDeferredWork()
+    {
+        if (closeRequested_)
+        {
+            if (persistNeeded_ || HasPendingChanges() || inFlight_ != 0) return;
+            closeRequested_ = false;
+            closingFromParent_ = true;
+            Close();
+            return;
+        }
+        if (deferredAction_ && !persistNeeded_ && !HasPendingChanges() && inFlight_ == 0)
+        {
+            auto action = *deferredAction_; deferredAction_.reset();
+            auto request = Request(L"action"); request.Insert(L"action", JsonValue::CreateStringValue(action)); Send(request);
+        }
+    }
+
+    void MainWindow::OnWindowClosing(Microsoft::UI::Windowing::AppWindow const&, Microsoft::UI::Windowing::AppWindowClosingEventArgs const& args)
+    {
+        if (closingFromParent_ || stopping_ || (!HasPendingChanges() && !mutationInFlight_ && !persistNeeded_)) return;
+        args.Cancel(true); closeRequested_ = true; FlushPending();
     }
 
     void MainWindow::Receive(JsonObject const& message)
@@ -250,7 +328,7 @@ namespace winrt::SettingsUI::implementation
         if (message.HasKey(L"event"))
         {
             auto event = message.GetNamedString(L"event", L"");
-            if (event == L"shutdown") { stopping_ = true; Close(); return; }
+            if (event == L"shutdown") { stopping_ = true; closingFromParent_ = true; Close(); return; }
             if (event == L"activate")
             {
                 auto target = std::wstring(message.GetNamedString(L"page", L"general").c_str());
@@ -261,8 +339,9 @@ namespace winrt::SettingsUI::implementation
             else if (event == L"state" && message.HasKey(L"state") && message.GetNamedValue(L"state").ValueType() == JsonValueType::Object)
             {
                 auto updated = message.GetNamedObject(L"state");
-                const bool settingsChanged = !state_ || state_.GetNamedObject(L"settings", JsonObject()).Stringify() != updated.GetNamedObject(L"settings", JsonObject()).Stringify();
-                state_ = updated;
+                const auto revision = static_cast<uint64_t>(message.GetNamedNumber(L"revision", 0));
+                const bool settingsChanged = revision >= revision_ && (!state_ || state_.GetNamedObject(L"settings", JsonObject()).Stringify() != updated.GetNamedObject(L"settings", JsonObject()).Stringify());
+                if (revision >= revision_) { state_ = updated; revision_ = revision; }
                 // Poll/status events are frequent; avoid rebuilding controls (and
                 // stealing keyboard focus) when only non-setting state changed.
                 if (settingsChanged || page_ == L"About") Hydrate();
@@ -273,14 +352,56 @@ namespace winrt::SettingsUI::implementation
         const bool isInitialGet = initialGetPending_;
         initialGetPending_ = false;
         inFlight_ = 0;
-        if (message.HasKey(L"state") && message.GetNamedValue(L"state").ValueType() == JsonValueType::Object) state_ = message.GetNamedObject(L"state");
-        Hydrate();
+        const auto responseRevision = static_cast<uint64_t>(message.GetNamedNumber(L"revision", 0));
+        if (message.HasKey(L"state") && message.GetNamedValue(L"state").ValueType() == JsonValueType::Object && responseRevision >= revision_)
+        { state_ = message.GetNamedObject(L"state"); revision_ = responseRevision; }
         const bool ok = message.GetNamedBoolean(L"ok", false);
-        if (!ok) ShowMessage(std::wstring(message.GetNamedString(L"error", L"The setting could not be applied.").c_str()), true);
-        else if (!isInitialGet) ShowMessage(L"Saved. Changes are now in effect.");
+        const bool wasPersist = persistInFlight_;
+        persistInFlight_ = false;
+        if (mutationInFlight_)
+        {
+            mutationInFlight_ = false;
+            if (!ok && message.GetNamedString(L"error_code", L"") == L"save_failed")
+            {
+                persistNeeded_ = true;
+                ShowMessage(std::wstring(message.GetNamedString(L"error", L"Changes are active, but could not be saved.").c_str()), true);
+            }
+            else if (!ok)
+            {
+                // A rejected batch was not applied. Do not retry it automatically;
+                // only edits made after it was sent remain eligible for a new batch.
+                flushRequested_ = false; debounceElapsed_ = false;
+                deferredAction_.reset(); closeRequested_ = false;
+                ShowMessage(std::wstring(message.GetNamedString(L"error", L"The setting could not be applied.").c_str()), true);
+                if (HasPendingChanges() && debounceTimer_) { debounceTimer_.Stop(); debounceTimer_.Start(); }
+            }
+            else
+            {
+                persistNeeded_ = false;
+                if (!isInitialGet) ShowMessage(L"Saved. Changes are now in effect.");
+            }
+            flightChanges_ = nullptr;
+        }
+        else if (wasPersist)
+        {
+            if (ok) { persistNeeded_ = false; ShowMessage(L"Changes saved."); }
+            else { persistNeeded_ = true; flushRequested_ = false; ShowMessage(std::wstring(message.GetNamedString(L"error", L"Changes could not be saved. Try again.").c_str()), true); }
+        }
+        else if (!ok) ShowMessage(std::wstring(message.GetNamedString(L"error", L"The request could not be completed.").c_str()), true);
+        Hydrate();
+        if (HasPendingChanges() && !flushRequested_ && debounceElapsed_) SendNextMutation();
+        else if (flushRequested_) SendNextMutation();
+        else ContinueDeferredWork();
     }
 
-    JsonObject MainWindow::State() const { return state_ ? state_.GetNamedObject(L"settings", JsonObject()) : JsonObject(); }
+    JsonObject MainWindow::State() const
+    {
+        auto settings = state_ ? state_.GetNamedObject(L"settings", JsonObject()) : JsonObject();
+        auto effective = JsonObject::Parse(settings.Stringify());
+        if (flightChanges_) for (auto const& pair : flightChanges_) effective.Insert(pair.Key(), pair.Value());
+        if (pendingChanges_) for (auto const& pair : pendingChanges_) effective.Insert(pair.Key(), pair.Value());
+        return effective;
+    }
     JsonObject MainWindow::Setting(std::wstring const&) { return State(); }
     bool MainWindow::Bool(std::wstring const& key) { auto s = State(); return s.GetNamedBoolean(key, false); }
     std::wstring MainWindow::Text(std::wstring const& key)
@@ -292,11 +413,18 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::SetValue(std::wstring const& key, IJsonValue const& value)
     {
         if (hydrating_) return;
-        auto request = Request(L"set"); request.Insert(L"key", JsonValue::CreateStringValue(key)); request.Insert(L"value", value); Send(request);
+        if (!pendingChanges_) pendingChanges_ = JsonObject();
+        pendingChanges_.Insert(key, value);
+        debounceElapsed_ = false;
+        flushRequested_ = false;
+        if (debounceTimer_) { debounceTimer_.Stop(); debounceTimer_.Start(); }
+        Hydrate();
+        ShowMessage(L"Changes will be applied shortly.");
     }
     void MainWindow::Action(std::wstring const& action)
     {
-        auto request = Request(L"action"); request.Insert(L"action", JsonValue::CreateStringValue(action)); Send(request);
+        deferredAction_ = action;
+        FlushPending();
     }
     void MainWindow::ShowMessage(std::wstring const& text, bool error)
     {

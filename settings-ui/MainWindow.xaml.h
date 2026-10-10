@@ -2,10 +2,13 @@
 #include "MainWindow.g.h"
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
+#include <winrt/Microsoft.UI.Dispatching.h>
 #include <winrt/Windows.Data.Json.h>
 
 namespace winrt::SettingsUI::implementation
@@ -20,6 +23,12 @@ namespace winrt::SettingsUI::implementation
         void RenderPage(std::wstring const& page);
         void Receive(winrt::Windows::Data::Json::JsonObject const& message);
         void Send(winrt::Windows::Data::Json::JsonObject request);
+        void FlushPending();
+        void SendNextMutation();
+        void ContinueDeferredWork();
+        bool HasPendingChanges() const;
+        void OnWindowClosing(Microsoft::UI::Windowing::AppWindow const&,
+            Microsoft::UI::Windowing::AppWindowClosingEventArgs const& args);
         void SetValue(std::wstring const& key, winrt::Windows::Data::Json::IJsonValue const& value);
         void Action(std::wstring const& action);
         void ShowMessage(std::wstring const& text, bool error = false);
@@ -39,7 +48,10 @@ namespace winrt::SettingsUI::implementation
         uint32_t parentPid_{};
         std::wstring page_{ L"General" };
         winrt::Windows::Data::Json::JsonObject state_{ nullptr };
+        winrt::Windows::Data::Json::JsonObject flightChanges_{ nullptr };
+        winrt::Windows::Data::Json::JsonObject pendingChanges_{ nullptr };
         winrt::Microsoft::UI::Dispatching::DispatcherQueue dispatcher_{ nullptr };
+        winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer debounceTimer_{ nullptr };
         std::atomic<bool> stopping_{ false };
         std::atomic<bool> hydrating_{ false };
         std::mutex requestsMutex_;
@@ -47,7 +59,17 @@ namespace winrt::SettingsUI::implementation
         std::queue<std::string> requests_;
         uint32_t nextId_{ 1 };
         uint32_t inFlight_{ 0 };
+        uint64_t revision_{};
         bool initialGetPending_{};
+        bool mutationInFlight_{};
+        bool persistInFlight_{};
+        bool persistNeeded_{};
+        bool flushRequested_{};
+        bool closeRequested_{};
+        bool closingFromParent_{};
+        bool debounceElapsed_{};
+        std::optional<std::wstring> deferredAction_;
+        winrt::event_token closingToken_{};
         std::thread ioThread_;
         std::atomic<HANDLE> pipeHandle_{ INVALID_HANDLE_VALUE };
         HWND hwnd_{};

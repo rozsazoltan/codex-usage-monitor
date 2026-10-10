@@ -636,6 +636,12 @@ fn build_live_plan(executable: &Path, remove_settings: bool) -> Result<CleanupPl
     let kind = detect_kind_for_executable(&executable);
     let paths = live_cleanup_paths(kind, remove_settings)?;
     let mut targets = build_targets(kind, &executable, remove_settings, &paths)?;
+    if kind != UninstallKind::Winget {
+        // Companion cache only: preferences and the shared Windows runtime are separate.
+        let cache = crate::settings_payload::cache_root()
+            .map_err(|error| format!("Unable to resolve settings payload cache: {error}"))?;
+        targets.push(CleanupTarget::Directory(cache));
+    }
 
     if kind == UninstallKind::Managed {
         let local_app_data = env_path("LOCALAPPDATA")

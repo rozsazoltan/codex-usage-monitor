@@ -13,7 +13,7 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,8 +21,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
-        run: cargo build --release
+      - name: Verify native build prerequisites
+        shell: pwsh
+        run: |
+          # windows-2022 includes VS 2022 C++, full-framework MSBuild and this SDK.
+          $sdk = "${env:ProgramFiles(x86)}/Windows Kits/10/Include/10.0.26100.0"
+          if (-not (Test-Path "$sdk/um/Windows.h")) { throw 'Windows SDK 10.0.26100.0 is required.' }
+
+      - name: Build native companion and embedded release binary
+        shell: pwsh
+        run: ./scripts/build-release.ps1
 
       - name: Prepare release assets
         shell: pwsh

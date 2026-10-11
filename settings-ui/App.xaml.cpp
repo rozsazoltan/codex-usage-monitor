@@ -2,11 +2,13 @@
 #include "App.xaml.h"
 #include "MainWindow.xaml.h"
 #include "App.xaml.g.hpp"
+#include <shobjidl_core.h>
 
 namespace winrt::SettingsUI::implementation
 {
     App::App()
     {
+        SetCurrentProcessExplicitAppUserModelID(L"com.datarose.codexusage");
         InitializeComponent();
     }
 

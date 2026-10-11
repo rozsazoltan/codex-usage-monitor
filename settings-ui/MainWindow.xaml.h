@@ -35,6 +35,7 @@ namespace winrt::SettingsUI::implementation
         void ShowMessage(std::wstring const& text, bool error = false);
         void UpdateClaudeAvailability();
         void UpdateAboutControls();
+        void UpdateTitleBarLayout();
         void OpenThirdPartyNotices();
         void Hydrate();
         void RefreshSettingsControlsIfSafe();
@@ -92,6 +93,10 @@ namespace winrt::SettingsUI::implementation
         HWND hwnd_{};
         HICON windowIcon_{};
         winrt::Microsoft::UI::Xaml::Window noticesWindow_{ nullptr };
+        winrt::Microsoft::UI::Xaml::XamlRoot xamlRoot_{ nullptr };
+        winrt::event_token appWindowChangedToken_{};
+        winrt::event_token xamlRootChangedToken_{};
+        winrt::event_token navigationLoadedToken_{};
     };
 }
 

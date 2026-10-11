@@ -190,6 +190,21 @@ namespace winrt::SettingsUI::implementation
         check_hresult(m_inner.as<::IWindowNative>()->get_WindowHandle(&hwnd_));
         windowIcon_ = LoadResourceIcon();
         ApplyWindowIcon(*this, windowIcon_);
+        ExtendsContentIntoTitleBar(true);
+        SetTitleBar(TitleBarDragRegion());
+        AppWindow().TitleBar().IconShowOptions(Microsoft::UI::Windowing::IconShowOptions::HideIconAndSystemMenu);
+        UpdateTitleBarLayout();
+        appWindowChangedToken_ = AppWindow().Changed([this](auto const&, auto const& args)
+        {
+            if (args.DidPositionChange() || args.DidSizeChange()) UpdateTitleBarLayout();
+        });
+        navigationLoadedToken_ = Navigation().Loaded([this](auto const& sender, auto const&)
+        {
+            xamlRoot_ = sender.as<NavigationView>().XamlRoot();
+            if (xamlRoot_)
+                xamlRootChangedToken_ = xamlRoot_.Changed([this](auto const&, auto const&) { UpdateTitleBarLayout(); });
+            UpdateTitleBarLayout();
+        });
         closingToken_ = AppWindow().Closing([this](auto const& sender, auto const& args) { OnWindowClosing(sender, args); });
         MONITORINFO monitor{ sizeof(monitor) };
         if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor))
@@ -242,6 +257,9 @@ namespace winrt::SettingsUI::implementation
 
     MainWindow::~MainWindow()
     {
+        if (appWindowChangedToken_) AppWindow().Changed(appWindowChangedToken_);
+        if (navigationLoadedToken_) Navigation().Loaded(navigationLoadedToken_);
+        if (xamlRoot_ && xamlRootChangedToken_) xamlRoot_.Changed(xamlRootChangedToken_);
         if (noticesWindow_)
         {
             noticesWindow_.Close();
@@ -633,6 +651,24 @@ namespace winrt::SettingsUI::implementation
                 : L"The built-in flow will ask you to confirm before removing anything.");
         }
     }
+    void MainWindow::UpdateTitleBarLayout()
+    {
+        if (!hwnd_) return;
+        const auto dpi = GetDpiForWindow(hwnd_);
+        if (!dpi) return;
+        const auto scale = static_cast<double>(dpi) / 96.0;
+        const auto titleBar = AppWindow().TitleBar();
+        const auto nativeHeight = titleBar.Height();
+        // AppWindow title-bar metrics are physical pixels; XAML layout uses DIPs.
+        const auto heightDip = nativeHeight > 0 ? static_cast<double>(nativeHeight) / scale : 32.0;
+        TitleBarRow().Height(GridLengthHelper::FromValueAndType(heightDip, GridUnitType::Pixel));
+        TitleBarDragRegion().Height(heightDip);
+        TitleBarDragRegion().Margin(Thickness{
+            static_cast<double>(titleBar.LeftInset()) / scale,
+            0,
+            static_cast<double>(titleBar.RightInset()) / scale,
+            0 });
+    }
     void MainWindow::OpenThirdPartyNotices()
     {
         if (noticesWindow_)
@@ -663,13 +699,27 @@ namespace winrt::SettingsUI::implementation
         Grid::SetRow(text, 1);
         layout.Children().Append(text);
         window.Content(layout);
-        window.AppWindow().Resize({ 900, 700 });
+
+        const auto ownerDpi = GetDpiForWindow(hwnd_);
+        const auto dpi = ownerDpi ? ownerDpi : 96;
+        auto width = MulDiv(900, dpi, 96);
+        auto height = MulDiv(700, dpi, 96);
         RECT owner{};
-        if (GetWindowRect(hwnd_, &owner))
+        MONITORINFO monitor{ sizeof(monitor) };
+        const bool hasOwner = GetWindowRect(hwnd_, &owner) != FALSE;
+        if (hasOwner && GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor))
         {
-            window.AppWindow().MoveAndResize({ owner.left + ((owner.right - owner.left) - 900) / 2,
-                owner.top + ((owner.bottom - owner.top) - 700) / 2, 900, 700 });
+            const auto workWidth = monitor.rcWork.right - monitor.rcWork.left;
+            const auto workHeight = monitor.rcWork.bottom - monitor.rcWork.top;
+            width = std::min<int>(width, static_cast<int>(workWidth));
+            height = std::min<int>(height, static_cast<int>(workHeight));
+            const auto left = std::clamp<int>(static_cast<int>(owner.left + ((owner.right - owner.left) - width) / 2),
+                static_cast<int>(monitor.rcWork.left), static_cast<int>(monitor.rcWork.right - width));
+            const auto top = std::clamp<int>(static_cast<int>(owner.top + ((owner.bottom - owner.top) - height) / 2),
+                static_cast<int>(monitor.rcWork.top), static_cast<int>(monitor.rcWork.bottom - height));
+            window.AppWindow().MoveAndResize({ left, top, width, height });
         }
+        else window.AppWindow().Resize({ width, height });
         ApplyWindowIcon(window, windowIcon_);
         noticesWindow_ = window;
         auto weak = get_weak();

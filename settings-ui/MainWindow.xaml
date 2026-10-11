@@ -3,7 +3,14 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="Codex Usage — Settings">
     <Window.SystemBackdrop><MicaBackdrop /></Window.SystemBackdrop>
-    <NavigationView x:Name="Navigation" PaneDisplayMode="Left" CompactPaneLength="48" IsBackButtonVisible="Collapsed"
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition x:Name="TitleBarRow" Height="32" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Grid x:Name="TitleBarDragRegion" Grid.Row="0" Background="Transparent"
+              AutomationProperties.Name="Window drag area" AutomationProperties.AutomationId="SettingsTitleBarDragRegion" />
+        <NavigationView x:Name="Navigation" Grid.Row="1" PaneDisplayMode="Left" CompactPaneLength="48" IsBackButtonVisible="Collapsed"
         IsSettingsVisible="False" OpenPaneLength="244" SelectionChanged="OnNavigationChanged"
         Background="Transparent" IsPaneToggleButtonVisible="True">
         <NavigationView.Resources>
@@ -43,5 +50,6 @@
             </ScrollViewer>
             <InfoBar x:Name="MessageBar" VerticalAlignment="Bottom" HorizontalAlignment="Right" MaxWidth="560" Margin="24,0,24,18" IsOpen="False" IsClosable="True" Severity="Informational" AutomationProperties.Name="Settings feedback" AutomationProperties.AutomationId="SettingsFeedback" AutomationProperties.LiveSetting="Polite" />
         </Grid>
-    </NavigationView>
+        </NavigationView>
+    </Grid>
 </Window>

@@ -139,6 +139,56 @@ namespace
             if (!after.HasKey(pair.Key()) || after.GetNamedValue(pair.Key()).Stringify() != pair.Value().Stringify()) return true;
         return false;
     }
+    bool IsSettingsChangingAction(std::optional<std::wstring> const& action)
+    {
+        return action && (*action == L"recommended" || *action == L"reset_appearance" || *action == L"reset_colors");
+    }
+    std::optional<std::array<uint8_t, 3>> ParseHexColor(std::wstring const& text)
+    {
+        if (text.size() != 7 || text[0] != L'#') return std::nullopt;
+        std::array<uint8_t, 3> color{};
+        auto hexDigit = [](wchar_t value) -> int
+        {
+            if (value >= L'0' && value <= L'9') return value - L'0';
+            if (value >= L'A' && value <= L'F') return value - L'A' + 10;
+            if (value >= L'a' && value <= L'f') return value - L'a' + 10;
+            return -1;
+        };
+        for (size_t i = 0; i < color.size(); ++i)
+        {
+            const auto high = hexDigit(text[1 + i * 2]);
+            const auto low = hexDigit(text[2 + i * 2]);
+            if (high < 0 || low < 0) return std::nullopt;
+            color[i] = static_cast<uint8_t>((high << 4) | low);
+        }
+        return color;
+    }
+    std::wstring FormatHexColor(std::array<uint8_t, 3> const& color)
+    {
+        constexpr wchar_t digits[] = L"0123456789ABCDEF";
+        std::wstring text{ L'#' };
+        for (const auto value : color)
+        {
+            text.push_back(digits[value >> 4]);
+            text.push_back(digits[value & 0x0F]);
+        }
+        return text;
+    }
+    std::wstring StoredColorText(JsonObject const& settings, std::wstring const& key)
+    {
+        const auto value = settings.GetNamedValue(key, JsonValue::CreateNullValue());
+        if (value.ValueType() != JsonValueType::Array) return {};
+        const auto array = value.GetArray();
+        if (array.Size() != 3) return {};
+        std::array<uint8_t, 3> color{};
+        for (uint32_t i = 0; i < color.size(); ++i)
+        {
+            const auto component = array.GetAt(i).GetNumber();
+            if (component < 0 || component > 255 || component != static_cast<int>(component)) return {};
+            color[i] = static_cast<uint8_t>(component);
+        }
+        return FormatHexColor(color);
+    }
     bool SettingsChangesAreLocalEcho(JsonObject const& previous, JsonObject const& updated, JsonObject const& localChanges)
     {
         const auto before = previous ? previous.GetNamedObject(L"settings", JsonObject()) : JsonObject();
@@ -260,6 +310,11 @@ namespace winrt::SettingsUI::implementation
         if (appWindowChangedToken_) AppWindow().Changed(appWindowChangedToken_);
         if (navigationLoadedToken_) Navigation().Loaded(navigationLoadedToken_);
         if (xamlRoot_ && xamlRootChangedToken_) xamlRoot_.Changed(xamlRootChangedToken_);
+        if (closeSaveFailureDialog_)
+        {
+            closeSaveFailureDialog_.Hide();
+            closeSaveFailureDialog_ = nullptr;
+        }
         if (noticesWindow_)
         {
             noticesWindow_.Close();
@@ -426,7 +481,10 @@ namespace winrt::SettingsUI::implementation
             for (auto const& pair : pendingChanges_)
             {
                 const auto key = std::wstring(pair.Key().c_str());
-                if ((!flightChanges_ || !flightChanges_.HasKey(key)) && server.HasKey(key) && server.GetNamedValue(key).Stringify() == pair.Value().Stringify()) continue;
+                const bool colorApplyPending = key == L"claude_accent" ? claudeColorApplyText_.has_value()
+                    : key == L"codex_accent" ? codexColorApplyText_.has_value() : false;
+                if ((!flightChanges_ || !flightChanges_.HasKey(key)) && !colorApplyPending &&
+                    server.HasKey(key) && server.GetNamedValue(key).Stringify() == pair.Value().Stringify()) continue;
                 if (changes.Size() == 20) { remainder.Insert(key, pair.Value()); continue; }
                 auto change = JsonObject(); change.Insert(L"key", JsonValue::CreateStringValue(key)); change.Insert(L"value", pair.Value()); changes.Append(change);
                 snapshot.Insert(key, pair.Value());
@@ -435,7 +493,12 @@ namespace winrt::SettingsUI::implementation
             if (changes.Size() != 0)
             {
                 auto request = Request(L"set_batch"); request.Insert(L"changes", changes);
-                flightChanges_ = snapshot; mutationInFlight_ = true;
+                flightChanges_ = snapshot;
+                flightClaudeColorApplyText_ = snapshot.HasKey(L"claude_accent") ? claudeColorApplyText_ : std::nullopt;
+                flightCodexColorApplyText_ = snapshot.HasKey(L"codex_accent") ? codexColorApplyText_ : std::nullopt;
+                if (flightClaudeColorApplyText_) claudeColorApplyText_.reset();
+                if (flightCodexColorApplyText_) codexColorApplyText_.reset();
+                mutationInFlight_ = true;
                 ShowMessage(L"Applying changes…");
                 Send(request);
                 return;
@@ -443,6 +506,18 @@ namespace winrt::SettingsUI::implementation
         }
         if (persistNeeded_ && flushRequested_)
         {
+            if (closeRequested_ && closeSaveDecisionPending_ && !closeWithoutSavingApproved_)
+            {
+                flushRequested_ = false;
+                ContinueDeferredWork();
+                return;
+            }
+            if (closeRequested_ && closeWithoutSavingApproved_)
+            {
+                flushRequested_ = false;
+                ContinueDeferredWork();
+                return;
+            }
             mutationInFlight_ = false;
             auto request = Request(L"persist");
             persistInFlight_ = true;
@@ -456,10 +531,44 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::ContinueDeferredWork()
     {
+        const bool canStartDeferredAction = deferredAction_ && !HasPendingChanges() && inFlight_ == 0 &&
+            !mutationInFlight_ && !persistInFlight_ &&
+            (!persistNeeded_ || (closeRequested_ && closeWithoutSavingApproved_));
+        if (canStartDeferredAction && (!closeRequested_ || IsSettingsChangingAction(deferredAction_)))
+        {
+            auto action = *deferredAction_; deferredAction_.reset();
+            settingsActionInFlight_ = IsSettingsChangingAction(action);
+            settingsActionInFlightName_ = settingsActionInFlight_ ? std::optional<std::wstring>(action) : std::nullopt;
+            if (action == L"reset_colors")
+            {
+                resetColorsClaudeDraftRevision_ = claudeColorDraftRevision_;
+                resetColorsCodexDraftRevision_ = codexColorDraftRevision_;
+            }
+            auto request = Request(L"action"); request.Insert(L"action", JsonValue::CreateStringValue(action)); Send(request);
+            return;
+        }
+
         if (closeRequested_)
         {
-            if (persistNeeded_ || HasPendingChanges() || inFlight_ != 0) return;
+            if (closeSaveDecisionDialogOpen_ || HasPendingChanges() || inFlight_ != 0 ||
+                mutationInFlight_ || persistInFlight_ || settingsActionInFlight_) return;
+            if (HasUnappliedColorDraft())
+            {
+                closeRequested_ = false;
+                closeSaveDecisionPending_ = false;
+                closeWithoutSavingApproved_ = false;
+                ShowMessage(L"Apply or discard each color draft before closing. Your draft text is still available on the Appearance page.", true);
+                return;
+            }
+            if (persistNeeded_ && !closeWithoutSavingApproved_)
+            {
+                closeSaveDecisionPending_ = true;
+                ShowCloseSaveFailureDialog();
+                return;
+            }
             closeRequested_ = false;
+            closeSaveDecisionPending_ = false;
+            closeWithoutSavingApproved_ = false;
             closingFromParent_ = true;
             Close();
             return;
@@ -467,15 +576,127 @@ namespace winrt::SettingsUI::implementation
         if (deferredAction_ && !persistNeeded_ && !HasPendingChanges() && inFlight_ == 0)
         {
             auto action = *deferredAction_; deferredAction_.reset();
-            settingsActionInFlight_ = action == L"recommended" || action == L"reset_appearance" || action == L"reset_colors";
+            settingsActionInFlight_ = IsSettingsChangingAction(action);
+            settingsActionInFlightName_ = settingsActionInFlight_ ? std::optional<std::wstring>(action) : std::nullopt;
+            if (action == L"reset_colors")
+            {
+                resetColorsClaudeDraftRevision_ = claudeColorDraftRevision_;
+                resetColorsCodexDraftRevision_ = codexColorDraftRevision_;
+            }
             auto request = Request(L"action"); request.Insert(L"action", JsonValue::CreateStringValue(action)); Send(request);
         }
     }
 
+    void MainWindow::ShowCloseSaveFailureDialog()
+    {
+        if (closeSaveDecisionDialogOpen_) return;
+        auto root = Navigation().XamlRoot();
+        if (!root)
+        {
+            closeRequested_ = false;
+            closeSaveDecisionPending_ = false;
+            ShowMessage(L"The save decision could not be opened. Settings remain open; your current changes are still active but may not be saved.", true);
+            return;
+        }
+
+        auto dialog = ContentDialog();
+        dialog.XamlRoot(root);
+        dialog.Title(box_value(L"Changes could not be saved"));
+        dialog.Content(box_value(L"Your changes are active in the widget but could not be saved. Retry to save them. Close without saving keeps the current values only for this run; they may be lost when Codex Usage exits. Cancel returns to settings."));
+        dialog.PrimaryButtonText(L"Retry save");
+        dialog.SecondaryButtonText(L"Close without saving");
+        dialog.CloseButtonText(L"Cancel");
+        dialog.DefaultButton(ContentDialogButton::Primary);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(dialog, L"CloseSaveFailureDialog");
+        closeSaveFailureDialog_ = dialog;
+        closeSaveDecisionDialogOpen_ = true;
+
+        auto weak = get_weak();
+        try
+        {
+            auto operation = dialog.ShowAsync();
+            operation.Completed([weak](auto const& completedOperation, auto const& status)
+            {
+                auto result = ContentDialogResult::None;
+                const bool completed = status == Windows::Foundation::AsyncStatus::Completed;
+                if (completed)
+                {
+                    try { result = completedOperation.GetResults(); }
+                    catch (...) {}
+                }
+                if (auto self = weak.get())
+                {
+                    self->dispatcher_.TryEnqueue([weak, result, completed]()
+                    {
+                        if (auto owner = weak.get()) owner->CompleteCloseSaveDecision(result, completed);
+                    });
+                }
+            });
+        }
+        catch (...)
+        {
+            closeSaveFailureDialog_ = nullptr;
+            closeSaveDecisionDialogOpen_ = false;
+            closeRequested_ = false;
+            closeSaveDecisionPending_ = false;
+            ShowMessage(L"The save decision could not be opened. Settings remain open; your current changes are still active but may not be saved.", true);
+        }
+    }
+
+    void MainWindow::CompleteCloseSaveDecision(ContentDialogResult result, bool completed)
+    {
+        closeSaveFailureDialog_ = nullptr;
+        closeSaveDecisionDialogOpen_ = false;
+        if (!completed)
+        {
+            closeRequested_ = false;
+            closeSaveDecisionPending_ = false;
+            closeWithoutSavingApproved_ = false;
+            ShowMessage(L"The save decision could not be completed. Settings remain open; your current changes may not be saved.", true);
+            return;
+        }
+
+        if (result == ContentDialogResult::Primary)
+        {
+            closeRequested_ = true;
+            closeSaveDecisionPending_ = false;
+            closeWithoutSavingApproved_ = false;
+            FlushPending();
+            return;
+        }
+        if (result == ContentDialogResult::Secondary)
+        {
+            closeRequested_ = true;
+            closeSaveDecisionPending_ = false;
+            closeWithoutSavingApproved_ = true;
+            FlushPending();
+            return;
+        }
+
+        closeRequested_ = false;
+        closeSaveDecisionPending_ = false;
+        closeWithoutSavingApproved_ = false;
+        ShowMessage(IsSettingsChangingAction(deferredAction_)
+            ? L"Close canceled. The requested settings action is still waiting for a successful save. Current changes remain active; unsaved changes may be lost when Codex Usage exits."
+            : L"Close canceled. Current changes remain active; unsaved changes may be lost when Codex Usage exits.", true);
+    }
+
     void MainWindow::OnWindowClosing(Microsoft::UI::Windowing::AppWindow const&, Microsoft::UI::Windowing::AppWindowClosingEventArgs const& args)
     {
-        if (closingFromParent_ || stopping_ || (!HasPendingChanges() && !mutationInFlight_ && !persistNeeded_)) return;
-        args.Cancel(true); closeRequested_ = true; FlushPending();
+        if (closingFromParent_ || stopping_) return;
+        const bool hasCloseSensitiveAction = settingsActionInFlight_ || IsSettingsChangingAction(deferredAction_);
+        const bool hasPendingSave = HasPendingChanges() || mutationInFlight_ || persistInFlight_ || persistNeeded_;
+        const bool hasUnappliedColorDraft = HasUnappliedColorDraft();
+        if (!hasCloseSensitiveAction && !hasPendingSave && !hasUnappliedColorDraft) return;
+        args.Cancel(true);
+        if (closeRequested_) return;
+        if (hasUnappliedColorDraft)
+        {
+            ShowMessage(L"Apply or discard each color draft before closing. Your draft text is still available on the Appearance page.", true);
+            return;
+        }
+        closeRequested_ = true;
+        FlushPending();
     }
 
     void MainWindow::Receive(JsonObject const& message)
@@ -509,6 +730,7 @@ namespace winrt::SettingsUI::implementation
                 }
                 UpdateClaudeAvailability();
                 UpdateAboutControls();
+                if (settingsChanged) SyncPaneState();
                 // Poll/status events are frequent; avoid rebuilding controls (and
                 // stealing keyboard focus) when only non-setting state changed.
                 // Local edits are already represented by the controls and the
@@ -527,19 +749,17 @@ namespace winrt::SettingsUI::implementation
         const bool isInitialGet = initialGetPending_;
         const bool wasMutation = mutationInFlight_;
         const bool wasSettingsAction = settingsActionInFlight_;
+        const auto completedSettingsAction = settingsActionInFlightName_;
         initialGetPending_ = false;
         settingsActionInFlight_ = false;
+        settingsActionInFlightName_.reset();
         inFlight_ = 0;
         const auto responseRevision = static_cast<uint64_t>(message.GetNamedNumber(L"revision", 0));
         if (message.HasKey(L"state") && message.GetNamedValue(L"state").ValueType() == JsonValueType::Object && responseRevision >= revision_)
         { state_ = message.GetNamedObject(L"state"); revision_ = responseRevision; }
         if (isInitialGet)
         {
-            const auto settings = state_ ? state_.GetNamedObject(L"settings", JsonObject()) : JsonObject();
-            hydrating_ = true;
-            Navigation().IsPaneOpen(settings.GetNamedBoolean(L"settings_pane_open", true));
-            hydrating_ = false;
-            paneStateKnown_ = true;
+            SyncPaneState();
         }
         UpdateClaudeAvailability();
         UpdateAboutControls();
@@ -552,6 +772,8 @@ namespace winrt::SettingsUI::implementation
             if (!ok && message.GetNamedString(L"error_code", L"") == L"save_failed")
             {
                 persistNeeded_ = true;
+                if (flightClaudeColorApplyText_) persistClaudeColorApplyText_ = flightClaudeColorApplyText_;
+                if (flightCodexColorApplyText_) persistCodexColorApplyText_ = flightCodexColorApplyText_;
                 ShowMessage(std::wstring(message.GetNamedString(L"error", L"Changes are active, but could not be saved.").c_str()), true);
             }
             else if (!ok)
@@ -559,31 +781,89 @@ namespace winrt::SettingsUI::implementation
                 // A rejected batch was not applied. Do not retry it automatically;
                 // only edits made after it was sent remain eligible for a new batch.
                 flushRequested_ = false; debounceElapsed_ = false;
-                deferredAction_.reset(); closeRequested_ = false;
+                const bool keepCloseForSettingsAction = closeRequested_ && IsSettingsChangingAction(deferredAction_);
+                if (!keepCloseForSettingsAction) deferredAction_.reset();
+                closeRequested_ = keepCloseForSettingsAction;
+                closeSaveDecisionPending_ = false;
+                closeWithoutSavingApproved_ = false;
+                flightClaudeColorApplyText_.reset();
+                flightCodexColorApplyText_.reset();
                 ShowMessage(std::wstring(message.GetNamedString(L"error", L"The setting could not be applied.").c_str()), true);
                 if (HasPendingChanges() && debounceTimer_) { debounceTimer_.Stop(); debounceTimer_.Start(); }
             }
             else
             {
                 persistNeeded_ = false;
+                closeSaveDecisionPending_ = false;
+                CompleteColorApply(L"claude_accent", flightClaudeColorApplyText_);
+                CompleteColorApply(L"codex_accent", flightCodexColorApplyText_);
+                CompleteColorApply(L"claude_accent", persistClaudeColorApplyText_);
+                CompleteColorApply(L"codex_accent", persistCodexColorApplyText_);
+                flightClaudeColorApplyText_.reset();
+                flightCodexColorApplyText_.reset();
+                persistClaudeColorApplyText_.reset();
+                persistCodexColorApplyText_.reset();
                 if (!isInitialGet) ShowMessage(L"Saved. Changes are now in effect.");
             }
             flightChanges_ = nullptr;
         }
         else if (wasPersist)
         {
-            if (ok) { persistNeeded_ = false; ShowMessage(L"Changes saved."); }
-            else { persistNeeded_ = true; flushRequested_ = false; ShowMessage(std::wstring(message.GetNamedString(L"error", L"Changes could not be saved. Try again.").c_str()), true); }
+            if (ok)
+            {
+                persistNeeded_ = false;
+                closeSaveDecisionPending_ = false;
+                CompleteColorApply(L"claude_accent", persistClaudeColorApplyText_);
+                CompleteColorApply(L"codex_accent", persistCodexColorApplyText_);
+                persistClaudeColorApplyText_.reset();
+                persistCodexColorApplyText_.reset();
+                ShowMessage(L"Changes saved.");
+            }
+            else
+            {
+                persistNeeded_ = true;
+                flushRequested_ = false;
+                if (closeRequested_)
+                {
+                    closeSaveDecisionPending_ = true;
+                    if (HasPendingChanges()) flushRequested_ = true;
+                }
+                ShowMessage(std::wstring(message.GetNamedString(L"error", L"Changes could not be saved. Try again.").c_str()), true);
+            }
         }
-        else if (!ok) ShowMessage(std::wstring(message.GetNamedString(L"error", L"The request could not be completed.").c_str()), true);
-        if (isInitialGet || (wasMutation && !ok))
+        const bool settingsActionSaveFailed = wasSettingsAction && !ok &&
+            message.GetNamedString(L"error_code", L"") == L"save_failed";
+        if (settingsActionSaveFailed)
+        {
+            persistNeeded_ = true;
+            settingsRefreshPending_ = true;
+            if (completedSettingsAction == L"reset_colors")
+                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_);
+            if (closeRequested_) flushRequested_ = true;
+            ShowMessage(std::wstring(message.GetNamedString(L"error", L"The action took effect, but its changes could not be saved.").c_str()), true);
+        }
+        else if (!ok && !wasMutation && !wasPersist) ShowMessage(std::wstring(message.GetNamedString(L"error", L"The request could not be completed.").c_str()), true);
+        if (wasSettingsAction && !ok && !settingsActionSaveFailed)
+        {
+            closeRequested_ = false;
+            closeSaveDecisionPending_ = false;
+            closeWithoutSavingApproved_ = false;
+        }
+        if (isInitialGet)
         {
             Hydrate();
             settingsRefreshPending_ = false;
         }
+        else if (wasMutation && !ok)
+        {
+            SyncPaneState();
+            settingsRefreshPending_ = true;
+        }
         else if (wasSettingsAction && ok)
         {
             settingsRefreshPending_ = true;
+            if (completedSettingsAction == L"reset_colors")
+                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_);
         }
         if (HasPendingChanges() && !flushRequested_ && debounceElapsed_) SendNextMutation();
         else if (flushRequested_) SendNextMutation();
@@ -730,7 +1010,60 @@ namespace winrt::SettingsUI::implementation
         });
         noticesWindow_.Activate();
     }
-    void MainWindow::Hydrate() { RenderPage(page_); }
+    void MainWindow::Hydrate()
+    {
+        SyncPaneState();
+        RenderPage(page_);
+    }
+
+    void MainWindow::SyncPaneState()
+    {
+        const auto settings = State();
+        const auto paneOpen = settings.GetNamedBoolean(L"settings_pane_open", true);
+        const bool wasHydrating = hydrating_.load();
+        hydrating_ = true;
+        Navigation().IsPaneOpen(paneOpen);
+        hydrating_ = wasHydrating;
+        paneStateKnown_ = true;
+    }
+
+    void MainWindow::SetColorDraft(std::wstring const& key, std::optional<std::wstring> draft)
+    {
+        if (key == L"claude_accent") claudeColorDraft_ = std::move(draft);
+        else if (key == L"codex_accent") codexColorDraft_ = std::move(draft);
+        appearanceColorDraft_ = claudeColorDraft_.has_value() || codexColorDraft_.has_value();
+    }
+
+    void MainWindow::CompleteColorApply(std::wstring const& key, std::optional<std::wstring> const& appliedDraft)
+    {
+        if (!appliedDraft) return;
+        if (key == L"claude_accent" && claudeColorDraft_ == appliedDraft)
+            SetColorDraft(key, std::nullopt);
+        else if (key == L"codex_accent" && codexColorDraft_ == appliedDraft)
+            SetColorDraft(key, std::nullopt);
+    }
+
+    bool MainWindow::HasUnappliedColorDraft() const
+    {
+        return (claudeColorDraft_ && claudeColorApplyText_ != claudeColorDraft_ &&
+                flightClaudeColorApplyText_ != claudeColorDraft_ && persistClaudeColorApplyText_ != claudeColorDraft_) ||
+            (codexColorDraft_ && codexColorApplyText_ != codexColorDraft_ &&
+                flightCodexColorApplyText_ != codexColorDraft_ && persistCodexColorApplyText_ != codexColorDraft_);
+    }
+
+    void MainWindow::ClearResetColorDraftsIfUnchanged(uint64_t claudeRevision, uint64_t codexRevision)
+    {
+        if (claudeColorDraftRevision_ == claudeRevision)
+        {
+            SetColorDraft(L"claude_accent", std::nullopt);
+            claudeColorApplyText_.reset();
+        }
+        if (codexColorDraftRevision_ == codexRevision)
+        {
+            SetColorDraft(L"codex_accent", std::nullopt);
+            codexColorApplyText_.reset();
+        }
+    }
 
     void MainWindow::RefreshSettingsControlsIfSafe()
     {
@@ -748,9 +1081,6 @@ namespace winrt::SettingsUI::implementation
     }
     void MainWindow::RenderPage(std::wstring const& page)
     {
-        appearanceColorDraft_ = false;
-        claudeColorDraft_ = false;
-        codexColorDraft_ = false;
         page_ = page; PageHost().Children().Clear();
         claudeToggle_ = nullptr;
         versionText_ = nullptr;
@@ -839,7 +1169,73 @@ namespace winrt::SettingsUI::implementation
         auto buttons=StackPanel();buttons.Spacing(8);for(auto [label,action]:std::array<std::pair<std::wstring,std::wstring>,3>{{{L"Recommended",L"recommended"},{L"Reset appearance",L"reset_appearance"},{L"Reset colors",L"reset_colors"}}}){auto b=Button();b.Content(box_value(label));Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(b,std::wstring(L"AppearanceAction_")+action);b.HorizontalAlignment(HorizontalAlignment::Left);b.Click([this,action](auto const&,auto const&){Action(action);});buttons.Children().Append(b);}stack.Children().Append(buttons);
         card.Child(stack);PageHost().Children().Append(card);
         auto colors=Card();auto c=StackPanel();c.Spacing(12);c.Children().Append(Label(L"Provider colors",19));c.Children().Append(Label(L"Use the widget’s recommended colors, or set a custom RGB accent from hex." ,12));
-        for(auto const& [key,title]:std::array<std::pair<std::wstring,std::wstring>,2>{{{L"claude_accent",L"Claude Code accent"},{L"codex_accent",L"Codex accent"}}}){auto group=StackPanel();group.Spacing(6);group.Children().Append(Label(title));auto row=StackPanel();row.Orientation(Orientation::Horizontal);row.Spacing(8);auto input=TextBox();Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(input,title);Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(input,std::wstring(L"Color_")+key);input.PlaceholderText(L"Default color");input.Width(145);auto val=State().GetNamedValue(key,JsonValue::CreateNullValue());if(val.ValueType()==JsonValueType::Array){auto a=val.GetArray();if(a.Size()==3){std::wostringstream hex;hex<<L"#"<<std::uppercase<<std::hex<<std::setfill(L'0');for(auto const& n:a)hex<<std::setw(2)<<static_cast<int>(n.GetNumber());input.Text(hex.str());}}input.TextChanged([this,key](auto const& sender,auto const&){const bool dirty=!sender.as<TextBox>().Text().empty();if(key==L"claude_accent")claudeColorDraft_=dirty;else codexColorDraft_=dirty;appearanceColorDraft_=claudeColorDraft_||codexColorDraft_;});auto set=Button();set.Content(box_value(L"Apply color"));Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(set,std::wstring(L"ApplyColor_")+key);set.Click([this,input,key] (auto const&,auto const&){auto text=input.Text().c_str();unsigned r,g,b;if(swscanf_s(text,L"#%2x%2x%2x",&r,&g,&b)!=3){ShowMessage(L"Enter a color like #D97757.",true);return;}auto arr=JsonArray();arr.Append(JsonValue::CreateNumberValue(r));arr.Append(JsonValue::CreateNumberValue(g));arr.Append(JsonValue::CreateNumberValue(b));if(key==L"claude_accent")claudeColorDraft_=false;else codexColorDraft_=false;appearanceColorDraft_=claudeColorDraft_||codexColorDraft_;SetValue(key,arr);});row.Children().Append(input);row.Children().Append(set);group.Children().Append(row);c.Children().Append(group);}
+         for (auto const& [key, title] : std::array<std::pair<std::wstring, std::wstring>, 2>{ {
+             { L"claude_accent", L"Claude Code accent" }, { L"codex_accent", L"Codex accent" } } })
+         {
+             auto group = StackPanel(); group.Spacing(6); group.Children().Append(Label(title));
+             auto row = StackPanel(); row.Orientation(Orientation::Horizontal); row.Spacing(8);
+             auto input = TextBox();
+             Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(input, title);
+             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(input, std::wstring(L"Color_") + key);
+             input.PlaceholderText(L"Default color"); input.Width(145);
+             const auto savedText = StoredColorText(State(), key);
+             const auto& draft = key == L"claude_accent" ? claudeColorDraft_ : codexColorDraft_;
+             input.Text(draft ? hstring(*draft) : hstring(savedText));
+             input.TextChanged([this, key](auto const& sender, auto const&)
+             {
+                 if (hydrating_) return;
+                 const auto text = std::wstring(sender.as<TextBox>().Text().c_str());
+                 if (key == L"claude_accent") ++claudeColorDraftRevision_;
+                 else ++codexColorDraftRevision_;
+                 if (key == L"claude_accent" && claudeColorApplyText_ && *claudeColorApplyText_ != text)
+                     claudeColorApplyText_.reset();
+                 if (key == L"codex_accent" && codexColorApplyText_ && *codexColorApplyText_ != text)
+                     codexColorApplyText_.reset();
+                 SetColorDraft(key, text);
+             });
+             auto apply = Button(); apply.Content(box_value(L"Apply color"));
+             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(apply, std::wstring(L"ApplyColor_") + key);
+             apply.Click([this, input, key](auto const&, auto const&)
+             {
+                 const std::wstring raw(input.Text().c_str());
+                 const auto color = ParseHexColor(raw);
+                 if (!color)
+                 {
+                     SetColorDraft(key, raw);
+                     ShowMessage(L"Enter exactly # followed by six ASCII hexadecimal digits, for example #D97757.", true);
+                     return;
+                 }
+                 const auto normalized = FormatHexColor(*color);
+                 input.Text(normalized);
+                 SetColorDraft(key, normalized);
+                 if (key == L"claude_accent") claudeColorApplyText_ = normalized;
+                 else codexColorApplyText_ = normalized;
+                 auto value = JsonArray();
+                 for (const auto component : *color) value.Append(JsonValue::CreateNumberValue(component));
+                 SetValue(key, value);
+             });
+             auto discard = Button(); discard.Content(box_value(L"Discard"));
+             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(discard, std::wstring(L"DiscardColor_") + key);
+             discard.Click([this, input, key](auto const&, auto const&)
+             {
+                 SetColorDraft(key, std::nullopt);
+                 if (pendingChanges_ && pendingChanges_.HasKey(key))
+                 {
+                     pendingChanges_.Remove(key);
+                     if (pendingChanges_.Size() == 0) pendingChanges_ = nullptr;
+                 }
+                 if (key == L"claude_accent") claudeColorApplyText_.reset();
+                 else codexColorApplyText_.reset();
+                 const bool wasHydrating = hydrating_.load();
+                 hydrating_ = true;
+                 input.Text(StoredColorText(State(), key));
+                 hydrating_ = wasHydrating;
+                 ShowMessage(L"Color draft discarded.");
+                 RefreshSettingsControlsIfSafe();
+             });
+             row.Children().Append(input); row.Children().Append(apply); row.Children().Append(discard);
+             group.Children().Append(row); c.Children().Append(group);
+         }
         colors.Child(c);PageHost().Children().Append(colors);
     }
 

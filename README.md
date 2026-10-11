@@ -1,12 +1,12 @@
 # Codex Usage
 
-Codex Usage is a native Windows taskbar widget for viewing Codex and Claude Code quota usage and reset times.
+Codex Usage is a lightweight, portable Windows quota-usage monitor for Codex and Claude Code.
 
-Developed by **Zoltán Rózsa** · [View project](https://github.com/rozsazoltan/codex-usage-monitor) · Licensed under [AGPL-3.0-or-later](LICENSE).
+Developed by [**Zoltán Rózsa**](https://datarose.net) · [View project](https://github.com/rozsazoltan/codex-usage-monitor) · Licensed under [AGPL v3](LICENSE).
 
 ## How it works
 
-Codex Usage is a portable Windows app that runs locally. For Codex and Claude Code, it reuses credentials from your existing CLI sign-ins; there is no separate Codex Usage account, app login, or API-key setup. It sends authenticated HTTPS requests directly to provider services to read quota usage and reset information; quota requests do not pass through a Codex Usage server. If Anthropic's usage endpoint does not provide reset information, Claude Code polling may fall back to a minimal `.` request to the Anthropic Messages API to read rate-limit headers. Update checks separately contact GitHub Releases.
+Codex Usage runs locally as a portable Windows app and works directly with the locally installed Codex and Claude Code tools. It reads their existing sign-in credentials and contacts provider usage services directly; no separate API authentication or API key is required.
 
 ## Requirements
 
@@ -98,12 +98,12 @@ The script restores/rebuilds native XAML with full VS MSBuild (not `dotnet build
 
 `build.rs` only embeds pre-generated files and never restores packages or accesses the network. A plain `cargo build --release` deliberately fails without `CODEX_SETTINGS_PAYLOAD` pointing to generated `manifest.json` and `payload.bin`; use the release script rather than publishing a build without settings. After any native change, rerun the full release script. GitHub releases still contain only the portable EXE and its SHA-256 checksum.
 
-## Credits and licenses
+## Third-party licenses and credits
 
-This repository is licensed under [AGPL-3.0-or-later](LICENSE).
+This project is licensed under [AGPL v3](LICENSE).
 
-- [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor) is the original idea and source basis. This repository branched from v1.10 and is now independently developed. The upstream project is licensed under MIT.
-- [lobehub/lobe-icons](https://github.com/lobehub/lobe-icons) provides the provider icon sources and is licensed under MIT.
-- [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) is licensed under MIT.
+- [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor) (MIT) — idea source; forked from v1.10 and now independently developed.
+- [lobehub/lobe-icons](https://github.com/lobehub/lobe-icons) (MIT) — provides icons.
+- [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) (MIT).
 
 Codex Usage is a maintained derivative of CodeZeno/Claude-Code-Usage-Monitor. Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.

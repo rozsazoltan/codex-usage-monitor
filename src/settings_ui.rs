@@ -265,10 +265,19 @@ fn open_in_session(
     );
     let pipe =
         create_pipe(&name).map_err(|e| format!("Cannot create private settings pipe: {e}"))?;
-    let child = Command::new(executable).current_dir(&directory)
-        .arg("--pipe").arg(&name).arg("--parent-pid").arg(std::process::id().to_string())
-        .arg("--page").arg(serde_json::to_value(page).unwrap().as_str().unwrap())
-        .spawn().map_err(|e| format!("Cannot start settings: {e}. Verify the complete companion payload and Windows App Runtime 1.8 x64 installation."))?;
+    let mut command = Command::new(executable);
+    command
+        .current_dir(&directory)
+        .arg("--pipe")
+        .arg(&name)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .arg("--page")
+        .arg(serde_json::to_value(page).unwrap().as_str().unwrap());
+    let launch_started = Instant::now();
+    let child = command.spawn().map_err(|e| {
+        format!("Cannot start settings: {e}. Check the companion executable and its permissions.")
+    })?;
     let child = ChildGuard(child);
     let pid = child.0.id();
     allow_foreground(pid);
@@ -291,10 +300,19 @@ fn open_in_session(
         state: state.clone(),
     });
     std::thread::spawn(move || {
-        let result = serve(&pipe, &mut child.child.0, hwnd, &stop, &activation, &state);
+        let result = serve(
+            &pipe,
+            &mut child.child.0,
+            pid,
+            launch_started,
+            hwnd,
+            &stop,
+            &activation,
+            &state,
+        );
         if let Err(error) = result {
             if !stop.load(Ordering::Acquire) {
-                *ERRORS.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("Settings connection failed: {error}. Verify the companion payload and Windows App Runtime 1.8 x64. See settings-ui/BUILDING.md."));
+                *ERRORS.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("Settings connection failed: {error}. The widget remains running; it is safe to close this message. See settings-ui/BUILDING.md."));
                 notify(hwnd);
             }
         }
@@ -322,6 +340,58 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+#[derive(Clone, Copy)]
+enum ChildExitPhase {
+    BeforePipeConnected,
+    DuringActiveConnection { connected_after_ms: u128 },
+}
+
+fn format_windows_exit_code(code: Option<i32>) -> String {
+    match code {
+        Some(code) => {
+            let code = code as u32;
+            format!("{code} (0x{code:08X})")
+        }
+        None => "unavailable".into(),
+    }
+}
+
+fn format_child_exit_error(
+    pid: u32,
+    code: Option<i32>,
+    launch_elapsed_ms: u128,
+    phase: ChildExitPhase,
+) -> String {
+    let phase_description = match phase {
+        ChildExitPhase::BeforePipeConnected => {
+            format!("before connecting to the widget pipe after {launch_elapsed_ms} ms")
+        }
+        ChildExitPhase::DuringActiveConnection { connected_after_ms } => format!(
+            "during the active pipe connection after {launch_elapsed_ms} ms (connected after {connected_after_ms} ms)"
+        ),
+    };
+    format!(
+        "Settings companion process PID {pid} exited {phase_description} with Windows exit code {}. Check its Application Error/WER record. If it points to resource loading, confirm the five companion payload files come from one build; if it points to a bootstrap/dependency failure, verify Windows App Runtime 1.8 x64.",
+        format_windows_exit_code(code)
+    )
+}
+
+fn log_child_exit(pid: u32, code: Option<i32>, launch_elapsed_ms: u128, phase: ChildExitPhase) {
+    let (phase_name, connected_after_ms) = match phase {
+        ChildExitPhase::BeforePipeConnected => ("before_pipe_connected", None),
+        ChildExitPhase::DuringActiveConnection { connected_after_ms } => {
+            ("during_active_connection", Some(connected_after_ms))
+        }
+    };
+    let connected_after_ms = connected_after_ms
+        .map(|elapsed| elapsed.to_string())
+        .unwrap_or_else(|| "not_connected".into());
+    crate::diagnose::log(format!(
+        "settings companion exited phase={phase_name} pid={pid} launch_elapsed_ms={launch_elapsed_ms} connected_after_ms={connected_after_ms} windows_exit_code={}",
+        format_windows_exit_code(code)
+    ));
 }
 
 fn allow_foreground(pid: u32) {
@@ -441,34 +511,42 @@ fn payload_length(bytes: &[u8]) -> io::Result<Option<usize>> {
 fn serve(
     pipe: &OwnedHandle,
     child: &mut Child,
+    pid: u32,
+    launch_started: Instant,
     hwnd: isize,
     stop: &Arc<AtomicBool>,
     page: &Mutex<Option<Page>>,
     state: &Mutex<Option<Value>>,
 ) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
+    let connected_after_ms = loop {
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        if child.try_wait()?.is_some() {
-            return Err(io::Error::other("Companion exited before connecting"));
+        if let Some(status) = child.try_wait()? {
+            let elapsed_ms = launch_started.elapsed().as_millis();
+            let phase = ChildExitPhase::BeforePipeConnected;
+            let code = status.code();
+            log_child_exit(pid, code, elapsed_ms, phase);
+            return Err(io::Error::other(format_child_exit_error(
+                pid, code, elapsed_ms, phase,
+            )));
         }
         // SAFETY: pipe is a live, non-inheritable named-pipe handle, in NOWAIT mode.
         let connected =
             unsafe { ConnectNamedPipe(pipe.as_raw_handle(), std::ptr::null_mut()) } != 0;
         let error = io::Error::last_os_error().raw_os_error();
         if connected || error == Some(535) {
-            let mut pid = 0;
+            let mut client_pid = 0;
             // SAFETY: pid is writable, handle remains owned for the call.
-            if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) } == 0
-                || pid != child.id()
+            if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut client_pid) } == 0
+                || client_pid != child.id()
             {
                 unsafe {
                     DisconnectNamedPipe(pipe.as_raw_handle());
                 }
             } else {
-                break;
+                break launch_started.elapsed().as_millis();
             }
         } else if error != Some(536) && error != Some(232) {
             return Err(io::Error::last_os_error());
@@ -479,15 +557,24 @@ fn serve(
             ));
         }
         std::thread::sleep(Duration::from_millis(10));
-    }
+    };
     let mut incoming = Vec::new();
     let mut outgoing = Vec::<u8>::new();
     let mut written = 0;
     let mut pending: Option<mpsc::Receiver<Value>> = None;
     let mut closing = None;
     loop {
-        if child.try_wait()?.is_some() {
-            return Ok(());
+        if let Some(status) = child.try_wait()? {
+            let elapsed_ms = launch_started.elapsed().as_millis();
+            let phase = ChildExitPhase::DuringActiveConnection { connected_after_ms };
+            let code = status.code();
+            log_child_exit(pid, code, elapsed_ms, phase);
+            if status.success() {
+                return Ok(());
+            }
+            return Err(io::Error::other(format_child_exit_error(
+                pid, code, elapsed_ms, phase,
+            )));
         }
         if stop.load(Ordering::Acquire) && closing.is_none() {
             closing = Some(Instant::now() + Duration::from_millis(500));
@@ -874,6 +961,45 @@ mod tests {
     }
 
     #[test]
+    fn windows_exit_codes_include_unsigned_decimal_and_hex_values() {
+        assert_eq!(format_windows_exit_code(Some(0)), "0 (0x00000000)");
+        assert_eq!(
+            format_windows_exit_code(Some(0xC0000409_u32 as i32)),
+            "3221226505 (0xC0000409)"
+        );
+        assert_eq!(format_windows_exit_code(None), "unavailable");
+    }
+
+    #[test]
+    fn child_exit_errors_identify_phase_pid_and_elapsed_time() {
+        let before_connect =
+            format_child_exit_error(1234, Some(0), 17, ChildExitPhase::BeforePipeConnected);
+        assert!(before_connect.contains("PID 1234"));
+        assert!(before_connect.contains("before connecting to the widget pipe after 17 ms"));
+        assert!(before_connect.contains("Windows exit code 0 (0x00000000)"));
+
+        let during_connection = format_child_exit_error(
+            5678,
+            Some(0xC0000409_u32 as i32),
+            501,
+            ChildExitPhase::DuringActiveConnection {
+                connected_after_ms: 23,
+            },
+        );
+        assert!(during_connection.contains("PID 5678"));
+        assert!(during_connection
+            .contains("during the active pipe connection after 501 ms (connected after 23 ms)"));
+        assert!(during_connection.contains("3221226505 (0xC0000409)"));
+        assert!(during_connection.contains(
+            "if it points to a bootstrap/dependency failure, verify Windows App Runtime 1.8 x64"
+        ));
+
+        let unavailable =
+            format_child_exit_error(9012, None, 8, ChildExitPhase::BeforePipeConnected);
+        assert!(unavailable.contains("Windows exit code unavailable"));
+    }
+
+    #[test]
     fn private_pipe_accepts_current_user_and_reports_client_pid() {
         use std::io::Write;
         let name = format!(r"\\.\pipe\CodexUsage.Settings.Test.{}", std::process::id());
@@ -956,6 +1082,7 @@ mod tests {
             std::process::id()
         );
         let pipe = create_pipe(&name).unwrap();
+        let launch_started = Instant::now();
         let child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -967,6 +1094,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut child = ChildGuard(child);
+        let pid = child.0.id();
         let job = child_job(&child.0).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
@@ -975,6 +1103,8 @@ mod tests {
             let result = serve(
                 &pipe,
                 &mut child.0,
+                pid,
+                launch_started,
                 0,
                 &worker_stop,
                 &Mutex::new(Some(Page::General)),

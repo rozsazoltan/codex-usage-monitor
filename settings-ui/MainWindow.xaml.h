@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <winrt/Microsoft.UI.Dispatching.h>
+#include <winrt/Microsoft.UI.Xaml.Controls.h>
 #include <winrt/Windows.Data.Json.h>
 
 namespace winrt::SettingsUI::implementation
@@ -32,7 +33,10 @@ namespace winrt::SettingsUI::implementation
         void SetValue(std::wstring const& key, winrt::Windows::Data::Json::IJsonValue const& value);
         void Action(std::wstring const& action);
         void ShowMessage(std::wstring const& text, bool error = false);
+        void UpdateClaudeAvailability();
+        void UpdateAboutControls();
         void Hydrate();
+        void RefreshSettingsControlsIfSafe();
         void BuildGeneral();
         void BuildMonitoring();
         void BuildAppearance();
@@ -50,8 +54,14 @@ namespace winrt::SettingsUI::implementation
         winrt::Windows::Data::Json::JsonObject state_{ nullptr };
         winrt::Windows::Data::Json::JsonObject flightChanges_{ nullptr };
         winrt::Windows::Data::Json::JsonObject pendingChanges_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch claudeToggle_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBlock versionText_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBlock updateStatusText_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBlock uninstallDescription_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::Button checkForUpdatesButton_{ nullptr };
         winrt::Microsoft::UI::Dispatching::DispatcherQueue dispatcher_{ nullptr };
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer debounceTimer_{ nullptr };
+        winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer messageTimer_{ nullptr };
         std::atomic<bool> stopping_{ false };
         std::atomic<bool> hydrating_{ false };
         std::mutex requestsMutex_;
@@ -68,6 +78,12 @@ namespace winrt::SettingsUI::implementation
         bool closeRequested_{};
         bool closingFromParent_{};
         bool debounceElapsed_{};
+        bool settingsActionInFlight_{};
+        bool settingsRefreshPending_{};
+        bool paneStateKnown_{};
+        bool appearanceColorDraft_{};
+        bool claudeColorDraft_{};
+        bool codexColorDraft_{};
         std::optional<std::wstring> deferredAction_;
         winrt::event_token closingToken_{};
         std::thread ioThread_;

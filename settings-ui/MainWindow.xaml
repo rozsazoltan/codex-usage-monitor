@@ -3,7 +3,7 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="Codex Usage — Settings">
     <Window.SystemBackdrop><MicaBackdrop /></Window.SystemBackdrop>
-    <NavigationView x:Name="Navigation" PaneDisplayMode="Left" IsBackButtonVisible="Collapsed"
+    <NavigationView x:Name="Navigation" PaneDisplayMode="Left" CompactPaneLength="48" IsBackButtonVisible="Collapsed"
         IsSettingsVisible="False" OpenPaneLength="244" SelectionChanged="OnNavigationChanged"
         Background="Transparent" IsPaneToggleButtonVisible="True">
         <NavigationView.PaneHeader>
@@ -13,31 +13,27 @@
             </StackPanel>
         </NavigationView.PaneHeader>
         <NavigationView.MenuItems>
-            <NavigationViewItem Content="General" Tag="General" Icon="Setting" />
-            <NavigationViewItem Content="Monitoring" Tag="Monitoring" Icon="View" />
-            <NavigationViewItem Content="Appearance" Tag="Appearance" Icon="Edit" />
-            <NavigationViewItem Content="Placement" Tag="Placement" Icon="MapPin" />
+            <NavigationViewItem Content="General" Tag="General" Icon="Setting" AutomationProperties.AutomationId="NavigationGeneral" />
+            <NavigationViewItem Content="Monitoring" Tag="Monitoring" Icon="View" AutomationProperties.AutomationId="NavigationMonitoring" />
+            <NavigationViewItem Content="Appearance" Tag="Appearance" Icon="Edit" AutomationProperties.AutomationId="NavigationAppearance" />
+            <NavigationViewItem Content="Placement" Tag="Placement" Icon="MapPin" AutomationProperties.AutomationId="NavigationPlacement" />
         </NavigationView.MenuItems>
         <NavigationView.FooterMenuItems>
-            <NavigationViewItem Content="About" Tag="About" Icon="Help" />
+            <NavigationViewItem Content="About" Tag="About" Icon="Help" AutomationProperties.AutomationId="NavigationAbout" />
         </NavigationView.FooterMenuItems>
         <Grid>
-            <Grid.RowDefinitions>
-                <RowDefinition Height="*" />
-                <RowDefinition Height="Auto" MinHeight="72" />
-            </Grid.RowDefinitions>
-            <ScrollViewer x:Name="PageScroll" Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel MaxWidth="820" HorizontalAlignment="Stretch" Padding="40,30,40,40" Spacing="22">
+            <ScrollViewer x:Name="PageScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel MaxWidth="1040" HorizontalAlignment="Left" Padding="40,30,40,40" Spacing="22">
                     <StackPanel Spacing="5">
                         <TextBlock x:Name="PageEyebrow" Text="PREFERENCES" FontSize="11" FontWeight="SemiBold" CharacterSpacing="130" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
                         <TextBlock x:Name="PageTitle" Text="General" FontSize="32" FontWeight="SemiBold" />
                         <TextBlock x:Name="PageSummary" Text="A few thoughtful choices make the widget feel like yours." FontSize="14" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
                     </StackPanel>
                     <StackPanel x:Name="PageHost" Spacing="18" />
-                    <TextBlock Text="Changes are saved by Codex Usage and take effect as they are applied." FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}" Margin="2,4,0,0" TextWrapping="Wrap" />
+                    <TextBlock Text="Changes are saved automatically." FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}" Margin="2,4,0,0" TextWrapping="Wrap" />
                 </StackPanel>
             </ScrollViewer>
-            <InfoBar x:Name="MessageBar" Grid.Row="1" Margin="24,0,24,18" IsOpen="False" IsClosable="True" Severity="Informational" AutomationProperties.Name="Settings feedback" AutomationProperties.LiveSetting="Polite" />
+            <InfoBar x:Name="MessageBar" VerticalAlignment="Bottom" HorizontalAlignment="Right" MaxWidth="560" Margin="24,0,24,18" IsOpen="False" IsClosable="True" Severity="Informational" AutomationProperties.Name="Settings feedback" AutomationProperties.AutomationId="SettingsFeedback" AutomationProperties.LiveSetting="Polite" />
         </Grid>
     </NavigationView>
 </Window>

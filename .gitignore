@@ -26,3 +26,7 @@ AGENTS.md
 
 # Local WinGet manifest generation output
 /manifests/
+
+
+# APM dependencies
+apm_modules/

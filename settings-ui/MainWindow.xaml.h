@@ -35,6 +35,7 @@ namespace winrt::SettingsUI::implementation
         void ShowMessage(std::wstring const& text, bool error = false);
         void UpdateClaudeAvailability();
         void UpdateAboutControls();
+        void OpenThirdPartyNotices();
         void Hydrate();
         void RefreshSettingsControlsIfSafe();
         void BuildGeneral();
@@ -89,6 +90,8 @@ namespace winrt::SettingsUI::implementation
         std::thread ioThread_;
         std::atomic<HANDLE> pipeHandle_{ INVALID_HANDLE_VALUE };
         HWND hwnd_{};
+        HICON windowIcon_{};
+        winrt::Microsoft::UI::Xaml::Window noticesWindow_{ nullptr };
     };
 }
 

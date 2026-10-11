@@ -1,0 +1,6 @@
+#pragma once
+
+#define IDI_SETTINGS_APP 101
+#define IDR_ABOUT_ICON 201
+#define IDR_DATAROSE_LOGO 202
+#define IDR_THIRD_PARTY_NOTICES 203

@@ -2,6 +2,7 @@
 #include "MainWindow.xaml.h"
 #include "MainWindow.g.cpp"
 #include "MainWindow.xaml.g.hpp"
+#include "Resources.h"
 #include <shellapi.h>
 #include <algorithm>
 #include <array>
@@ -43,6 +44,60 @@ namespace
     TextBlock Label(std::wstring const& text, double size = 14)
     {
         auto label = TextBlock(); label.Text(text); label.FontSize(size); label.TextWrapping(TextWrapping::Wrap); return label;
+    }
+    HICON LoadResourceIcon()
+    {
+        return static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_SETTINGS_APP), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+    }
+    void ApplyWindowIcon(Microsoft::UI::Xaml::Window const& window, HICON icon)
+    {
+        if (!icon) return;
+        const auto iconId = Microsoft::UI::GetIconIdFromIcon(icon);
+        window.AppWindow().SetIcon(iconId);
+        HWND hwnd{};
+        if (SUCCEEDED(window.as<::IWindowNative>()->get_WindowHandle(&hwnd)))
+        {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon));
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));
+        }
+    }
+    std::vector<uint8_t> ResourceBytes(int id)
+    {
+        auto module = GetModuleHandleW(nullptr);
+        auto resource = FindResourceW(module, MAKEINTRESOURCEW(id), RT_RCDATA);
+        if (!resource) return {};
+        auto loaded = LoadResource(module, resource);
+        const auto size = SizeofResource(module, resource);
+        auto data = static_cast<uint8_t const*>(LockResource(loaded));
+        return data && size ? std::vector<uint8_t>(data, data + size) : std::vector<uint8_t>{};
+    }
+    std::wstring ResourceText(int id)
+    {
+        const auto bytes = ResourceBytes(id);
+        if (bytes.empty()) return L"Third-party notices could not be loaded.";
+        const auto length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, reinterpret_cast<char const*>(bytes.data()), static_cast<int>(bytes.size()), nullptr, 0);
+        if (!length) return L"Third-party notices could not be loaded.";
+        std::wstring text(static_cast<size_t>(length), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, reinterpret_cast<char const*>(bytes.data()), static_cast<int>(bytes.size()), text.data(), length);
+        return text;
+    }
+    winrt::fire_and_forget SetImageFromResource(Image image, int id)
+    {
+        try
+        {
+            const auto bytes = ResourceBytes(id);
+            if (bytes.empty()) co_return;
+            Windows::Storage::Streams::InMemoryRandomAccessStream stream;
+            Windows::Storage::Streams::DataWriter writer(stream);
+            writer.WriteBytes(winrt::array_view<uint8_t const>(bytes.data(), bytes.data() + bytes.size()));
+            co_await writer.StoreAsync();
+            writer.DetachStream();
+            stream.Seek(0);
+            Media::Imaging::BitmapImage bitmap;
+            co_await bitmap.SetSourceAsync(stream);
+            image.Source(bitmap);
+        }
+        catch (...) {}
     }
     Border Card()
     {
@@ -133,6 +188,8 @@ namespace winrt::SettingsUI::implementation
                 SetValue(L"settings_pane_open", JsonValue::CreateBooleanValue(false));
         });
         check_hresult(m_inner.as<::IWindowNative>()->get_WindowHandle(&hwnd_));
+        windowIcon_ = LoadResourceIcon();
+        ApplyWindowIcon(*this, windowIcon_);
         closingToken_ = AppWindow().Closing([this](auto const& sender, auto const& args) { OnWindowClosing(sender, args); });
         MONITORINFO monitor{ sizeof(monitor) };
         if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor))
@@ -185,12 +242,18 @@ namespace winrt::SettingsUI::implementation
 
     MainWindow::~MainWindow()
     {
+        if (noticesWindow_)
+        {
+            noticesWindow_.Close();
+            noticesWindow_ = nullptr;
+        }
         if (messageTimer_) messageTimer_.Stop();
         if (debounceTimer_) debounceTimer_.Stop();
         stopping_.store(true); requestsChanged_.notify_all();
         if (pipeHandle_ != INVALID_HANDLE_VALUE) CancelIoEx(pipeHandle_, nullptr);
         if (ioThread_.joinable()) CancelSynchronousIo(ioThread_.native_handle());
         if (ioThread_.joinable()) ioThread_.join();
+        if (windowIcon_) DestroyIcon(windowIcon_);
     }
 
     void MainWindow::InitializePipe()
@@ -566,9 +629,56 @@ namespace winrt::SettingsUI::implementation
         {
             const auto channel = state_ ? state_.GetNamedString(L"install_channel", L"portable") : hstring(L"portable");
             uninstallDescription_.Text(channel == L"winget"
-                ? L"This permanently removes the app. WinGet will open its uninstall flow, which asks you to confirm before anything is removed."
-                : L"This permanently removes Codex Usage from this PC. The built-in flow asks you to confirm before anything is removed.");
+                ? L"WinGet will open its uninstall flow and ask you to confirm."
+                : L"The built-in flow will ask you to confirm before removing anything.");
         }
+    }
+    void MainWindow::OpenThirdPartyNotices()
+    {
+        if (noticesWindow_)
+        {
+            noticesWindow_.Activate();
+            return;
+        }
+
+        auto window = Microsoft::UI::Xaml::Window();
+        window.Title(L"Third-party licenses and notices");
+        auto layout = Grid();
+        layout.Padding(Thickness{ 24, 20, 24, 24 });
+        auto rows = layout.RowDefinitions();
+        rows.Append(RowDefinition());
+        rows.Append(RowDefinition());
+        rows.GetAt(0).Height(GridLengthHelper::Auto());
+        rows.GetAt(1).Height(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
+        auto heading = Label(L"Third-party licenses and notices", 21);
+        heading.Margin(Thickness{ 0, 0, 0, 16 });
+        layout.Children().Append(heading);
+        auto text = TextBox();
+        text.Text(ResourceText(IDR_THIRD_PARTY_NOTICES));
+        text.IsReadOnly(true);
+        text.AcceptsReturn(true);
+        text.TextWrapping(TextWrapping::Wrap);
+        text.FontFamily(Media::FontFamily(L"Consolas"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(text, L"Third-party license and notice text");
+        Grid::SetRow(text, 1);
+        layout.Children().Append(text);
+        window.Content(layout);
+        window.AppWindow().Resize({ 900, 700 });
+        RECT owner{};
+        if (GetWindowRect(hwnd_, &owner))
+        {
+            window.AppWindow().MoveAndResize({ owner.left + ((owner.right - owner.left) - 900) / 2,
+                owner.top + ((owner.bottom - owner.top) - 700) / 2, 900, 700 });
+        }
+        ApplyWindowIcon(window, windowIcon_);
+        noticesWindow_ = window;
+        auto weak = get_weak();
+        noticesWindow_.Closed([weak](auto const& sender, auto const&)
+        {
+            if (auto self = weak.get(); self && self->noticesWindow_ == sender.as<Microsoft::UI::Xaml::Window>())
+                self->noticesWindow_ = nullptr;
+        });
+        noticesWindow_.Activate();
     }
     void MainWindow::Hydrate() { RenderPage(page_); }
 
@@ -601,7 +711,7 @@ namespace winrt::SettingsUI::implementation
         const std::map<std::wstring, std::wstring> summaries{
             {L"General",L"Manage startup, taskbar visibility, and language."}, {L"Monitoring",L"Choose providers and refresh options."},
             {L"Appearance",L"Choose the widget’s theme and visual settings."}, {L"Placement",L"Choose the display and taskbar position."},
-            {L"About",L"A clear view of your usage, right where you need it."}};
+            {L"About",L"Application details, updates, and licenses."}};
         PageSummary().Text(summaries.at(page));
         hydrating_ = true;
         if (page == L"General") BuildGeneral(); else if (page == L"Monitoring") BuildMonitoring(); else if (page == L"Appearance") BuildAppearance(); else if (page == L"Placement") BuildPlacement(); else BuildAbout();
@@ -693,12 +803,19 @@ namespace winrt::SettingsUI::implementation
     {
         auto hero = Card();
         auto h = StackPanel(); h.Spacing(10);
-        auto mark = Border(); mark.Width(54); mark.Height(54); mark.CornerRadius(CornerRadiusHelper::FromUniformRadius(16));
-        mark.Background(Application::Current().Resources().Lookup(box_value(L"AccentFillColorDefaultBrush")).as<Media::Brush>());
-        auto glyph = TextBlock(); glyph.Text(L"C"); glyph.FontSize(28); glyph.HorizontalAlignment(HorizontalAlignment::Center); glyph.VerticalAlignment(VerticalAlignment::Center); mark.Child(glyph);
-        h.Children().Append(mark); h.Children().Append(Label(L"Codex Usage", 25));
+        auto nameRow = StackPanel(); nameRow.Orientation(Orientation::Horizontal); nameRow.Spacing(12); nameRow.VerticalAlignment(VerticalAlignment::Center);
+        auto appIcon = Image(); appIcon.Width(44); appIcon.Height(44); appIcon.Stretch(Media::Stretch::Uniform); appIcon.VerticalAlignment(VerticalAlignment::Center);
+        SetImageFromResource(appIcon, IDR_ABOUT_ICON);
+        auto appName = Label(L"Codex Usage", 25); appName.VerticalAlignment(VerticalAlignment::Center);
+        nameRow.Children().Append(appIcon); nameRow.Children().Append(appName);
+        h.Children().Append(nameRow);
         h.Children().Append(Label(L"A lightweight, portable Windows quota monitor for Codex and Claude Code.", 14));
         h.Children().Append(Label(L"Developed by Zoltán Rózsa", 13));
+        auto roseLogo = Image(); roseLogo.Width(128); roseLogo.Height(40); roseLogo.Stretch(Media::Stretch::Uniform); roseLogo.HorizontalAlignment(HorizontalAlignment::Left);
+        SetImageFromResource(roseLogo, IDR_DATAROSE_LOGO);
+        auto developerLink = HyperlinkButton(); developerLink.Content(roseLogo); developerLink.NavigateUri(Windows::Foundation::Uri(L"https://datarose.net"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(developerLink, L"Visit Datarose website");
+        developerLink.HorizontalAlignment(HorizontalAlignment::Left); h.Children().Append(developerLink);
         versionText_ = Label(state_ ? std::wstring(std::wstring(L"Version ") + state_.GetNamedString(L"version", L"unknown").c_str()) : std::wstring(L"Connecting to the widget…"), 12);
         h.Children().Append(versionText_);
         hero.Child(h); PageHost().Children().Append(hero);
@@ -716,15 +833,39 @@ namespace winrt::SettingsUI::implementation
         auto license = Label(L"Licensed under AGPL-3.0-or-later", 13);
         license.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
         projectRow.Children().Append(repo); projectRow.Children().Append(license); s.Children().Append(projectRow);
-
-        s.Children().Append(Label(L"Credits & licenses", 17));
-        s.Children().Append(Label(L"upstream-ray/codex-usage-monitor — idea and source basis; this fork branched from v1.10 and is now independently developed. MIT.", 13));
-        s.Children().Append(Label(L"lobehub/lobe-icons — provider icons. MIT.", 13));
-        s.Children().Append(Label(L"CodeZeno/Claude-Code-Usage-Monitor — MIT.", 13));
-        s.Children().Append(Label(L"Codex Usage is a maintained derivative of CodeZeno/Claude-Code-Usage-Monitor. Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.", 13));
+        s.Children().Append(Label(L"Third-party license terms and required notices are included with this application.", 13));
+        auto noticesButton = Button(); noticesButton.Content(box_value(L"Third-party licenses and notices"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(noticesButton, L"ThirdPartyNotices");
+        noticesButton.HorizontalAlignment(HorizontalAlignment::Left);
+        noticesButton.Click([this](auto const&, auto const&) { OpenThirdPartyNotices(); });
+        s.Children().Append(noticesButton);
         info.Child(s); PageHost().Children().Append(info);
 
          auto update=Card();auto u=StackPanel();u.Spacing(10);u.Children().Append(Label(L"Updates",19));updateStatusText_=Label(state_?std::wstring(state_.GetNamedString(L"update_status",L"Update status unavailable").c_str()):std::wstring(L"Checking update status…"),13);u.Children().Append(updateStatusText_);checkForUpdatesButton_=Button();checkForUpdatesButton_.Content(box_value(L"Check for updates"));Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(checkForUpdatesButton_,L"CheckForUpdates");checkForUpdatesButton_.Style(Application::Current().Resources().Lookup(box_value(L"AccentButtonStyle")).as<Style>());checkForUpdatesButton_.IsEnabled(!(state_&&state_.GetNamedBoolean(L"update_busy",false)));checkForUpdatesButton_.HorizontalAlignment(HorizontalAlignment::Left);checkForUpdatesButton_.Click([this](auto const&,auto const&){Action(L"update");});u.Children().Append(checkForUpdatesButton_);update.Child(u);PageHost().Children().Append(update);
-         auto channel=state_?state_.GetNamedString(L"install_channel",L"portable"):L"portable";auto uninstallCard=Card();auto us=StackPanel();us.Spacing(10);us.Children().Append(Label(L"Uninstall Codex Usage",19));auto warning=StackPanel();warning.Orientation(Orientation::Horizontal);warning.Spacing(8);warning.Children().Append(Label(L"⚠",18));uninstallDescription_=Label(channel==L"winget"?L"This permanently removes the app. WinGet will open its uninstall flow, which asks you to confirm before anything is removed.":L"This permanently removes Codex Usage from this PC. The built-in flow asks you to confirm before anything is removed.",13);warning.Children().Append(uninstallDescription_);us.Children().Append(warning);auto uninstall=Button();uninstall.Content(box_value(L"Uninstall Codex Usage…"));Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(uninstall,L"UninstallApp");uninstall.Foreground(Media::SolidColorBrush(Windows::UI::Color{255,255,255,255}));uninstall.Background(Media::SolidColorBrush(Windows::UI::Color{255,196,43,28}));uninstall.HorizontalAlignment(HorizontalAlignment::Left);uninstall.Click([this](auto const&,auto const&){Action(L"uninstall");});us.Children().Append(uninstall);uninstallCard.Child(us);PageHost().Children().Append(uninstallCard);
+        const auto channel = state_ ? state_.GetNamedString(L"install_channel", L"portable") : hstring(L"portable");
+        auto uninstallCard = Card();
+        auto uninstallStack = StackPanel(); uninstallStack.Spacing(10);
+        uninstallStack.Children().Append(Label(L"Uninstall Codex Usage", 19));
+        uninstallStack.Children().Append(Label(L"This removes the app and its local files.", 13));
+        uninstallDescription_ = Label(channel == L"winget"
+            ? L"WinGet will open its uninstall flow and ask you to confirm."
+            : L"The built-in flow will ask you to confirm before removing anything.", 13);
+        uninstallStack.Children().Append(uninstallDescription_);
+
+        auto uninstall = Button();
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(uninstall, L"UninstallApp");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(uninstall, L"Uninstall Codex Usage");
+        uninstall.Style(Navigation().Resources().Lookup(box_value(L"UninstallButtonStyle")).as<Style>());
+        uninstall.HorizontalAlignment(HorizontalAlignment::Left);
+        auto uninstallContent = StackPanel();
+        uninstallContent.Orientation(Orientation::Horizontal); uninstallContent.Spacing(8);
+        auto uninstallIcon = FontIcon(); uninstallIcon.Glyph(L"\uE74D"); uninstallIcon.FontSize(14);
+        uninstallContent.Children().Append(uninstallIcon);
+        uninstallContent.Children().Append(Label(L"Uninstall Codex Usage…", 14));
+        uninstall.Content(uninstallContent);
+        uninstall.Click([this](auto const&, auto const&) { Action(L"uninstall"); });
+        uninstallStack.Children().Append(uninstall);
+        uninstallCard.Child(uninstallStack);
+        PageHost().Children().Append(uninstallCard);
     }
 }

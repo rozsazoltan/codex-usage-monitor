@@ -1,0 +1,7 @@
+#include <windows.h>
+#include "Resources.h"
+
+IDI_SETTINGS_APP ICON "..\\src\\icons\\icon.ico"
+IDR_ABOUT_ICON RCDATA "..\\src\\icons\\256x256.png"
+IDR_DATAROSE_LOGO RCDATA "Assets\\datarose-logo.png"
+IDR_THIRD_PARTY_NOTICES RCDATA "..\\THIRD-PARTY-NOTICES.txt"

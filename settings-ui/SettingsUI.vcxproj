@@ -73,21 +73,26 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="App.xaml.h" />
     <ClInclude Include="MainWindow.xaml.h" />
+    <ClInclude Include="Resources.h" />
     <ClCompile Include="pch.cpp"><PrecompiledHeader>Create</PrecompiledHeader></ClCompile>
     <ClCompile Include="App.xaml.cpp" />
     <ClCompile Include="MainWindow.xaml.cpp" />
     <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
     <ClCompile Include="XamlSupport.cpp" />
+    <ResourceCompile Include="Resources.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <!-- Desktop VC builds do not import the UWP workload's native XAML targets.
        Run the NuGet-provided compiler around MIDL/projection generation instead. -->
   <Target Name="CompileNativeXamlPass1" BeforeTargets="Midl" DependsOnTargets="ResolveReferences;MarkupCompilePass1" />
   <Target Name="CompileNativeXamlPass2" BeforeTargets="ClCompile" DependsOnTargets="MarkupCompilePass2" />
+  <PropertyGroup>
+    <PortableOutputDir Condition="'$(PortableOutputDir)' == ''">$(MSBuildThisFileDirectory)bin\portable</PortableOutputDir>
+  </PropertyGroup>
   <Target Name="PublishPortable" DependsOnTargets="Build">
     <ItemGroup>
       <PortableFile Include="$(OutDir)SettingsUI.exe;$(OutDir)Microsoft.WindowsAppRuntime.Bootstrap.dll;$(OutDir)SettingsUI.pri;$(OutDir)App.xbf;$(OutDir)MainWindow.xbf" />
     </ItemGroup>
-    <Copy SourceFiles="@(PortableFile)" DestinationFolder="$(MSBuildThisFileDirectory)bin\portable" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(PortableFile)" DestinationFolder="$(PortableOutputDir)" SkipUnchangedFiles="true" />
   </Target>
 </Project>

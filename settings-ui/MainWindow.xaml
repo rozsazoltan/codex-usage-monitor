@@ -6,6 +6,14 @@
     <NavigationView x:Name="Navigation" PaneDisplayMode="Left" CompactPaneLength="48" IsBackButtonVisible="Collapsed"
         IsSettingsVisible="False" OpenPaneLength="244" SelectionChanged="OnNavigationChanged"
         Background="Transparent" IsPaneToggleButtonVisible="True">
+        <NavigationView.Resources>
+            <Style x:Key="UninstallButtonStyle" TargetType="Button">
+                <Setter Property="Foreground" Value="{ThemeResource SystemFillColorCautionBrush}" />
+                <Setter Property="Background" Value="{ThemeResource SystemFillColorCautionBackgroundBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource SystemFillColorCautionBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+            </Style>
+        </NavigationView.Resources>
         <NavigationView.PaneHeader>
             <StackPanel Margin="18,18,12,24" Spacing="5">
                 <TextBlock Text="CODEX USAGE" FontSize="11" FontWeight="SemiBold" CharacterSpacing="150" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />

@@ -40,6 +40,10 @@ $msbuild = 'D:\program\vs-buildtools\2022\MSBuild\Current\Bin\MSBuild.exe'
 & $msbuild settings-ui\SettingsUI.vcxproj /t:PublishPortable /p:Configuration=Release /p:Platform=x64 /m /v:minimal
 ```
 
+`PublishPortable` writes to `settings-ui\bin\portable` by default. To validate
+the publish target without replacing a running portable copy, pass an alternate
+directory, for example `/p:PortableOutputDir=D:\temp\settings-ui-publish`.
+
 Change `$msbuild` to the full VS 2022 MSBuild path on other machines. Do not copy
 the entire compiler output directory into a release: it includes symbols and
 unused SDK-transitive WebView2/background-task artifacts. `PublishPortable` copies

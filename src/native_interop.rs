@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -61,12 +61,11 @@ pub struct TaskbarWindow {
 /// Windows display device name (for example \\.\DISPLAY2) for a taskbar.
 /// Unlike enumeration order, this survives taskbar recreation and rearrangement.
 pub fn taskbar_monitor_device(taskbar: &TaskbarWindow) -> Option<String> {
-    let point = windows::Win32::Foundation::POINT {
-        x: taskbar.rect.left + (taskbar.rect.right - taskbar.rect.left) / 2,
-        y: taskbar.rect.top + (taskbar.rect.bottom - taskbar.rect.top) / 2,
-    };
     unsafe {
-        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        // Resolve the monitor from the taskbar HWND itself instead of a point
+        // derived from its rectangle. Auto-hidden taskbars can have a clipped
+        // or transient rectangle that puts its center outside the display.
+        let monitor = MonitorFromWindow(taskbar.hwnd, MONITOR_DEFAULTTONEAREST);
         if monitor.is_invalid() {
             return None;
         }
@@ -187,11 +186,14 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-/// Embed our window as a child of the taskbar
-pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
+/// Embed our window as a child of the taskbar.
+///
+/// Returns `false` if Windows rejects the reparenting operation, restoring the
+/// window styles so callers can keep the existing attachment or fallback.
+pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> bool {
     unsafe {
-        // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
         // Reset alpha mode used by the startup popup fallback before switching
         // back to UpdateLayeredWindow rendering inside the taskbar.
         if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
@@ -204,11 +206,18 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
         );
 
         // Change from popup to child
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
+        let new_style = ((style as u32) & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
-        let _ = SetParent(hwnd, taskbar_hwnd);
+        if SetParent(hwnd, taskbar_hwnd).is_err() {
+            // Do not mark a still-top-level window as embedded: subsequent
+            // positioning uses taskbar-relative coordinates and would move it
+            // off-screen. Restore the popup's original rendering styles.
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, style);
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
+            return false;
+        }
+        true
     }
 }
 
@@ -253,7 +262,7 @@ mod attachment_tests {
             )
             .unwrap();
             SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
-            embed_in_taskbar(child, parent);
+            assert!(embed_in_taskbar(child, parent));
             assert_eq!(GetParent(child).unwrap(), parent);
             let dc = CreateCompatibleDC(None);
             let info = BITMAPINFO {
@@ -301,11 +310,42 @@ mod attachment_tests {
             );
         }
     }
+
+    #[test]
+    fn failed_taskbar_attachment_preserves_popup_styles_and_parent() {
+        unsafe {
+            let popup = CreateWindowExW(
+                WS_EX_LAYERED,
+                w!("STATIC"),
+                w!("attachment-failure-test"),
+                WS_POPUP,
+                0,
+                0,
+                20,
+                20,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let original_style = GetWindowLongW(popup, GWL_STYLE);
+            let original_ex_style = GetWindowLongW(popup, GWL_EXSTYLE);
+
+            assert!(!embed_in_taskbar(popup, HWND(1 as *mut _)));
+            assert_eq!(GetParent(popup).unwrap_or_default(), HWND::default());
+            assert_eq!(GetWindowLongW(popup, GWL_STYLE), original_style);
+            assert_eq!(GetWindowLongW(popup, GWL_EXSTYLE), original_ex_style);
+
+            let _ = DestroyWindow(popup);
+        }
+    }
 }
 
 #[cfg(test)]
 mod taskbar_selection_tests {
     use super::*;
+    use windows::core::w;
 
     #[test]
     fn monitor_device_selection_requires_an_exact_match() {
@@ -341,6 +381,47 @@ mod taskbar_selection_tests {
             taskbar_index_for_monitor_device(&taskbars, r"\\.\DISPLAY3", resolve_device),
             None
         );
+    }
+
+    #[test]
+    fn taskbar_monitor_device_comes_from_the_taskbar_window() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("monitor-resolution-test"),
+                WS_POPUP,
+                0,
+                0,
+                20,
+                20,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let taskbar = TaskbarWindow {
+                hwnd,
+                rect: RECT::default(),
+                is_primary: false,
+            };
+            let rect_independent = TaskbarWindow {
+                rect: RECT {
+                    left: 100_000,
+                    top: 100_000,
+                    right: 100_001,
+                    bottom: 100_001,
+                },
+                ..taskbar
+            };
+
+            assert_eq!(
+                taskbar_monitor_device(&taskbar),
+                taskbar_monitor_device(&rect_independent)
+            );
+            let _ = DestroyWindow(hwnd);
+        }
     }
 }
 

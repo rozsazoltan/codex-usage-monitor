@@ -1075,6 +1075,14 @@ fn attach_to_taskbar(hwnd: HWND, target: TaskbarTarget) -> bool {
         taskbar.rect.bottom
     ));
 
+    if !native_interop::embed_in_taskbar(hwnd, taskbar.hwnd) {
+        diagnose::log(format!(
+            "taskbar attachment failed index={index} hwnd={:?}",
+            taskbar.hwnd
+        ));
+        return false;
+    }
+
     let old_hook = {
         let mut state = lock_state();
         state.as_mut().and_then(|s| s.win_event_hook.take())
@@ -1082,8 +1090,6 @@ fn attach_to_taskbar(hwnd: HWND, target: TaskbarTarget) -> bool {
     if let Some(hook) = old_hook {
         native_interop::unhook_win_event(hook);
     }
-
-    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
 
     let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
     if tray_notify.is_some() {
@@ -4413,6 +4419,12 @@ fn apply_settings_batch(
             } else {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
+        }
+    } else if monitor_changed && show_widget {
+        // Reparenting can leave a child window hidden on some shell/taskbar
+        // transitions even though the user's visibility preference is on.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
     }
     render_layered();

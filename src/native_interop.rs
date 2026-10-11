@@ -1,9 +1,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::{cell::Cell, thread_local};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, POINT, RECT, SYSTEMTIME};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, ScreenToClient, MONITORINFO,
+    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -55,7 +58,66 @@ pub fn system_time_to_local(value: SystemTime) -> Option<SYSTEMTIME> {
 pub struct TaskbarWindow {
     pub hwnd: HWND,
     pub rect: RECT,
+}
+
+/// An active display returned by EnumDisplayMonitors.
+#[derive(Clone, Debug)]
+pub struct DisplayMonitor {
+    pub device: String,
+    pub rect: RECT,
     pub is_primary: bool,
+}
+
+/// Enumerate active displays independently of whether Explorer created a
+/// taskbar window for each one.
+pub fn find_monitors() -> Vec<DisplayMonitor> {
+    unsafe extern "system" fn enum_proc(
+        monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+        _dc: windows::Win32::Graphics::Gdi::HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let monitors = &mut *(lparam.0 as *mut Vec<DisplayMonitor>);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO).as_bool() {
+            return BOOL(1);
+        }
+        let len = info
+            .szDevice
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(info.szDevice.len());
+        let device = String::from_utf16_lossy(&info.szDevice[..len]);
+        if !device.is_empty() {
+            monitors.push(DisplayMonitor {
+                device,
+                rect: info.monitorInfo.rcMonitor,
+                // MONITORINFOF_PRIMARY is 1 in the Win32 GDI contract.
+                is_primary: info.monitorInfo.dwFlags & 1 != 0,
+            });
+        }
+        BOOL(1)
+    }
+
+    let mut monitors: Vec<DisplayMonitor> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(enum_proc),
+            LPARAM(&mut monitors as *mut _ as isize),
+        );
+    }
+    monitors.sort_by_key(|monitor| {
+        (
+            monitor.rect.top,
+            monitor.rect.left,
+            monitor.rect.bottom,
+            monitor.rect.right,
+        )
+    });
+    monitors
 }
 
 /// Windows display device name (for example \\.\DISPLAY2) for a taskbar.
@@ -83,21 +145,6 @@ pub fn taskbar_monitor_device(taskbar: &TaskbarWindow) -> Option<String> {
     }
 }
 
-/// Find the taskbar for an exact monitor device name without using its
-/// enumeration index as a fallback.
-pub fn taskbar_index_for_monitor_device<F>(
-    taskbars: &[TaskbarWindow],
-    device: &str,
-    mut resolve_device: F,
-) -> Option<usize>
-where
-    F: FnMut(&TaskbarWindow) -> Option<String>,
-{
-    taskbars
-        .iter()
-        .position(|taskbar| resolve_device(taskbar).as_deref() == Some(device))
-}
-
 pub fn find_taskbars() -> Vec<TaskbarWindow> {
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let taskbars = &mut *(lparam.0 as *mut Vec<TaskbarWindow>);
@@ -107,11 +154,7 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
             let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
             if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
                 if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
-                    taskbars.push(TaskbarWindow {
-                        hwnd,
-                        rect,
-                        is_primary: class_name == "Shell_TrayWnd",
-                    });
+                    taskbars.push(TaskbarWindow { hwnd, rect });
                 }
             }
         }
@@ -186,38 +229,327 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-/// Embed our window as a child of the taskbar.
-///
-/// Returns `false` if Windows rejects the reparenting operation, restoring the
-/// window styles so callers can keep the existing attachment or fallback.
-pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> bool {
+/// Convert a screen-space point to the specified window's client coordinates.
+pub fn screen_to_client(hwnd: HWND, x: i32, y: i32) -> Option<POINT> {
     unsafe {
-        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        let style = GetWindowLongW(hwnd, GWL_STYLE);
-        // Reset alpha mode used by the startup popup fallback before switching
-        // back to UpdateLayeredWindow rendering inside the taskbar.
-        if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
-            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_LAYERED.0 as i32));
-        }
-        let _ = SetWindowLongW(
+        let mut point = POINT { x, y };
+        ScreenToClient(hwnd, &mut point).as_bool().then_some(point)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowPosition {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Clone, Copy)]
+struct WindowSnapshot {
+    parent: HWND,
+    style: i32,
+    ex_style: i32,
+    rect: RECT,
+    visible: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_MODE_CHANGE_AFTER_PARENT_MUTATION: Cell<bool> = const { Cell::new(false) };
+}
+
+unsafe fn has_parent(hwnd: HWND, parent: Option<HWND>) -> bool {
+    if !IsWindow(hwnd).as_bool() {
+        return false;
+    }
+    match parent {
+        Some(parent) => GetParent(hwnd).is_ok_and(|actual| actual == parent),
+        // GetParent reports a null parent as an error in windows 0.58. IsWindow
+        // above distinguishes that expected null from an invalid child HWND.
+        None => GetParent(hwnd).is_err(),
+    }
+}
+
+unsafe fn has_style(hwnd: HWND, expected: i32, is_child: bool) -> bool {
+    let actual = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    let expected = expected as u32;
+    if !is_child && expected & WS_POPUP_STYLE != 0 {
+        actual & !WS_CLIPSIBLINGS_STYLE == expected & !WS_CLIPSIBLINGS_STYLE
+    } else {
+        actual == expected
+    }
+}
+
+unsafe fn restore_window(hwnd: HWND, old: WindowSnapshot) -> bool {
+    let old_parent = (!old.parent.is_invalid()).then_some(old.parent);
+    let current_parent = GetParent(hwnd).unwrap_or_default();
+    let parent_changed = current_parent != old.parent;
+    let topmost_cleared = if old_parent.is_some() && current_parent.is_invalid() {
+        SetWindowPos(
             hwnd,
-            GWL_EXSTYLE,
-            ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+        )
+        .is_ok()
+    } else {
+        true
+    };
+
+    if GetWindowLongW(hwnd, GWL_STYLE) != old.style {
+        let _ = SetWindowLongW(hwnd, GWL_STYLE, old.style);
+    }
+    if parent_changed && old_parent.is_none() {
+        if old.ex_style & WS_EX_LAYERED.0 as i32 != 0 {
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style & !(WS_EX_LAYERED.0 as i32));
+        }
+        let _ = SetParent(hwnd, HWND::default());
+        if GetWindowLongW(hwnd, GWL_STYLE) != old.style {
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, old.style);
+        }
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style);
+    } else {
+        if parent_changed
+            && current_parent.is_invalid()
+            && old.ex_style & WS_EX_LAYERED.0 as i32 != 0
+        {
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style & !(WS_EX_LAYERED.0 as i32));
+        }
+        if GetWindowLongW(hwnd, GWL_EXSTYLE) != old.ex_style {
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style);
+        }
+        if parent_changed {
+            let _ = SetParent(hwnd, old.parent);
+        }
+    }
+    let parent = has_parent(hwnd, old_parent);
+
+    if old_parent.is_none() && old.ex_style & WS_EX_LAYERED.0 as i32 != 0 {
+        let _ = SetLayeredWindowAttributes(
+            hwnd,
+            windows::Win32::Foundation::COLORREF(0),
+            255,
+            LWA_ALPHA,
         );
+    }
 
-        // Change from popup to child
-        let new_style = ((style as u32) & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
-        let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
+    let mut point = POINT {
+        x: old.rect.left,
+        y: old.rect.top,
+    };
+    let coordinates = if old_parent.is_some() {
+        ScreenToClient(old.parent, &mut point).as_bool()
+    } else {
+        true
+    };
+    let insert_after = if old.ex_style & WS_EX_TOPMOST.0 as i32 != 0 {
+        HWND_TOPMOST
+    } else if old_parent.is_some() {
+        HWND_TOP
+    } else {
+        HWND_NOTOPMOST
+    };
+    let positioned = coordinates
+        && SetWindowPos(
+            hwnd,
+            insert_after,
+            point.x,
+            point.y,
+            old.rect.right - old.rect.left,
+            old.rect.bottom - old.rect.top,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+        .is_ok();
+    let style = has_style(hwnd, old.style, old_parent.is_some());
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) == old.ex_style;
+    if old.visible {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    } else {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    style && ex_style && parent && positioned && topmost_cleared
+}
 
-        if SetParent(hwnd, taskbar_hwnd).is_err() {
-            // Do not mark a still-top-level window as embedded: subsequent
-            // positioning uses taskbar-relative coordinates and would move it
-            // off-screen. Restore the popup's original rendering styles.
+/// Change between an embedded child window and a floating popup, placing it in
+/// the coordinate space of its new parent. Native failures restore the prior
+/// parent, styles, rectangle, z-order, and visibility.
+pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPosition) -> bool {
+    unsafe {
+        if !IsWindow(hwnd).as_bool() || position.width <= 0 || position.height <= 0 {
+            return false;
+        }
+        if parent.is_some_and(|parent| !IsWindow(parent).as_bool()) {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return false;
+        }
+        let old_parent = GetParent(hwnd).unwrap_or_default();
+        let new_parent = parent.unwrap_or_default();
+        let parent_changed = old_parent != new_parent;
+        let old = WindowSnapshot {
+            parent: old_parent,
+            style: GetWindowLongW(hwnd, GWL_STYLE),
+            ex_style: GetWindowLongW(hwnd, GWL_EXSTYLE),
+            rect,
+            visible: IsWindowVisible(hwnd).as_bool(),
+        };
+
+        let (style, ex_style, insert_after) = if parent.is_some() {
+            (
+                ((old.style as u32 & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE)
+                    as i32,
+                (old.ex_style & !WS_EX_TOPMOST.0 as i32)
+                    | WS_EX_LAYERED.0 as i32
+                    | WS_EX_TOOLWINDOW.0 as i32
+                    | WS_EX_NOACTIVATE.0 as i32,
+                HWND_TOP,
+            )
+        } else {
+            (
+                ((old.style as u32 & !WS_CHILD_STYLE) | WS_POPUP_STYLE) as i32,
+                old.ex_style
+                    | WS_EX_LAYERED.0 as i32
+                    | WS_EX_TOOLWINDOW.0 as i32
+                    | WS_EX_NOACTIVATE.0 as i32
+                    | WS_EX_TOPMOST.0 as i32,
+                HWND_TOPMOST,
+            )
+        };
+
+        if parent.is_some() {
+            // Reset WS_EX_LAYERED while still top-level so the next
+            // UpdateLayeredWindow call can replace the popup's alpha mode.
+            if parent_changed
+                && old_parent.is_invalid()
+                && old.ex_style & WS_EX_LAYERED.0 as i32 != 0
+            {
+                let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style & !(WS_EX_LAYERED.0 as i32));
+            }
+            if GetWindowLongW(hwnd, GWL_EXSTYLE) != ex_style {
+                let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
+            }
+            if GetWindowLongW(hwnd, GWL_STYLE) != style {
+                let _ = SetWindowLongW(hwnd, GWL_STYLE, style);
+            }
+        } else {
+            if GetWindowLongW(hwnd, GWL_STYLE) != style {
+                let _ = SetWindowLongW(hwnd, GWL_STYLE, style);
+            }
+            if GetWindowLongW(hwnd, GWL_EXSTYLE) != ex_style {
+                let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
+            }
+        }
+        let ex_style_before_position = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let expected_ex_style_before_position = ex_style & !(WS_EX_TOPMOST.0 as i32);
+        if ex_style_before_position & !(WS_EX_TOPMOST.0 as i32) != expected_ex_style_before_position
+            || (parent.is_some() && GetWindowLongW(hwnd, GWL_STYLE) != style)
+        {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+
+        if parent.is_some()
+            && parent_changed
+            && SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            )
+            .is_err()
+        {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+
+        // SetParent may return NULL both for success (the previous parent was
+        // null) and failure. Verify the resulting parent instead of trusting
+        // the windows crate's Result conversion of that ambiguous return.
+        if parent_changed {
+            let _ = SetParent(hwnd, new_parent);
+        }
+        if !has_parent(hwnd, parent) {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+        #[cfg(test)]
+        if FAIL_NEXT_MODE_CHANGE_AFTER_PARENT_MUTATION.with(|fail| fail.replace(false)) {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+        if parent.is_none() && GetWindowLongW(hwnd, GWL_STYLE) != style {
             let _ = SetWindowLongW(hwnd, GWL_STYLE, style);
-            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
+        }
+        if GetWindowLongW(hwnd, GWL_STYLE) != style {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+        if parent.is_none()
+            && SetLayeredWindowAttributes(
+                hwnd,
+                windows::Win32::Foundation::COLORREF(0),
+                255,
+                LWA_ALPHA,
+            )
+            .is_err()
+        {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+
+        if SetWindowPos(
+            hwnd,
+            insert_after,
+            position.x,
+            position.y,
+            position.width,
+            position.height,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+        .is_err()
+        {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+        if GetWindowLongW(hwnd, GWL_EXSTYLE) != ex_style || GetWindowLongW(hwnd, GWL_STYLE) != style
+        {
+            let _ = restore_window(hwnd, old);
             return false;
         }
         true
+    }
+}
+
+/// Reposition an already configured child/popup without activating it.
+pub fn position_window(hwnd: HWND, parent: Option<HWND>, position: WindowPosition) -> bool {
+    if position.width <= 0 || position.height <= 0 {
+        return false;
+    }
+    let insert_after = if parent.is_some() {
+        HWND_TOP
+    } else {
+        HWND_TOPMOST
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            insert_after,
+            position.x,
+            position.y,
+            position.width,
+            position.height,
+            SWP_NOACTIVATE,
+        )
+        .is_ok()
     }
 }
 
@@ -227,6 +559,57 @@ mod attachment_tests {
     use windows::core::w;
     use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
     use windows::Win32::Graphics::Gdi::*;
+
+    unsafe fn update_test_layered_surface(hwnd: HWND) -> windows::core::Result<()> {
+        let mut client_rect = RECT::default();
+        GetClientRect(hwnd, &mut client_rect)?;
+        let width = client_rect.right - client_rect.left;
+        let height = client_rect.bottom - client_rect.top;
+        assert!(
+            width > 0 && height > 0,
+            "test child has an empty client area"
+        );
+        let dc = CreateCompatibleDC(None);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: 40,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0)
+            .expect("CreateDIBSection should create a test surface");
+        std::slice::from_raw_parts_mut(bits as *mut u32, (width * height) as usize)
+            .fill(0xffff_ffff);
+        let old = SelectObject(dc, bitmap);
+        let source = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        let rendered = UpdateLayeredWindow(
+            hwnd,
+            None,
+            None,
+            None,
+            dc,
+            Some(&source),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+        let _ = SelectObject(dc, old);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(dc);
+        rendered
+    }
 
     #[test]
     fn startup_popup_can_switch_to_layered_child_rendering() {
@@ -247,7 +630,7 @@ mod attachment_tests {
             )
             .unwrap();
             let child = CreateWindowExW(
-                WS_EX_LAYERED,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 w!("STATIC"),
                 w!("widget-test"),
                 WS_POPUP,
@@ -262,7 +645,16 @@ mod attachment_tests {
             )
             .unwrap();
             SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
-            assert!(embed_in_taskbar(child, parent));
+            assert!(set_window_mode(
+                child,
+                Some(parent),
+                WindowPosition {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }
+            ));
             assert_eq!(GetParent(child).unwrap(), parent);
             let dc = CreateCompatibleDC(None);
             let info = BITMAPINFO {
@@ -302,17 +694,32 @@ mod attachment_tests {
             let _ = SelectObject(dc, old);
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(dc);
-            let _ = DestroyWindow(child);
-            let _ = DestroyWindow(parent);
             assert!(
                 rendered.is_ok(),
                 "fallback alpha mode must not prevent taskbar rendering: {rendered:?}"
             );
+
+            let placement = WindowPosition {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            };
+            assert!(set_window_mode(child, None, placement));
+            assert!(set_window_mode(child, Some(parent), placement));
+            let second_render = update_test_layered_surface(child);
+            assert!(
+                second_render.is_ok(),
+                "UpdateLayeredWindow must work after a second child re-embedding: {second_render:?}"
+            );
+
+            let _ = DestroyWindow(child);
+            let _ = DestroyWindow(parent);
         }
     }
 
     #[test]
-    fn failed_taskbar_attachment_preserves_popup_styles_and_parent() {
+    fn failed_window_mode_transition_restores_popup_styles_and_parent() {
         unsafe {
             let popup = CreateWindowExW(
                 WS_EX_LAYERED,
@@ -332,12 +739,226 @@ mod attachment_tests {
             let original_style = GetWindowLongW(popup, GWL_STYLE);
             let original_ex_style = GetWindowLongW(popup, GWL_EXSTYLE);
 
-            assert!(!embed_in_taskbar(popup, HWND(1 as *mut _)));
+            assert!(!set_window_mode(
+                popup,
+                Some(HWND(std::ptr::dangling_mut::<std::ffi::c_void>())),
+                WindowPosition {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 20,
+                }
+            ));
             assert_eq!(GetParent(popup).unwrap_or_default(), HWND::default());
             assert_eq!(GetWindowLongW(popup, GWL_STYLE), original_style);
             assert_eq!(GetWindowLongW(popup, GWL_EXSTYLE), original_ex_style);
 
             let _ = DestroyWindow(popup);
+        }
+    }
+
+    #[test]
+    fn post_mutation_window_mode_failure_restores_geometry_visibility_and_redraw() {
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("post-mutation-parent"),
+                WS_POPUP,
+                0,
+                0,
+                80,
+                80,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let popup = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("post-mutation-popup"),
+                WS_POPUP,
+                127,
+                139,
+                24,
+                26,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            SetLayeredWindowAttributes(popup, COLORREF(0), 255, LWA_ALPHA).unwrap();
+            let _ = ShowWindow(popup, SW_SHOWNOACTIVATE);
+
+            let original_style = GetWindowLongW(popup, GWL_STYLE);
+            let original_ex_style = GetWindowLongW(popup, GWL_EXSTYLE);
+            let mut original_rect = RECT::default();
+            GetWindowRect(popup, &mut original_rect).unwrap();
+            assert!(IsWindowVisible(popup).as_bool());
+
+            FAIL_NEXT_MODE_CHANGE_AFTER_PARENT_MUTATION.with(|fail| fail.set(true));
+            assert!(!set_window_mode(
+                popup,
+                Some(parent),
+                WindowPosition {
+                    x: 7,
+                    y: 9,
+                    width: 28,
+                    height: 30,
+                }
+            ));
+
+            assert!(GetParent(popup).is_err());
+            assert_eq!(GetWindowLongW(popup, GWL_STYLE), original_style);
+            assert_eq!(GetWindowLongW(popup, GWL_EXSTYLE), original_ex_style);
+            let mut restored_rect = RECT::default();
+            GetWindowRect(popup, &mut restored_rect).unwrap();
+            assert_eq!(restored_rect, original_rect);
+            assert!(IsWindowVisible(popup).as_bool());
+
+            assert!(InvalidateRect(popup, None, false).as_bool());
+            assert!(UpdateWindow(popup).as_bool());
+
+            let _ = DestroyWindow(popup);
+            let _ = DestroyWindow(parent);
+        }
+    }
+
+    #[test]
+    fn popup_child_popup_child_round_trip_preserves_visibility_and_render_modes() {
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("round-trip-parent"),
+                WS_POPUP,
+                100,
+                120,
+                80,
+                80,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let mut screen_point = POINT { x: 7, y: 9 };
+            assert!(ClientToScreen(parent, &mut screen_point).as_bool());
+            let client_point = screen_to_client(parent, screen_point.x, screen_point.y).unwrap();
+            assert_eq!((client_point.x, client_point.y), (7, 9));
+            let child = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("round-trip-child"),
+                WS_POPUP,
+                0,
+                0,
+                20,
+                20,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
+            let _ = ShowWindow(parent, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(child, SW_SHOWNOACTIVATE);
+
+            let embedded = WindowPosition {
+                x: 4,
+                y: 5,
+                width: 21,
+                height: 22,
+            };
+            let floating = WindowPosition {
+                x: -1400,
+                y: 200,
+                width: 23,
+                height: 24,
+            };
+            assert!(set_window_mode(child, Some(parent), embedded));
+            assert_eq!(GetParent(child).unwrap(), parent);
+            assert_ne!(GetWindowLongW(child, GWL_STYLE) as u32 & WS_CHILD_STYLE, 0);
+            assert_eq!(
+                GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0,
+                WS_EX_LAYERED.0
+            );
+            assert_eq!(
+                GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,
+                0
+            );
+            assert_ne!(
+                GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE.0,
+                0
+            );
+            assert!(IsWindowVisible(child).as_bool());
+
+            let child_style = GetWindowLongW(child, GWL_STYLE);
+            let child_ex_style = GetWindowLongW(child, GWL_EXSTYLE);
+            let mut child_rect = RECT::default();
+            GetWindowRect(child, &mut child_rect).unwrap();
+            assert!(!set_window_mode(
+                child,
+                Some(HWND(std::ptr::dangling_mut::<std::ffi::c_void>())),
+                WindowPosition {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                }
+            ));
+            assert_eq!(GetParent(child).unwrap(), parent);
+            assert_eq!(GetWindowLongW(child, GWL_STYLE), child_style);
+            assert_eq!(GetWindowLongW(child, GWL_EXSTYLE), child_ex_style);
+            let mut restored_rect = RECT::default();
+            GetWindowRect(child, &mut restored_rect).unwrap();
+            assert_eq!(restored_rect, child_rect);
+
+            assert!(set_window_mode(child, None, floating));
+            assert!(GetParent(child).is_err());
+            assert_eq!(
+                GetWindowLongW(child, GWL_STYLE) as u32 & WS_POPUP_STYLE,
+                WS_POPUP_STYLE
+            );
+            assert_eq!(GetWindowLongW(child, GWL_STYLE) as u32 & WS_CHILD_STYLE, 0);
+            assert_ne!(
+                GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0,
+                0
+            );
+            assert_ne!(
+                GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,
+                0
+            );
+            assert_ne!(
+                GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0,
+                0
+            );
+            assert_ne!(
+                GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE.0,
+                0
+            );
+            assert!(IsWindowVisible(child).as_bool());
+
+            assert!(set_window_mode(child, Some(parent), embedded));
+            assert_eq!(GetParent(child).unwrap(), parent);
+            assert_eq!(
+                GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0,
+                WS_EX_LAYERED.0
+            );
+            assert!(IsWindowVisible(child).as_bool());
+
+            let _ = ShowWindow(child, SW_HIDE);
+            assert!(set_window_mode(child, None, floating));
+            assert!(!IsWindowVisible(child).as_bool());
+            assert!(set_window_mode(child, Some(parent), embedded));
+            assert!(!IsWindowVisible(child).as_bool());
+
+            let _ = DestroyWindow(child);
+            let _ = DestroyWindow(parent);
         }
     }
 }
@@ -346,42 +967,6 @@ mod attachment_tests {
 mod taskbar_selection_tests {
     use super::*;
     use windows::core::w;
-
-    #[test]
-    fn monitor_device_selection_requires_an_exact_match() {
-        let taskbars = [
-            TaskbarWindow {
-                hwnd: HWND::default(),
-                rect: RECT {
-                    left: 1,
-                    ..Default::default()
-                },
-                is_primary: true,
-            },
-            TaskbarWindow {
-                hwnd: HWND::default(),
-                rect: RECT {
-                    left: 2,
-                    ..Default::default()
-                },
-                is_primary: false,
-            },
-        ];
-        let resolve_device = |taskbar: &TaskbarWindow| match taskbar.rect.left {
-            1 => Some(r"\\.\DISPLAY1".to_string()),
-            2 => Some(r"\\.\DISPLAY2".to_string()),
-            _ => None,
-        };
-
-        assert_eq!(
-            taskbar_index_for_monitor_device(&taskbars, r"\\.\DISPLAY2", resolve_device),
-            Some(1)
-        );
-        assert_eq!(
-            taskbar_index_for_monitor_device(&taskbars, r"\\.\DISPLAY3", resolve_device),
-            None
-        );
-    }
 
     #[test]
     fn taskbar_monitor_device_comes_from_the_taskbar_window() {
@@ -404,7 +989,6 @@ mod taskbar_selection_tests {
             let taskbar = TaskbarWindow {
                 hwnd,
                 rect: RECT::default(),
-                is_primary: false,
             };
             let rect_independent = TaskbarWindow {
                 rect: RECT {
@@ -422,13 +1006,6 @@ mod taskbar_selection_tests {
             );
             let _ = DestroyWindow(hwnd);
         }
-    }
-}
-
-/// Move the window
-pub fn move_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
-    unsafe {
-        let _ = MoveWindow(hwnd, x, y, w, h, true);
     }
 }
 

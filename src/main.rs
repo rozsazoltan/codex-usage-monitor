@@ -79,7 +79,18 @@ fn main() {
     if diagnose_enabled {
         diagnose::log("entering window::run");
     }
+    #[cfg(windows)]
+    set_app_user_model_id();
     window::run();
+}
+
+#[cfg(windows)]
+fn set_app_user_model_id() {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+    let app_id: Vec<u16> = "com.datarose.codexusage\0".encode_utf16().collect();
+    let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(app_id.as_ptr())) };
 }
 
 fn version_requested(args: &[String]) -> bool {

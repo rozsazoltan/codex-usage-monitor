@@ -110,6 +110,7 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+    settings_pane_open: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -505,6 +506,8 @@ struct SettingsFile {
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
     widget_visible: bool,
+    #[serde(default = "default_settings_pane_open")]
+    settings_pane_open: bool,
     #[serde(default = "default_show_tray_icon")]
     show_tray_icon: bool,
     #[serde(default = "default_show_provider_icons")]
@@ -538,6 +541,7 @@ impl Default for SettingsFile {
             appearance: Appearance::default(),
             last_update_check_unix: None,
             widget_visible: true,
+            settings_pane_open: default_settings_pane_open(),
             show_tray_icon: default_show_tray_icon(),
             show_provider_icons: default_show_provider_icons(),
             show_claude_code: false,
@@ -560,6 +564,10 @@ fn default_poll_interval() -> u32 {
 }
 
 fn default_widget_visible() -> bool {
+    true
+}
+
+fn default_settings_pane_open() -> bool {
     true
 }
 
@@ -697,6 +705,7 @@ fn persist_state_settings() -> Result<(), String> {
             appearance: s.appearance,
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
+            settings_pane_open: s.settings_pane_open,
             show_tray_icon: s.show_tray_icon,
             show_provider_icons: s.show_provider_icons,
             show_claude_code: s.show_claude_code,
@@ -2337,6 +2346,7 @@ pub fn run() {
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
+                settings_pane_open: settings.settings_pane_open,
             });
         }
 
@@ -3897,6 +3907,7 @@ fn settings_snapshot() -> serde_json::Value {
         "settings": {
             "language":s.language_override.map_or("system", LanguageId::code),
             "startup":is_startup_enabled(), "widget_visible":s.widget_visible,
+            "settings_pane_open":s.settings_pane_open,
             "show_tray_icon":s.show_tray_icon,"show_provider_icons":s.show_provider_icons,
             "show_claude_code":s.show_claude_code,"show_codex":s.show_codex,
             "show_antigravity":s.show_antigravity,"show_session_window":s.show_session_window,
@@ -4018,6 +4029,7 @@ struct SettingsCandidate {
     language_override: Option<LanguageId>,
     startup: bool,
     widget_visible: bool,
+    settings_pane_open: bool,
     show_tray_icon: bool,
     show_provider_icons: bool,
     show_claude_code: bool,
@@ -4040,6 +4052,7 @@ impl SettingsCandidate {
             language_override: settings.language.as_deref().and_then(LanguageId::from_code),
             startup,
             widget_visible: settings.widget_visible,
+            settings_pane_open: settings.settings_pane_open,
             show_tray_icon: settings.show_tray_icon,
             show_provider_icons: settings.show_provider_icons,
             show_claude_code: settings.show_claude_code,
@@ -4061,6 +4074,7 @@ impl SettingsCandidate {
             language_override: state.language_override,
             startup,
             widget_visible: state.widget_visible,
+            settings_pane_open: state.settings_pane_open,
             show_tray_icon: state.show_tray_icon,
             show_provider_icons: state.show_provider_icons,
             show_claude_code: state.show_claude_code,
@@ -4117,6 +4131,9 @@ fn validate_settings_changes(
             }
             Key::Startup => candidate.startup = setting_value(change.value.clone())?,
             Key::WidgetVisible => candidate.widget_visible = setting_value(change.value.clone())?,
+            Key::SettingsPaneOpen => {
+                candidate.settings_pane_open = setting_value(change.value.clone())?
+            }
             Key::ShowTrayIcon => candidate.show_tray_icon = setting_value(change.value.clone())?,
             Key::ShowProviderIcons => {
                 candidate.show_provider_icons = setting_value(change.value.clone())?
@@ -4200,10 +4217,17 @@ fn validate_settings_changes(
     Ok(candidate)
 }
 
+fn settings_batch_needs_widget_redraw(changes: &[settings_ui::Change]) -> bool {
+    changes
+        .iter()
+        .any(|change| change.key != Key::SettingsPaneOpen)
+}
+
 fn apply_settings_batch(
     hwnd: HWND,
     changes: &[settings_ui::Change],
 ) -> Result<(), SettingsApplyError> {
+    let redraw_widget = settings_batch_needs_widget_redraw(changes);
     let startup = is_startup_enabled();
     let (current, claude_code_available) = {
         let state = lock_state();
@@ -4358,6 +4382,7 @@ fn apply_settings_batch(
             ));
         };
         app_state.widget_visible = candidate.widget_visible;
+        app_state.settings_pane_open = candidate.settings_pane_open;
         app_state.show_tray_icon = candidate.show_tray_icon;
         app_state.show_provider_icons = candidate.show_provider_icons;
         app_state.show_claude_code = candidate.show_claude_code;
@@ -4427,7 +4452,9 @@ fn apply_settings_batch(
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
     }
-    render_layered();
+    if redraw_widget {
+        render_layered();
+    }
     if tooltip_changed {
         sync_tray_icons(hwnd);
     }
@@ -4887,6 +4914,7 @@ mod tests {
             (Key::PollIntervalMs, json!(60_000.5)),
             (Key::AdaptiveRefresh, json!("true")),
             (Key::ShowTrayIcon, json!("true")),
+            (Key::SettingsPaneOpen, json!("false")),
             (Key::AlertThresholdPercent, json!(15)),
             (Key::Language, json!("../../arbitrary")),
             (Key::Palette, json!("custom")),
@@ -4908,6 +4936,31 @@ mod tests {
             }
             assert_eq!(save_calls, 0, "invalid {key:?} must not save");
         }
+    }
+
+    #[test]
+    fn settings_pane_open_is_a_strict_ui_only_preference() {
+        use serde_json::json;
+
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        assert!(current.settings_pane_open);
+        let change = settings_ui::Change {
+            key: Key::SettingsPaneOpen,
+            value: json!(false),
+        };
+        let candidate = validate_settings_changes(&current, &[change.clone()], false, &[])
+            .expect("boolean settings-pane value should be accepted");
+        let mut expected = current.clone();
+        expected.settings_pane_open = false;
+
+        assert_eq!(candidate, expected);
+        assert!(!settings_batch_needs_widget_redraw(&[change]));
+
+        let invalid = settings_ui::Change {
+            key: Key::SettingsPaneOpen,
+            value: json!("false"),
+        };
+        assert!(validate_settings_changes(&current, &[invalid], false, &[]).is_err());
     }
 
     #[test]
@@ -5249,6 +5302,7 @@ mod tests {
         assert_eq!(old.appearance, Appearance::default());
         assert_eq!(old.appearance.bar_thickness, BarThickness::Slim);
         assert_eq!(old.monitor_device, None);
+        assert!(old.settings_pane_open);
         assert!(old.show_tray_icon);
         assert!(old.show_provider_icons);
 
@@ -5293,6 +5347,21 @@ mod tests {
         assert!(!restored.show_provider_icons);
         assert!(SettingsFile::default().show_tray_icon);
         assert!(SettingsFile::default().show_provider_icons);
+    }
+
+    #[test]
+    fn settings_pane_open_defaults_true_and_round_trips_as_a_boolean() {
+        let settings = SettingsFile {
+            settings_pane_open: false,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
+        let legacy: SettingsFile = serde_json::from_str(&test_settings_json("en")).unwrap();
+
+        assert!(!restored.settings_pane_open);
+        assert!(legacy.settings_pane_open);
+        assert!(serde_json::from_str::<SettingsFile>(r#"{"settings_pane_open":"false"}"#).is_err());
     }
 
     #[test]

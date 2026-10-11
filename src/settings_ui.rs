@@ -25,8 +25,8 @@
 //! Set keys (snake_case): language ("system" or supported language code),
 //! startup, widget_visible, show_tray_icon, show_provider_icons,
 //! show_claude_code, show_codex, show_antigravity,
-//! show_session_window, show_weekly_window, adaptive_refresh, anchor_left
-//! (booleans); poll_interval_ms (60000..=3600000 integer),
+//! show_session_window, show_weekly_window, adaptive_refresh, anchor_left,
+//! settings_pane_open (booleans); poll_interval_ms (60000..=3600000 integer),
 //! alert_threshold_percent (0|10|20|30); palette
 //! (system|high_contrast_dark|high_contrast_light), bar_style
 //! (continuous|segmented), bar_thickness (standard|slim), font_size
@@ -119,6 +119,7 @@ pub enum Key {
     CodexAccent,
     MonitorDevice,
     AnchorLeft,
+    SettingsPaneOpen,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -821,6 +822,10 @@ mod tests {
         .is_ok());
         assert!(parse_request(
             br#"{"v":1,"id":2,"op":"set_batch","changes":[{"key":"show_tray_icon","value":false},{"key":"show_provider_icons","value":false},{"key":"claude_accent","value":null}]}"#
+        )
+        .is_ok());
+        assert!(parse_request(
+            br#"{"v":1,"id":3,"op":"set_batch","changes":[{"key":"settings_pane_open","value":false}]}"#
         )
         .is_ok());
         assert!(parse_request(br#"{"v":1,"id":1,"op":"persist"}"#).is_ok());

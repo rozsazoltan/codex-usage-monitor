@@ -15,6 +15,8 @@ centered within the nearest monitor's work area.
 - Windows SDK **10.0.26100.0**, including headers, libraries and WinRT metadata.
 - Full .NET Framework MSBuild and .NET Framework 4.7.2 or later for the XAML build
   tasks. A `dotnet` SDK is not required; do not use `dotnet build`.
+- PowerShell **7.2 or later**, with `pwsh` on `PATH`, for `PublishPortable` and
+  the release scripts. Windows PowerShell 5.1 is not supported.
 - Internet access to nuget.org for the initial restore.
 - To run: the shared **Windows App Runtime 1.8, x64**, at least the servicing
   level required by the pinned Windows App SDK. This project does not install it.
@@ -43,11 +45,34 @@ $msbuild = 'D:\program\vs-buildtools\2022\MSBuild\Current\Bin\MSBuild.exe'
 `PublishPortable` writes to `settings-ui\bin\portable` by default. To validate
 the publish target without replacing a running portable copy, pass an alternate
 directory, for example `/p:PortableOutputDir=D:\temp\settings-ui-publish`.
+The publisher creates a missing destination parent only after source validation.
+
+Publication stages all five files in a unique sibling directory, checks their
+SHA-256 hashes and verifies that the source files did not change. It then renames
+the old destination to a backup and the staging directory to the destination.
+These two renames are **not an atomic directory exchange**: the destination can
+be briefly absent. A failed replacement restores the backup where possible;
+process termination or power loss cannot be rolled back automatically. A failed
+rollback retains the backup and reports its recovery path. Cleanup failures leave
+the committed destination intact and report any retained backup.
+
+Existing files are never overwritten in place. If the old files or directory
+are locked, close the existing Settings window and retry; the publisher does not
+stop processes. Unexpected destination files, subdirectories, and reparse paths
+are refused rather than removed. Identical payload content returns `Unchanged`
+without replacing the directory.
+
+`scripts\build-release.ps1` publishes to the dedicated ignored
+`target\settings-portable-build` directory and passes that directory explicitly
+to `scripts\package-settings.ps1 -InputDirectory`. It does not publish or package
+the shared developer `settings-ui\bin\portable` directory. The payload still
+contains exactly five flat files; the shared Windows App Runtime remains an
+external prerequisite and is never bundled or installed by publication.
 
 Change `$msbuild` to the full VS 2022 MSBuild path on other machines. Do not copy
 the entire compiler output directory into a release: it includes symbols and
-unused SDK-transitive WebView2/background-task artifacts. `PublishPortable` copies
-only the five runtime files to `settings-ui/bin/portable/`:
+unused SDK-transitive WebView2/background-task artifacts. `PublishPortable`
+publishes only the five runtime files:
 
 | File | Observed Release x64 bytes |
 | --- | ---: |

@@ -90,9 +90,6 @@
     <PortableOutputDir Condition="'$(PortableOutputDir)' == ''">$(MSBuildThisFileDirectory)bin\portable</PortableOutputDir>
   </PropertyGroup>
   <Target Name="PublishPortable" DependsOnTargets="Build">
-    <ItemGroup>
-      <PortableFile Include="$(OutDir)SettingsUI.exe;$(OutDir)Microsoft.WindowsAppRuntime.Bootstrap.dll;$(OutDir)SettingsUI.pri;$(OutDir)App.xbf;$(OutDir)MainWindow.xbf" />
-    </ItemGroup>
-    <Copy SourceFiles="@(PortableFile)" DestinationFolder="$(PortableOutputDir)" SkipUnchangedFiles="true" />
+    <Exec Command="pwsh -NoProfile -NonInteractive -File &quot;$(MSBuildThisFileDirectory)..\scripts\publish-settings.ps1&quot; -SourceDir &quot;$(OutDir)\.&quot; -DestinationDir &quot;$(PortableOutputDir)\.&quot;" />
   </Target>
 </Project>

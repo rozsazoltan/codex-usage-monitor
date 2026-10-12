@@ -1,11 +1,12 @@
 #requires -Version 7.2
 <#
 .SYNOPSIS
-Checks native Settings startup, page navigation, and close/pipe lifetime regressions.
+Checks native Settings startup, bitmap previews, page navigation, and close/pipe lifetime regressions.
 .DESCRIPTION
 Requires an interactive Windows desktop and the installed x64 Windows App Runtime.
 Uses a private synthetic backend; no widget, credentials, or settings files are used.
-Does not build, publish, install dependencies, or invoke any application actions.
+Does not build, publish, install dependencies, or connect to the real widget.
+Preview and explicitly authorized setting edits use only an in-memory synthetic backend.
 #>
 [CmdletBinding()]
 param(
@@ -35,6 +36,7 @@ foreach ($assembly in @('UIAutomationTypes.dll', 'UIAutomationClient.dll')) {
     }
     Add-Type -Path $path
 }
+Add-Type -AssemblyName System.Drawing
 if (-not ('SettingsUISmokeNative' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -86,10 +88,12 @@ $snapshot = @{
         show_session_window = $true; show_weekly_window = $true
         poll_interval_ms = 900000; adaptive_refresh = $true; alert_threshold_percent = 0
         palette = 'system'; bar_style = 'continuous'; bar_thickness = 'standard'; font_size = 'standard'
+        window_label_font_size = 9; show_provider_icon = $true
+        show_percentage = $true; show_bar = $true; show_reset_time = $true; usage_text_color = $null
         claude_accent = $null; codex_accent = $null; monitor_device = 'smoke-display'; anchor_left = $false
     }
     effective_language = 'en'; claude_code_available = $false
-    effective_appearance = @{ dark = $false; claude_accent = @(217, 119, 87); codex_accent = @(16, 163, 127) }
+    effective_appearance = @{ dark = $false; claude_accent = @(217, 119, 87); codex_accent = @(15, 143, 112) }
     update_busy = $false; update_available = $true; update_status = 'Synthetic update available'; install_channel = 'portable'
     version = 'smoke-test'; languages = @(@{ code = 'en'; name = 'English' })
     monitors = @(@{ device = 'smoke-display'; primary = $true })
@@ -101,6 +105,8 @@ $controls = @{
 $pages = @('General', 'Monitoring', 'Appearance', 'Placement', 'Update', 'About')
 $timeoutMilliseconds = $TimeoutSeconds * 1000
 $results = [Collections.Generic.List[object]]::new()
+$script:smokeBackend = $null
+$script:servicingPipe = $false
 
 function Assert([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -116,6 +122,103 @@ function Assert-Running([Diagnostics.Process]$Process, [string]$Phase) {
     if ($Process.HasExited) {
         throw "PID $($Process.Id) exited during $Phase with Windows exit code $(Get-ExitDescription $Process)."
     }
+    if ($null -ne $script:smokeBackend -and -not $script:servicingPipe) { Receive-SmokeRequests }
+}
+
+function New-PreviewSnapshot([hashtable]$Canonical, [hashtable]$Changes = @{}) {
+    $candidate = $Canonical.settings.Clone()
+    foreach ($key in $Changes.Keys) { $candidate[$key] = $Changes[$key] }
+    if ($Changes.ContainsKey('show_provider_icons')) { $candidate.show_provider_icon = $Changes.show_provider_icons }
+    $width = 160
+    $height = 24 + 2 * [int]$candidate.window_label_font_size
+    $bitmap = [Drawing.Bitmap]::new($width, $height, [Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    $stream = [IO.MemoryStream]::new()
+    $brushes = [Collections.Generic.List[Drawing.SolidBrush]]::new()
+    try {
+        $graphics.Clear([Drawing.Color]::FromArgb(255, 243, 243, 243))
+        $rgbColor = {
+            param($Rgb, [string]$Fallback)
+            if ($null -ne $Rgb) { return [Drawing.Color]::FromArgb(255, [int]$Rgb[0], [int]$Rgb[1], [int]$Rgb[2]) }
+            [Drawing.ColorTranslator]::FromHtml($Fallback)
+        }
+        $claude = [Drawing.SolidBrush]::new((& $rgbColor $candidate.claude_accent '#D97757'))
+        $codex = [Drawing.SolidBrush]::new((& $rgbColor $candidate.codex_accent '#0F8F70'))
+        $text = [Drawing.SolidBrush]::new((& $rgbColor $candidate.usage_text_color '#404040'))
+        $icon = [Drawing.SolidBrush]::new([Drawing.ColorTranslator]::FromHtml('#8030C0'))
+        foreach ($brush in @($claude, $codex, $text, $icon)) { $brushes.Add($brush) }
+        # Deliberately simple, opaque markers test bitmap transport and candidate
+        # state, not the Rust renderer's typography or layout implementation.
+        if ($candidate.show_bar) {
+            $graphics.FillRectangle($claude, 6, 6, 70, 8)
+            $graphics.FillRectangle($codex, 6, $height - 14, 96, 8)
+        }
+        if ($candidate.show_percentage) { $graphics.FillRectangle($text, 108, 6, 30, 10) }
+        if ($candidate.show_reset_time) { $graphics.FillRectangle($text, 108, $height - 14, 30, 8) }
+        if ($candidate.show_provider_icon) { $graphics.FillRectangle($icon, 142, 6, 12, 12) }
+        $bitmap.Save($stream, [Drawing.Imaging.ImageFormat]::Bmp)
+        $result = $Canonical.Clone()
+        $result.widget_preview_image = 'data:image/bmp;base64,' + [Convert]::ToBase64String($stream.ToArray())
+        $result.widget_preview_width = $width
+        $result.widget_preview_height = $height
+        return $result
+    } finally {
+        foreach ($brush in $brushes) { $brush.Dispose() }
+        $stream.Dispose(); $graphics.Dispose(); $bitmap.Dispose()
+    }
+}
+
+function Receive-SmokeRequests {
+    $backend = $script:smokeBackend
+    if ($null -eq $backend -or $script:servicingPipe -or -not $backend.Pipe.IsConnected) { return }
+    $script:servicingPipe = $true
+    try {
+        while ($true) {
+            [uint32]$available = 0
+            $ok = [SettingsUISmokeNative]::PeekNamedPipe($backend.Pipe.SafePipeHandle, [IntPtr]::Zero, 0, [IntPtr]::Zero, [ref]$available, [IntPtr]::Zero)
+            Assert $ok 'Could not inspect the synthetic pipe.'
+            if ($available -eq 0) { break }
+            $length = [BitConverter]::ToUInt32((Read-Exact $backend.Pipe $backend.Process 4), 0)
+            Assert ($length -gt 0 -and $length -le 65536) 'Invalid synthetic request frame length.'
+            $request = [Text.UTF8Encoding]::new($false, $true).GetString((Read-Exact $backend.Pipe $backend.Process ([int]$length))) | ConvertFrom-Json -AsHashtable
+            Assert ($request.v -eq 1 -and $request.id -is [long]) 'Invalid synthetic request envelope.'
+            switch -CaseSensitive ($request.op) {
+                preview {
+                    Assert ($request.Count -eq 4 -and $request.changes -is [hashtable]) 'Preview must contain a changes object.'
+                    foreach ($key in $request.changes.Keys) {
+                        Assert ($key -in @('palette', 'bar_style', 'bar_thickness', 'font_size', 'window_label_font_size',
+                            'claude_accent', 'codex_accent', 'usage_text_color', 'show_provider_icon', 'show_provider_icons',
+                            'show_percentage', 'show_bar', 'show_reset_time')) "Unexpected preview candidate key: $key"
+                    }
+                    $backend.Previews.Add($request)
+                    $response = @{ v = 1; id = $request.id; ok = $true; revision = $backend.Revision;
+                        state = (New-PreviewSnapshot $backend.State $request.changes) }
+                    if ($backend.HoldNextPreview) {
+                        $backend.HoldNextPreview = $false
+                        $backend.HeldPreview = $response
+                    } else { Write-Frame $backend.Pipe $backend.Process $response }
+                }
+                set_batch {
+                    Assert ($request.Count -eq 4 -and $request.changes -is [array] -and $request.changes.Count -gt 0) 'Invalid synthetic setting batch.'
+                    foreach ($change in $request.changes) {
+                        Assert ($backend.AllowedChanges.ContainsKey($change.key)) "Unexpected setting mutation: $($change.key)."
+                        Assert (($change.value | ConvertTo-Json -Compress) -ceq ($backend.AllowedChanges[$change.key] | ConvertTo-Json -Compress)) "Unexpected value for $($change.key)."
+                        $backend.State.settings[$change.key] = $change.value
+                        if ($change.key -in @('show_provider_icon', 'show_provider_icons')) {
+                            $backend.State.settings.show_provider_icon = $change.value
+                            $backend.State.settings.show_provider_icons = $change.value
+                        }
+                    }
+                    Assert ($backend.State.settings.show_percentage -or $backend.State.settings.show_bar -or $backend.State.settings.show_reset_time) 'Native UI submitted an all-hidden usage configuration.'
+                    $backend.Commits.Add($request)
+                    $backend.Revision++
+                    Write-Frame $backend.Pipe $backend.Process @{ v = 1; id = $request.id; ok = $true;
+                        revision = $backend.Revision; state = (New-PreviewSnapshot $backend.State) }
+                }
+                default { throw "Unexpected backend operation: $($request.op). No requests were forwarded to the widget." }
+            }
+        }
+    } finally { $script:servicingPipe = $false }
 }
 
 function Wait-SmokeTask([Threading.Tasks.Task]$Task, [Diagnostics.Process]$Process, [string]$Phase) {
@@ -197,10 +300,387 @@ function Select-Page([Windows.Automation.AutomationElement]$Window, [Diagnostics
 }
 
 function Assert-NoUnexpectedRequests([IO.Pipes.NamedPipeServerStream]$Pipe) {
-    [uint32]$available = 0
-    $ok = [SettingsUISmokeNative]::PeekNamedPipe($Pipe.SafePipeHandle, [IntPtr]::Zero, 0, [IntPtr]::Zero, [ref]$available, [IntPtr]::Zero)
-    Assert $ok 'Could not inspect the synthetic pipe before closing.'
-    Assert ($available -eq 0) 'A UI-only interaction unexpectedly submitted another backend request. No requests were forwarded to the widget.'
+    Assert ($null -ne $script:smokeBackend -and $Pipe -eq $script:smokeBackend.Pipe) 'No active synthetic backend.'
+    $commits = $script:smokeBackend.Commits.Count
+    # Cover the 180 ms native preview coalescing interval and pending UI dispatch.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $script:smokeBackend.Process 'settling preview-only requests'
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt 400)
+    Receive-SmokeRequests
+    Assert ($script:smokeBackend.Commits.Count -eq $commits) 'A preview-only interaction unexpectedly committed settings.'
+}
+
+function Show-SmokeControl([Windows.Automation.AutomationElement]$Control, [int]$BudgetMs = -1) {
+    # Invoke does not reliably scroll WinUI controls into view. Keep screen-color checks
+    # inside the actual ScrollViewer viewport rather than sampling clipped content.
+    $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
+    $ancestor = $walker.GetParent($Control)
+    $scroll = $null
+    while ($null -ne $ancestor) {
+        if ($ancestor.TryGetCurrentPattern([Windows.Automation.ScrollPattern]::Pattern, [ref]$scroll) -and
+            $scroll.Current.VerticallyScrollable) { break }
+        $ancestor = $walker.GetParent($ancestor)
+    }
+    if ($null -eq $ancestor) {
+        Assert (-not $Control.Current.IsOffscreen) 'The requested smoke control is offscreen without a scrollable ancestor.'
+        return
+    }
+    $scroll.SetScrollPercent([Windows.Automation.ScrollPattern]::NoScroll, 0)
+    Start-Sleep -Milliseconds 50
+    if ($BudgetMs -lt 0) { $BudgetMs = $timeoutMilliseconds }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $bounds = $Control.Current.BoundingRectangle
+        $viewport = $ancestor.Current.BoundingRectangle
+        if (-not $Control.Current.IsOffscreen -and $bounds.Height -gt 0 -and
+            $bounds.Top -ge $viewport.Top -and $bounds.Bottom -le $viewport.Bottom) { return }
+        $scroll.Scroll([Windows.Automation.ScrollAmount]::NoAmount, [Windows.Automation.ScrollAmount]::SmallIncrement)
+        Start-Sleep -Milliseconds 50
+    } while ($clock.ElapsedMilliseconds -lt $BudgetMs)
+    $bounds = $Control.Current.BoundingRectangle
+    throw "Could not scroll $($Control.Current.AutomationId) fully into view. Offscreen=$($Control.Current.IsOffscreen) Bounds=$($bounds.Left),$($bounds.Top),$($bounds.Width)x$($bounds.Height)."
+}
+
+function Wait-PreviewColor([Windows.Automation.AutomationElement]$Window,
+    [Diagnostics.Process]$Process, [string]$Hex, [bool]$Present = $true) {
+    # Refetch the preview element on every poll: native page rebuilds can
+    # invalidate a previously returned element (Infinity bounds) mid-test.
+    $color = [Drawing.ColorTranslator]::FromHtml($Hex)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $script:lastPreviewMatches = -1
+    $script:lastPreviewBounds = 'none'
+    $script:lastPreviewGate = 'no-poll'
+    $script:lastPreviewStatus = 'n/a'
+    $firstPoll = $true
+    do {
+        Assert-Running $Process 'rendering the local accent preview'
+        $image = Find-Control $Window 'WidgetPreviewImage'
+        $status = Find-Control $Window 'WidgetPreviewStatus'
+        if ($firstPoll) {
+            $firstPoll = $false
+            $statusName = if ($null -ne $status) { $status.Current.Name } else { '<missing>' }
+            $script:lastPreviewStatus = $statusName
+            Write-Host "Preview first poll: imageFound=$($null -ne $image) statusFound=$($null -ne $status) status='$statusName'"
+        }
+        if ($null -eq $image) { $script:lastPreviewGate = 'image-missing'; Start-Sleep -Milliseconds 50; continue }
+        if ($null -eq $status) { $script:lastPreviewGate = 'status-missing'; Start-Sleep -Milliseconds 50; continue }
+        if ($status.Current.Name -cne 'Sample values rendered by the widget.') { $script:lastPreviewGate = "status-mismatch:$($status.Current.Name)"; Start-Sleep -Milliseconds 50; continue }
+        $bounds = $image.Current.BoundingRectangle
+        if ([double]::IsInfinity($bounds.Width) -or $bounds.Width -le 0) { $script:lastPreviewGate = "bad-bounds:$($bounds.Width)x$($bounds.Height)"; Start-Sleep -Milliseconds 50; continue }
+        try { Show-SmokeControl $image 1500 } catch { $script:lastPreviewGate = "scroll-error:$($_.Exception.Message)"; Start-Sleep -Milliseconds 100; continue }
+        $bounds = $image.Current.BoundingRectangle
+        if ([double]::IsInfinity($bounds.Width)) { $script:lastPreviewGate = 'bad-bounds-after-scroll'; continue }
+        $bitmap = [Drawing.Bitmap]::new([int][Math]::Ceiling($bounds.Width), [int][Math]::Ceiling($bounds.Height))
+        $graphics = [Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $graphics.CopyFromScreen([int]$bounds.Left, [int]$bounds.Top, 0, 0, $bitmap.Size)
+            # The continuous preview bar has a solid fill; require multiple pixels
+            # so an unrelated single text pixel cannot satisfy the preview assertion.
+            $matches = 0
+            for ($y = 0; $y -lt $bitmap.Height; $y += 2) {
+                for ($x = 0; $x -lt $bitmap.Width; $x += 2) {
+                    if ($bitmap.GetPixel($x, $y).ToArgb() -eq $color.ToArgb()) { $matches++ }
+                }
+            }
+            if (($Present -and $matches -ge 20) -or (-not $Present -and $matches -eq 0)) { return }
+            $script:lastPreviewMatches = $matches
+            $script:lastPreviewBounds = "$([int]$bounds.Left),$([int]$bounds.Top),$([int]$bounds.Width)x$([int]$bounds.Height)"
+            $script:lastPreviewGate = 'counted'
+        } finally { $graphics.Dispose(); $bitmap.Dispose() }
+        Start-Sleep -Milliseconds 50
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    $treeIds = @()
+    try {
+        $all = $Window.FindAll([Windows.Automation.TreeScope]::Descendants,
+            [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::IsControlElementProperty, $true))
+        foreach ($el in $all) {
+            try { $treeIds += $el.Current.AutomationId } catch { $treeIds += '<unavailable>' }
+            if ($treeIds.Count -ge 150) { break }
+        }
+    } catch { $treeIds = @("tree-dump-failed:$($_.Exception.Message)") }
+    throw "The widget bitmap preview did not reach color $Hex presence=$Present (last matches=$($script:lastPreviewMatches) bounds=$($script:lastPreviewBounds) gate=$($script:lastPreviewGate) firstStatus='$($script:lastPreviewStatus)'). Keep the interactive smoke window unobscured. TreeIds=$($treeIds -join ',')"
+}
+
+function Find-PickerRoot([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process,
+    [string]$Key = 'codex_accent') {
+    $picker = Find-Control $Window "ColorPicker_$Key"
+    if ($null -eq $picker) {
+        # WinUI flyouts may be hosted in a separate popup HWND. Scope desktop lookup
+        # to the child process rather than matching another application's picker.
+        $condition = [Windows.Automation.AndCondition]::new(
+            [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $Process.Id),
+            [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::AutomationIdProperty, "ColorPicker_$Key"))
+        $picker = [Windows.Automation.AutomationElement]::RootElement.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
+    }
+    if ($null -ne $picker -and -not $picker.Current.IsOffscreen) {
+        $title = switch ($Key) {
+            'claude_accent' { 'Claude Code bar accent' }
+            'codex_accent' { 'Codex bar accent' }
+            default { 'Provider mark and percentage color' }
+        }
+        Assert ($picker.Current.Name -ceq "$title RGB color") 'The native picker has an unexpected accessible name.'
+        return [Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($picker)
+    }
+}
+
+function Open-ColorPicker([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process,
+    [string]$Key = 'codex_accent') {
+    $choose = Find-Control $Window "ChooseColor_$Key"
+    Assert ($null -ne $choose -and $choose.Current.Name -ceq 'Choose color…') 'Missing native Choose color button.'
+    Show-SmokeControl $choose
+    $choose.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process 'opening the native RGB picker'
+        $root = Find-PickerRoot $Window $Process $Key
+        if ($null -ne $root) { return $root }
+        Start-Sleep -Milliseconds 50
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    throw "Choose color did not expose the native $Key RGB picker."
+}
+
+function Invoke-PickerAction([Windows.Automation.AutomationElement]$Root, [string]$Name,
+    [Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process, [string]$Key = 'codex_accent') {
+    $condition = [Windows.Automation.AndCondition]::new(
+        [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, $Name),
+        [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Button))
+    $button = $Root.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
+    Assert ($null -ne $button) "The scoped color picker has no $Name button."
+    $button.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process "dismissing the color picker with $Name"
+        if ($null -eq (Find-PickerRoot $Window $Process $Key)) { return }
+        Start-Sleep -Milliseconds 50
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    throw "The color picker stayed open after $Name."
+}
+
+function Test-AppearanceDraftPreview([Windows.Automation.AutomationElement]$Window,
+    [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    foreach ($entry in @{
+        Appearance_palette = 'Follow Windows'
+        Appearance_bar_style = 'Continuous'
+        Appearance_bar_thickness = 'Standard'
+        Appearance_font_size = 'Standard'
+    }.GetEnumerator()) {
+        $control = Find-Control $Window $entry.Key
+        Assert ($null -ne $control -and (Test-Selection $control $entry.Value)) "Incorrect hydrated Appearance selection: $($entry.Key)"
+    }
+    foreach ($entry in @{
+        AppearancePreview = 'Live widget preview · sample values'
+        AppearancePreviewSummary = 'This image is rendered by the widget using sample usage data.'
+    }.GetEnumerator()) {
+        $control = Find-Control $Window $entry.Key
+        Assert ($null -ne $control -and $control.Current.Name -ceq $entry.Value) "Missing or incorrect Appearance preview: $($entry.Key)"
+    }
+    Wait-BitmapPreview $Window $Process | Out-Null
+    Write-Host 'Appearance phase: default bitmap preview'
+    Wait-PreviewColor $Window $Process '#0F8F70'
+    $input = Find-Control $Window 'Color_codex_accent'
+    # Preserve non-normalized casing across Cancel; accidentally committing the
+    # picker's normalized RGB value must not pass as an unchanged draft.
+    $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('#12ab56')
+    Wait-PreviewColor $Window $Process '#12AB56'
+    Assert-NoUnexpectedRequests $Pipe
+
+    $pickerRoot = Open-ColorPicker $Window $Process
+    Invoke-PickerAction $pickerRoot 'Cancel' $Window $Process
+    Assert ($input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '#12ab56') 'Picker Cancel mutated the existing hex draft.'
+    Assert-NoUnexpectedRequests $Pipe
+
+    $discard = Find-Control $Window 'DiscardColor_codex_accent'
+    $discard.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $input = Find-Control $Window 'Color_codex_accent'
+    Assert ($input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '') 'Discard did not restore the saved default before picker use.'
+    $pickerRoot = Open-ColorPicker $Window $Process
+    Invoke-PickerAction $pickerRoot 'Use color' $Window $Process
+    Assert ($input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '#0F8F70') 'Use color did not create the default picker RGB draft.'
+    Assert-NoUnexpectedRequests $Pipe
+    $discard = Find-Control $Window 'DiscardColor_codex_accent'
+    $discard.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $input = Find-Control $Window 'Color_codex_accent'
+    Assert ($input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '') 'Discard did not restore the saved default after picker use.'
+    Wait-PreviewColor $Window $Process '#0F8F70'
+    Assert-NoUnexpectedRequests $Pipe
+    Assert ($script:smokeBackend.Previews.Count -gt 0) 'Draft editing never requested an actual protocol-v1 preview.'
+    Test-StaleBitmapPreview $Window $Pipe $Process
+    Test-UsageTextColor $Window $Pipe $Process
+    Test-WidgetControls $Window $Pipe $Process
+    Write-Host 'Appearance verified: BMP transport, preview-only drafts, stale preview response, RGB picker, usage-text Apply/Discard, label font sizes, provider marks and visibility guard.'
+}
+
+function Wait-BitmapPreview([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process 'loading the widget bitmap preview'
+        $image = Find-Control $Window 'WidgetPreviewImage'
+        $status = Find-Control $Window 'WidgetPreviewStatus'
+        if ($null -ne $image -and $null -ne $status -and
+            $status.Current.Name -ceq 'Sample values rendered by the widget.' -and
+            -not [double]::IsInfinity($image.Current.BoundingRectangle.Width) -and $image.Current.BoundingRectangle.Width -gt 0) {
+            Assert ($image.Current.Name -ceq 'Widget appearance preview with sample usage values') 'Incorrect bitmap accessible name.'
+            return $image
+        }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    throw 'The WidgetPreviewImage did not load with successful WidgetPreviewStatus feedback.'
+}
+
+function Wait-SmokeCommit([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process, [int]$Before) {
+    Assert-Running $Process 'saving the staged setting change'
+    $saveBar = Find-Control $Window 'SavePendingChanges'
+    Assert ($null -ne $saveBar) 'Missing manual save button for the staged setting change.'
+    $saveBar.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process 'acknowledging the authorized synthetic setting change'
+        $condition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Saved. Changes are now in effect.')
+        if ($script:smokeBackend.Commits.Count -gt $Before -and
+            $null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)) {
+            Start-Sleep -Milliseconds 100
+            $script:smokeBackend.AllowedChanges.Clear()
+            return
+        }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    throw 'The native UI did not acknowledge the authorized setting batch.'
+}
+
+function Test-StaleBitmapPreview([Windows.Automation.AutomationElement]$Window,
+    [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    $script:smokeBackend.HoldNextPreview = $true
+    $input = Find-Control $Window 'Color_codex_accent'
+    $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('#654321')
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($null -eq $script:smokeBackend.HeldPreview -and $clock.ElapsedMilliseconds -lt $timeoutMilliseconds) {
+        Assert-Running $Process 'holding the first color preview response'
+        Start-Sleep -Milliseconds 20
+    }
+    Assert ($null -ne $script:smokeBackend.HeldPreview) 'The synthetic backend did not receive a coalesced preview.'
+    $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('#234567')
+    $first = $script:smokeBackend.HeldPreview
+    $script:smokeBackend.HeldPreview = $null
+    $script:smokeBackend.HoldNextPreview = $true
+    Write-Frame $Pipe $Process $first
+    $clock.Restart()
+    while ($null -eq $script:smokeBackend.HeldPreview -and $clock.ElapsedMilliseconds -lt $timeoutMilliseconds) {
+        Assert-Running $Process 'holding the latest preview to inspect stale-response rejection'
+        Start-Sleep -Milliseconds 20
+    }
+    Assert ($null -ne $script:smokeBackend.HeldPreview) 'No replacement preview followed the stale response.'
+    # Leave the replacement in flight: an incorrectly accepted old bitmap cannot
+    # be hidden by a quickly rendered newer response during this assertion.
+    Start-Sleep -Milliseconds 200
+    Wait-PreviewColor $Window $Process '#0F8F70'
+    Write-Frame $Pipe $Process $script:smokeBackend.HeldPreview
+    $script:smokeBackend.HeldPreview = $null
+    Wait-PreviewColor $Window $Process '#234567'
+    Assert ($script:smokeBackend.State.settings.codex_accent -eq $null) 'Preview responses mutated the canonical saved accent.'
+    (Find-Control $Window 'DiscardColor_codex_accent').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Wait-PreviewColor $Window $Process '#0F8F70'
+    Assert-NoUnexpectedRequests $Pipe
+}
+
+function Test-UsageTextColor([Windows.Automation.AutomationElement]$Window,
+    [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    $input = Find-Control $Window 'Color_usage_text_color'
+    Assert ($null -ne $input) 'Missing provider mark and percentage color input.'
+    $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('#aabbcc')
+    Wait-PreviewColor $Window $Process '#AABBCC'
+    $root = Open-ColorPicker $Window $Process 'usage_text_color'
+    Invoke-PickerAction $root 'Cancel' $Window $Process 'usage_text_color'
+    Assert ($input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '#aabbcc') 'Usage-text picker Cancel changed the draft.'
+    $root = Open-ColorPicker $Window $Process 'usage_text_color'
+    Invoke-PickerAction $root 'Use color' $Window $Process 'usage_text_color'
+    Assert ($input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '#AABBCC') 'Usage-text picker did not normalize its draft.'
+    Assert-NoUnexpectedRequests $Pipe
+    $before = $script:smokeBackend.Commits.Count
+    $script:smokeBackend.AllowedChanges.usage_text_color = @(170, 187, 204)
+    (Find-Control $Window 'ApplyColor_usage_text_color').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Wait-SmokeCommit $Window $Process $before
+    $input = Find-Control $Window 'Color_usage_text_color'
+    $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('#112233')
+    Wait-PreviewColor $Window $Process '#112233'
+    (Find-Control $Window 'DiscardColor_usage_text_color').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $input = Find-Control $Window 'Color_usage_text_color'
+    Assert ($input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '#AABBCC') 'Usage-text Discard did not restore the saved RGB value.'
+    Wait-PreviewColor $Window $Process '#AABBCC'
+    Assert-NoUnexpectedRequests $Pipe
+}
+
+function Set-SmokeToggle([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process,
+    [string]$Id, [string]$Key, [bool]$Value) {
+    $control = Find-Control $Window $Id
+    Assert ($null -ne $control) "Missing widget toggle: $Id"
+    Show-SmokeControl $control
+    $pattern = $control.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern)
+    Assert (($pattern.Current.ToggleState -eq [Windows.Automation.ToggleState]::On) -ne $Value) "Toggle $Id already has the target value."
+    $before = $script:smokeBackend.Commits.Count
+    $script:smokeBackend.AllowedChanges[$Key] = $Value
+    if ($Key -in @('show_provider_icon', 'show_provider_icons')) {
+        $script:smokeBackend.AllowedChanges.show_provider_icon = $Value
+        $script:smokeBackend.AllowedChanges.show_provider_icons = $Value
+    }
+    $pattern.Toggle()
+    Wait-SmokeCommit $Window $Process $before
+}
+
+function Test-WidgetControls([Windows.Automation.AutomationElement]$Window,
+    [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    Write-Host 'Appearance phase: label font sizes'
+    foreach ($size in @(8, 14, 9)) {
+        $combo = Find-Control $Window 'Appearance_window_label_font_size'
+        Assert ($null -ne $combo) 'Missing usage window label font size selector.'
+        Show-SmokeControl $combo
+        $combo.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+        $condition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, "$size pt")
+        $item = $combo.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
+        Assert ($null -ne $item) "Missing supported label font size: $size pt"
+        $before = $script:smokeBackend.Commits.Count
+        $script:smokeBackend.AllowedChanges.window_label_font_size = $size
+        $item.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select()
+        $combo.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+        Wait-SmokeCommit $Window $Process $before
+        $image = Wait-BitmapPreview $Window $Process
+        $bounds = $image.Current.BoundingRectangle
+        Assert ([Math]::Abs($bounds.Width - 160) -le 2 -and [Math]::Abs($bounds.Height - (24 + 2 * $size)) -le 2) 'Bitmap physical dimensions did not match the selected label size.'
+    }
+    Select-Page $Window $Process 'General'
+    Set-SmokeToggle $Window $Process 'Setting_show_provider_icons' 'show_provider_icons' $false
+    Select-Page $Window $Process 'Appearance'
+    Write-Host 'Appearance phase: provider icon hidden'
+    Wait-PreviewColor $Window $Process '#8030C0' $false
+    Select-Page $Window $Process 'General'
+    Set-SmokeToggle $Window $Process 'Setting_show_provider_icons' 'show_provider_icons' $true
+    Select-Page $Window $Process 'Monitoring'
+    Set-SmokeToggle $Window $Process 'Setting_show_percentage' 'show_percentage' $false
+    Set-SmokeToggle $Window $Process 'Setting_show_bar' 'show_bar' $false
+    $last = Find-Control $Window 'Setting_show_reset_time'
+    Show-SmokeControl $last
+    $last.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
+    Assert-NoUnexpectedRequests $Pipe
+    $last = Find-Control $Window 'Setting_show_reset_time'
+    Assert ($last.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq [Windows.Automation.ToggleState]::On) 'Native UI allowed all three usage values to be hidden.'
+    $message = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,
+        'Keep at least one of percentage, progress bar, or reset time visible.')
+    Assert ($null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $message)) 'Visibility guard did not expose durable feedback.'
+    $feedback = Find-Control $Window 'SettingsFeedback'
+    Assert ($null -ne $feedback -and -not $feedback.Current.IsOffscreen -and $feedback.Current.BoundingRectangle.Height -gt 0) 'Settings InfoBar was not visibly presented.'
+    Select-Page $Window $Process 'Appearance'
+    Write-Host 'Appearance phase: usage values hidden'
+    Wait-PreviewColor $Window $Process '#0F8F70' $false
+    Wait-PreviewColor $Window $Process '#AABBCC'
+    Select-Page $Window $Process 'Monitoring'
+    Set-SmokeToggle $Window $Process 'Setting_show_percentage' 'show_percentage' $true
+    Set-SmokeToggle $Window $Process 'Setting_show_bar' 'show_bar' $true
+    Select-Page $Window $Process 'Appearance'
+    Write-Host 'Appearance phase: usage values restored'
+    Wait-PreviewColor $Window $Process '#0F8F70'
+    Wait-PreviewColor $Window $Process '#8030C0'
+    Assert-NoUnexpectedRequests $Pipe
 }
 
 function Request-WindowClose([IntPtr]$Window, [Diagnostics.Process]$Process) {
@@ -213,9 +693,11 @@ function Request-WindowClose([IntPtr]$Window, [Diagnostics.Process]$Process) {
 }
 
 function Test-DraftCloseCancellation([Windows.Automation.AutomationElement]$Window,
-    [IntPtr]$Handle, [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
-    $input = Find-Control $Window 'Color_codex_accent'
-    Assert ($null -ne $input) 'Missing Codex accent draft input.'
+    [IntPtr]$Handle, [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process,
+    [string]$Key = 'codex_accent') {
+    $input = Find-Control $Window "Color_$Key"
+    Assert ($null -ne $input) "Missing $Key draft input."
+    $savedText = $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
     $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('#123456')
     Assert ($input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '#123456') 'The unapplied hex draft was not entered.'
     Assert-NoUnexpectedRequests $Pipe
@@ -232,21 +714,21 @@ function Test-DraftCloseCancellation([Windows.Automation.AutomationElement]$Wind
     }
     Assert $canceled 'Unapplied draft close did not expose the cancellation feedback.'
     Assert ([SettingsUISmokeNative]::IsWindowVisible($Handle)) 'Canceled close hid or destroyed the settings window.'
-    $discard = Find-Control $Window 'DiscardColor_codex_accent'
+    $discard = Find-Control $Window "DiscardColor_$Key"
     Assert ($null -ne $discard) 'Missing draft Discard button.'
     $discard.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
-    $input = Find-Control $Window 'Color_codex_accent'
-    Assert ($null -ne $input -and $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '') 'Discard did not restore the synthetic default accent.'
+    $input = Find-Control $Window "Color_$Key"
+    Assert ($null -ne $input -and $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq $savedText) 'Discard did not restore the synthetic saved color.'
 
     # Reuse the same pipe after cancellation: a wrongly set Closed flag would ignore this event.
     Write-Frame $Pipe $Process @{ v = 1; event = 'activate'; page = 'general' }
     Wait-Page $Window $Process 'General'
     foreach ($next in $pages) { Select-Page $Window $Process $next }
     Select-Page $Window $Process 'Appearance'
-    $input = Find-Control $Window 'Color_codex_accent'
-    Assert ($null -ne $input -and $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '') 'Discarded draft returned after navigation.'
+    $input = Find-Control $Window "Color_$Key"
+    Assert ($null -ne $input -and $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq $savedText) 'Discarded draft returned after navigation.'
     Assert-NoUnexpectedRequests $Pipe
-    Write-Host 'Canceled draft close verified: draft discarded, same pipe reactivated General, all six pages navigated, window still usable.'
+    Write-Host "Canceled $Key draft close verified: draft discarded, same pipe reactivated General, all six pages navigated, window still usable."
 }
 
 function Open-Notices([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process) {
@@ -290,6 +772,7 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
     [bool]$DraftCloseCancellation = $false, [bool]$Notices = $false, [bool]$UpdateAvailable = $true) {
     $process = $null
     $pipe = $null
+    $script:smokeBackend = $null
     $result = [pscustomobject]@{
         Page = $Page; Close = $CloseMode; Status = 'Failed'; PID = $null
         InitialGet = $false; HWND = $null; Navigated = ''; DraftCancel = $false
@@ -327,8 +810,14 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
             $request.id -ge 0 -and $request.id -le [uint32]::MaxValue) 'The first request was not a valid protocol-v1 get.'
         $result.InitialGet = $true
         $caseSnapshot = $snapshot.Clone()
+        $caseSnapshot.settings = $snapshot.settings.Clone()
         $caseSnapshot.update_available = $UpdateAvailable
-        Write-Frame $pipe $process @{ v = 1; id = $request.id; ok = $true; revision = 1; state = $caseSnapshot }
+        $script:smokeBackend = @{
+            Pipe = $pipe; Process = $process; State = $caseSnapshot; Revision = 1
+            AllowedChanges = @{}; Commits = [Collections.Generic.List[object]]::new()
+            Previews = [Collections.Generic.List[object]]::new(); HoldNextPreview = $false; HeldPreview = $null
+        }
+        Write-Frame $pipe $process @{ v = 1; id = $request.id; ok = $true; revision = 1; state = (New-PreviewSnapshot $caseSnapshot) }
 
         $windowClock = [Diagnostics.Stopwatch]::StartNew()
         do {
@@ -359,7 +848,9 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
         }
         if ($DraftCloseCancellation) {
             Assert ($Page -ceq 'Appearance') 'Draft cancellation requires the Appearance startup route.'
+            Test-AppearanceDraftPreview $window $pipe $process
             Test-DraftCloseCancellation $window $hwnd $pipe $process
+            Test-DraftCloseCancellation $window $hwnd $pipe $process 'usage_text_color'
             $result.DraftCancel = $true
             $result.Navigated = $pages -join ', '
         }
@@ -370,6 +861,7 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
             $result.NoticesHWND = '0x{0:X}' -f $noticesHandle.ToInt64()
         }
         Assert-NoUnexpectedRequests $pipe
+        $script:smokeBackend = $null
         switch ($CloseMode) {
             Shutdown { Write-Frame $pipe $process @{ v = 1; event = 'shutdown' } }
             ShutdownDisconnect {
@@ -415,6 +907,7 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
             [IO.File]::Delete($diagnostic)
         }
     } finally {
+        $script:smokeBackend = $null
         if ($null -ne $pipe) { $pipe.Dispose() }
         if ($null -ne $process) {
             try {

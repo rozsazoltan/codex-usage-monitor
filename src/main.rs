@@ -1,4 +1,5 @@
 #![windows_subsystem = "windows"]
+#![recursion_limit = "256"]
 
 use std::io::Write;
 

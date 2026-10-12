@@ -636,9 +636,19 @@ namespace winrt::SettingsUI::implementation
         persistNeeded_ = false;
         SetColorDraft(L"claude_accent", std::nullopt);
         SetColorDraft(L"codex_accent", std::nullopt);
+        SetColorDraft(L"antigravity_accent", std::nullopt);
+        SetColorDraft(L"opencode_accent", std::nullopt);
+        SetColorDraft(L"cursor_accent", std::nullopt);
+        SetColorDraft(L"grok_accent", std::nullopt);
+        SetColorDraft(L"copilot_accent", std::nullopt);
         SetColorDraft(L"usage_text_color", std::nullopt);
         claudeColorApplyText_.reset();
         codexColorApplyText_.reset();
+        antigravityColorApplyText_.reset();
+        opencodeColorApplyText_.reset();
+        cursorColorApplyText_.reset();
+        grokColorApplyText_.reset();
+        copilotColorApplyText_.reset();
         usageTextColorApplyText_.reset();
         Hydrate();
         UpdateSaveBar();
@@ -660,6 +670,11 @@ namespace winrt::SettingsUI::implementation
                 const auto key = std::wstring(pair.Key().c_str());
                 const bool colorApplyPending = key == L"claude_accent" ? claudeColorApplyText_.has_value()
                     : key == L"codex_accent" ? codexColorApplyText_.has_value()
+                    : key == L"antigravity_accent" ? antigravityColorApplyText_.has_value()
+                    : key == L"opencode_accent" ? opencodeColorApplyText_.has_value()
+                    : key == L"cursor_accent" ? cursorColorApplyText_.has_value()
+                    : key == L"grok_accent" ? grokColorApplyText_.has_value()
+                    : key == L"copilot_accent" ? copilotColorApplyText_.has_value()
                     : key == L"usage_text_color" ? usageTextColorApplyText_.has_value() : false;
                 if ((!flightChanges_ || !flightChanges_.HasKey(key)) && !colorApplyPending &&
                     server.HasKey(key) && server.GetNamedValue(key).Stringify() == pair.Value().Stringify()) continue;
@@ -674,9 +689,19 @@ namespace winrt::SettingsUI::implementation
                 flightChanges_ = snapshot;
                 flightClaudeColorApplyText_ = snapshot.HasKey(L"claude_accent") ? claudeColorApplyText_ : std::nullopt;
                 flightCodexColorApplyText_ = snapshot.HasKey(L"codex_accent") ? codexColorApplyText_ : std::nullopt;
+                flightAntigravityColorApplyText_ = snapshot.HasKey(L"antigravity_accent") ? antigravityColorApplyText_ : std::nullopt;
+                flightOpencodeColorApplyText_ = snapshot.HasKey(L"opencode_accent") ? opencodeColorApplyText_ : std::nullopt;
+                flightCursorColorApplyText_ = snapshot.HasKey(L"cursor_accent") ? cursorColorApplyText_ : std::nullopt;
+                flightGrokColorApplyText_ = snapshot.HasKey(L"grok_accent") ? grokColorApplyText_ : std::nullopt;
+                flightCopilotColorApplyText_ = snapshot.HasKey(L"copilot_accent") ? copilotColorApplyText_ : std::nullopt;
                 flightUsageTextColorApplyText_ = snapshot.HasKey(L"usage_text_color") ? usageTextColorApplyText_ : std::nullopt;
                 if (flightClaudeColorApplyText_) claudeColorApplyText_.reset();
                 if (flightCodexColorApplyText_) codexColorApplyText_.reset();
+                if (flightAntigravityColorApplyText_) antigravityColorApplyText_.reset();
+                if (flightOpencodeColorApplyText_) opencodeColorApplyText_.reset();
+                if (flightCursorColorApplyText_) cursorColorApplyText_.reset();
+                if (flightGrokColorApplyText_) grokColorApplyText_.reset();
+                if (flightCopilotColorApplyText_) copilotColorApplyText_.reset();
                 if (flightUsageTextColorApplyText_) usageTextColorApplyText_.reset();
                 mutationInFlight_ = true;
                 ShowMessage(L"Applying changes…");
@@ -723,6 +748,11 @@ namespace winrt::SettingsUI::implementation
             {
                 resetColorsClaudeDraftRevision_ = claudeColorDraftRevision_;
                 resetColorsCodexDraftRevision_ = codexColorDraftRevision_;
+                resetColorsAntigravityDraftRevision_ = antigravityColorDraftRevision_;
+                resetColorsOpencodeDraftRevision_ = opencodeColorDraftRevision_;
+                resetColorsCursorDraftRevision_ = cursorColorDraftRevision_;
+                resetColorsGrokDraftRevision_ = grokColorDraftRevision_;
+                resetColorsCopilotDraftRevision_ = copilotColorDraftRevision_;
                 resetColorsUsageTextDraftRevision_ = usageTextColorDraftRevision_;
             }
             auto request = Request(L"action"); request.Insert(L"action", JsonValue::CreateStringValue(action)); Send(request);
@@ -763,6 +793,11 @@ namespace winrt::SettingsUI::implementation
             {
                 resetColorsClaudeDraftRevision_ = claudeColorDraftRevision_;
                 resetColorsCodexDraftRevision_ = codexColorDraftRevision_;
+                resetColorsAntigravityDraftRevision_ = antigravityColorDraftRevision_;
+                resetColorsOpencodeDraftRevision_ = opencodeColorDraftRevision_;
+                resetColorsCursorDraftRevision_ = cursorColorDraftRevision_;
+                resetColorsGrokDraftRevision_ = grokColorDraftRevision_;
+                resetColorsCopilotDraftRevision_ = copilotColorDraftRevision_;
                 resetColorsUsageTextDraftRevision_ = usageTextColorDraftRevision_;
             }
             auto request = Request(L"action"); request.Insert(L"action", JsonValue::CreateStringValue(action)); Send(request);
@@ -976,6 +1011,11 @@ namespace winrt::SettingsUI::implementation
                 persistNeeded_ = true;
                 if (flightClaudeColorApplyText_) persistClaudeColorApplyText_ = flightClaudeColorApplyText_;
                 if (flightCodexColorApplyText_) persistCodexColorApplyText_ = flightCodexColorApplyText_;
+                if (flightAntigravityColorApplyText_) persistAntigravityColorApplyText_ = flightAntigravityColorApplyText_;
+                if (flightOpencodeColorApplyText_) persistOpencodeColorApplyText_ = flightOpencodeColorApplyText_;
+                if (flightCursorColorApplyText_) persistCursorColorApplyText_ = flightCursorColorApplyText_;
+                if (flightGrokColorApplyText_) persistGrokColorApplyText_ = flightGrokColorApplyText_;
+                if (flightCopilotColorApplyText_) persistCopilotColorApplyText_ = flightCopilotColorApplyText_;
                 if (flightUsageTextColorApplyText_) persistUsageTextColorApplyText_ = flightUsageTextColorApplyText_;
                 ShowMessage(std::wstring(message.GetNamedString(L"error", L"Changes are active, but could not be saved.").c_str()), true);
             }
@@ -991,6 +1031,11 @@ namespace winrt::SettingsUI::implementation
                 closeWithoutSavingApproved_ = false;
                 flightClaudeColorApplyText_.reset();
                 flightCodexColorApplyText_.reset();
+                flightAntigravityColorApplyText_.reset();
+                flightOpencodeColorApplyText_.reset();
+                flightCursorColorApplyText_.reset();
+                flightGrokColorApplyText_.reset();
+                flightCopilotColorApplyText_.reset();
                 flightUsageTextColorApplyText_.reset();
                 ShowMessage(std::wstring(message.GetNamedString(L"error", L"The setting could not be applied.").c_str()), true);
             }
@@ -1000,15 +1045,35 @@ namespace winrt::SettingsUI::implementation
                 closeSaveDecisionPending_ = false;
                 CompleteColorApply(L"claude_accent", flightClaudeColorApplyText_);
                 CompleteColorApply(L"codex_accent", flightCodexColorApplyText_);
+                CompleteColorApply(L"antigravity_accent", flightAntigravityColorApplyText_);
+                CompleteColorApply(L"opencode_accent", flightOpencodeColorApplyText_);
+                CompleteColorApply(L"cursor_accent", flightCursorColorApplyText_);
+                CompleteColorApply(L"grok_accent", flightGrokColorApplyText_);
+                CompleteColorApply(L"copilot_accent", flightCopilotColorApplyText_);
                 CompleteColorApply(L"usage_text_color", flightUsageTextColorApplyText_);
                 CompleteColorApply(L"claude_accent", persistClaudeColorApplyText_);
                 CompleteColorApply(L"codex_accent", persistCodexColorApplyText_);
+                CompleteColorApply(L"antigravity_accent", persistAntigravityColorApplyText_);
+                CompleteColorApply(L"opencode_accent", persistOpencodeColorApplyText_);
+                CompleteColorApply(L"cursor_accent", persistCursorColorApplyText_);
+                CompleteColorApply(L"grok_accent", persistGrokColorApplyText_);
+                CompleteColorApply(L"copilot_accent", persistCopilotColorApplyText_);
                 CompleteColorApply(L"usage_text_color", persistUsageTextColorApplyText_);
                 flightClaudeColorApplyText_.reset();
                 flightCodexColorApplyText_.reset();
+                flightAntigravityColorApplyText_.reset();
+                flightOpencodeColorApplyText_.reset();
+                flightCursorColorApplyText_.reset();
+                flightGrokColorApplyText_.reset();
+                flightCopilotColorApplyText_.reset();
                 flightUsageTextColorApplyText_.reset();
                 persistClaudeColorApplyText_.reset();
                 persistCodexColorApplyText_.reset();
+                persistAntigravityColorApplyText_.reset();
+                persistOpencodeColorApplyText_.reset();
+                persistCursorColorApplyText_.reset();
+                persistGrokColorApplyText_.reset();
+                persistCopilotColorApplyText_.reset();
                 persistUsageTextColorApplyText_.reset();
                 if (!isInitialGet) ShowMessage(L"Saved. Changes are now in effect.");
             }
@@ -1022,9 +1087,19 @@ namespace winrt::SettingsUI::implementation
                 closeSaveDecisionPending_ = false;
                 CompleteColorApply(L"claude_accent", persistClaudeColorApplyText_);
                 CompleteColorApply(L"codex_accent", persistCodexColorApplyText_);
+                CompleteColorApply(L"antigravity_accent", persistAntigravityColorApplyText_);
+                CompleteColorApply(L"opencode_accent", persistOpencodeColorApplyText_);
+                CompleteColorApply(L"cursor_accent", persistCursorColorApplyText_);
+                CompleteColorApply(L"grok_accent", persistGrokColorApplyText_);
+                CompleteColorApply(L"copilot_accent", persistCopilotColorApplyText_);
                 CompleteColorApply(L"usage_text_color", persistUsageTextColorApplyText_);
                 persistClaudeColorApplyText_.reset();
                 persistCodexColorApplyText_.reset();
+                persistAntigravityColorApplyText_.reset();
+                persistOpencodeColorApplyText_.reset();
+                persistCursorColorApplyText_.reset();
+                persistGrokColorApplyText_.reset();
+                persistCopilotColorApplyText_.reset();
                 persistUsageTextColorApplyText_.reset();
                 ShowMessage(L"Changes saved.");
             }
@@ -1047,7 +1122,7 @@ namespace winrt::SettingsUI::implementation
             persistNeeded_ = true;
             settingsRefreshPending_ = true;
             if (completedSettingsAction == L"reset_colors")
-                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_, resetColorsUsageTextDraftRevision_);
+                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_, resetColorsAntigravityDraftRevision_, resetColorsOpencodeDraftRevision_, resetColorsCursorDraftRevision_, resetColorsGrokDraftRevision_, resetColorsCopilotDraftRevision_, resetColorsUsageTextDraftRevision_);
             if (closeRequested_) flushRequested_ = true;
             ShowMessage(std::wstring(message.GetNamedString(L"error", L"The action took effect, but its changes could not be saved.").c_str()), true);
         }
@@ -1072,7 +1147,7 @@ namespace winrt::SettingsUI::implementation
         {
             settingsRefreshPending_ = true;
             if (completedSettingsAction == L"reset_colors")
-                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_, resetColorsUsageTextDraftRevision_);
+                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_, resetColorsAntigravityDraftRevision_, resetColorsOpencodeDraftRevision_, resetColorsCursorDraftRevision_, resetColorsGrokDraftRevision_, resetColorsCopilotDraftRevision_, resetColorsUsageTextDraftRevision_);
         }
         if (HasPendingChanges() && flushRequested_) SendNextMutation();
         else if (flushRequested_) SendNextMutation();
@@ -1107,7 +1182,12 @@ namespace winrt::SettingsUI::implementation
         UpdateSaveBar();
         if (key == L"palette" || key == L"bar_style" || key == L"bar_thickness" || key == L"font_size" ||
             key == L"window_label_font_size" || key == L"claude_accent" || key == L"codex_accent" ||
+            key == L"antigravity_accent" || key == L"opencode_accent" || key == L"cursor_accent" ||
+            key == L"grok_accent" || key == L"copilot_accent" ||
             key == L"usage_text_color" || key == L"show_provider_icon" || key == L"show_provider_icons" ||
+            key == L"show_claude_icon" || key == L"show_codex_icon" || key == L"show_antigravity_icon" ||
+            key == L"show_opencode_icon" || key == L"show_cursor_icon" || key == L"show_grok_icon" ||
+            key == L"show_copilot_icon" ||
             key == L"show_percentage" || key == L"show_bar" || key == L"show_reset_time")
             ScheduleWidgetPreview();
     }
@@ -1146,9 +1226,12 @@ namespace winrt::SettingsUI::implementation
         if (previewTimer_) previewTimer_.Stop();
         auto settings = State();
         auto changes = JsonObject();
-        static const std::array<std::wstring, 12> previewKeys{
+        static const std::array<std::wstring, 24> previewKeys{
             L"palette", L"bar_style", L"bar_thickness", L"font_size", L"window_label_font_size",
-            L"claude_accent", L"codex_accent", L"usage_text_color", L"show_provider_icon",
+            L"claude_accent", L"codex_accent", L"antigravity_accent", L"opencode_accent",
+            L"cursor_accent", L"grok_accent", L"copilot_accent", L"usage_text_color", L"show_provider_icon",
+            L"show_claude_icon", L"show_codex_icon", L"show_antigravity_icon", L"show_opencode_icon",
+            L"show_cursor_icon", L"show_grok_icon", L"show_copilot_icon",
             L"show_percentage", L"show_bar", L"show_reset_time" };
         for (auto const& key : previewKeys)
             if (settings.HasKey(key)) changes.Insert(key, settings.GetNamedValue(key));
@@ -1163,6 +1246,11 @@ namespace winrt::SettingsUI::implementation
         };
         addColorDraft(L"claude_accent", claudeColorDraft_);
         addColorDraft(L"codex_accent", codexColorDraft_);
+        addColorDraft(L"antigravity_accent", antigravityColorDraft_);
+        addColorDraft(L"opencode_accent", opencodeColorDraft_);
+        addColorDraft(L"cursor_accent", cursorColorDraft_);
+        addColorDraft(L"grok_accent", grokColorDraft_);
+        addColorDraft(L"copilot_accent", copilotColorDraft_);
         addColorDraft(L"usage_text_color", usageTextColorDraft_);
 
         auto request = Request(L"preview");
@@ -1403,8 +1491,15 @@ namespace winrt::SettingsUI::implementation
     {
         if (key == L"claude_accent") claudeColorDraft_ = std::move(draft);
         else if (key == L"codex_accent") codexColorDraft_ = std::move(draft);
+        else if (key == L"antigravity_accent") antigravityColorDraft_ = std::move(draft);
+        else if (key == L"opencode_accent") opencodeColorDraft_ = std::move(draft);
+        else if (key == L"cursor_accent") cursorColorDraft_ = std::move(draft);
+        else if (key == L"grok_accent") grokColorDraft_ = std::move(draft);
+        else if (key == L"copilot_accent") copilotColorDraft_ = std::move(draft);
         else if (key == L"usage_text_color") usageTextColorDraft_ = std::move(draft);
-        appearanceColorDraft_ = claudeColorDraft_.has_value() || codexColorDraft_.has_value() || usageTextColorDraft_.has_value();
+        appearanceColorDraft_ = claudeColorDraft_.has_value() || codexColorDraft_.has_value() ||
+            antigravityColorDraft_.has_value() || opencodeColorDraft_.has_value() || cursorColorDraft_.has_value() ||
+            grokColorDraft_.has_value() || copilotColorDraft_.has_value() || usageTextColorDraft_.has_value();
         UpdateSaveBar();
     }
 
@@ -1414,6 +1509,16 @@ namespace winrt::SettingsUI::implementation
         if (key == L"claude_accent" && claudeColorDraft_ == appliedDraft)
             SetColorDraft(key, std::nullopt);
         else if (key == L"codex_accent" && codexColorDraft_ == appliedDraft)
+            SetColorDraft(key, std::nullopt);
+        else if (key == L"antigravity_accent" && antigravityColorDraft_ == appliedDraft)
+            SetColorDraft(key, std::nullopt);
+        else if (key == L"opencode_accent" && opencodeColorDraft_ == appliedDraft)
+            SetColorDraft(key, std::nullopt);
+        else if (key == L"cursor_accent" && cursorColorDraft_ == appliedDraft)
+            SetColorDraft(key, std::nullopt);
+        else if (key == L"grok_accent" && grokColorDraft_ == appliedDraft)
+            SetColorDraft(key, std::nullopt);
+        else if (key == L"copilot_accent" && copilotColorDraft_ == appliedDraft)
             SetColorDraft(key, std::nullopt);
         else if (key == L"usage_text_color" && usageTextColorDraft_ == appliedDraft)
             SetColorDraft(key, std::nullopt);
@@ -1425,11 +1530,21 @@ namespace winrt::SettingsUI::implementation
                 flightClaudeColorApplyText_ != claudeColorDraft_ && persistClaudeColorApplyText_ != claudeColorDraft_) ||
             (codexColorDraft_ && codexColorApplyText_ != codexColorDraft_ &&
                 flightCodexColorApplyText_ != codexColorDraft_ && persistCodexColorApplyText_ != codexColorDraft_) ||
+            (antigravityColorDraft_ && antigravityColorApplyText_ != antigravityColorDraft_ &&
+                flightAntigravityColorApplyText_ != antigravityColorDraft_ && persistAntigravityColorApplyText_ != antigravityColorDraft_) ||
+            (opencodeColorDraft_ && opencodeColorApplyText_ != opencodeColorDraft_ &&
+                flightOpencodeColorApplyText_ != opencodeColorDraft_ && persistOpencodeColorApplyText_ != opencodeColorDraft_) ||
+            (cursorColorDraft_ && cursorColorApplyText_ != cursorColorDraft_ &&
+                flightCursorColorApplyText_ != cursorColorDraft_ && persistCursorColorApplyText_ != cursorColorDraft_) ||
+            (grokColorDraft_ && grokColorApplyText_ != grokColorDraft_ &&
+                flightGrokColorApplyText_ != grokColorDraft_ && persistGrokColorApplyText_ != grokColorDraft_) ||
+            (copilotColorDraft_ && copilotColorApplyText_ != copilotColorDraft_ &&
+                flightCopilotColorApplyText_ != copilotColorDraft_ && persistCopilotColorApplyText_ != copilotColorDraft_) ||
             (usageTextColorDraft_ && usageTextColorApplyText_ != usageTextColorDraft_ &&
                 flightUsageTextColorApplyText_ != usageTextColorDraft_ && persistUsageTextColorApplyText_ != usageTextColorDraft_);
     }
 
-    void MainWindow::ClearResetColorDraftsIfUnchanged(uint64_t claudeRevision, uint64_t codexRevision, uint64_t usageTextRevision)
+    void MainWindow::ClearResetColorDraftsIfUnchanged(uint64_t claudeRevision, uint64_t codexRevision, uint64_t antigravityRevision, uint64_t opencodeRevision, uint64_t cursorRevision, uint64_t grokRevision, uint64_t copilotRevision, uint64_t usageTextRevision)
     {
         if (claudeColorDraftRevision_ == claudeRevision)
         {
@@ -1440,6 +1555,31 @@ namespace winrt::SettingsUI::implementation
         {
             SetColorDraft(L"codex_accent", std::nullopt);
             codexColorApplyText_.reset();
+        }
+        if (antigravityColorDraftRevision_ == antigravityRevision)
+        {
+            SetColorDraft(L"antigravity_accent", std::nullopt);
+            antigravityColorApplyText_.reset();
+        }
+        if (opencodeColorDraftRevision_ == opencodeRevision)
+        {
+            SetColorDraft(L"opencode_accent", std::nullopt);
+            opencodeColorApplyText_.reset();
+        }
+        if (cursorColorDraftRevision_ == cursorRevision)
+        {
+            SetColorDraft(L"cursor_accent", std::nullopt);
+            cursorColorApplyText_.reset();
+        }
+        if (grokColorDraftRevision_ == grokRevision)
+        {
+            SetColorDraft(L"grok_accent", std::nullopt);
+            grokColorApplyText_.reset();
+        }
+        if (copilotColorDraftRevision_ == copilotRevision)
+        {
+            SetColorDraft(L"copilot_accent", std::nullopt);
+            copilotColorApplyText_.reset();
         }
         if (usageTextColorDraftRevision_ == usageTextRevision)
         {
@@ -1705,12 +1845,41 @@ namespace winrt::SettingsUI::implementation
         }
         style.Children().Append(buttons); styleCard.Child(style); PageHost().Children().Append(styleCard);
 
+        auto marksCard = Card(); auto marks = StackPanel(); marks.Spacing(14);
+        marks.Children().Append(Label(L"Provider marks", 19));
+        auto marksNote = Label(L"Show or hide each provider’s mark and percentage in the widget. Provider marks alone do not count toward the visible usage value.", 12);
+        marksNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        marks.Children().Append(marksNote);
+        for (auto const& [markKey, markTitle] : std::array<std::pair<std::wstring, std::wstring>, 7>{{
+            {L"show_claude_icon",L"Claude Code mark"},{L"show_codex_icon",L"Codex mark"},
+            {L"show_antigravity_icon",L"Antigravity mark"},{L"show_opencode_icon",L"OpenCode mark"},
+            {L"show_cursor_icon",L"Cursor mark"},{L"show_grok_icon",L"Grok mark"},
+            {L"show_copilot_icon",L"Copilot mark"}}})
+        {
+            auto copy = StackPanel(); copy.Spacing(3); copy.Children().Append(Label(markTitle));
+            auto markToggle = ToggleSwitch(); SetSwitchContent(markToggle);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(markToggle, markTitle);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(markToggle, std::wstring(L"Setting_") + markKey);
+            markToggle.IsOn(State().GetNamedBoolean(markKey, true));
+            markToggle.Toggled([this, markKey](auto const& sender, auto const&)
+            {
+                auto control = sender.as<ToggleSwitch>();
+                if (hydrating_) return;
+                SetValue(markKey, JsonValue::CreateBooleanValue(control.IsOn()));
+            });
+            marks.Children().Append(ToggleRow(copy, markToggle));
+        }
+        marksCard.Child(marks); PageHost().Children().Append(marksCard);
+
         auto colorsCard = Card(); auto colors = StackPanel(); colors.Spacing(12);
         colors.Children().Append(Label(L"Widget colors", 19));
         colors.Children().Append(Label(L"Progress-bar accents stay provider-specific. The shared text color applies to provider marks and usage percentages.", 12));
         colors.Children().Append(Label(L"Progress-bar accents", 14));
-        for (auto const& [key, title] : std::array<std::pair<std::wstring, std::wstring>, 3>{{
+        for (auto const& [key, title] : std::array<std::pair<std::wstring, std::wstring>, 8>{{
             {L"claude_accent",L"Claude Code bar accent"},{L"codex_accent",L"Codex bar accent"},
+            {L"antigravity_accent",L"Antigravity bar accent"},{L"opencode_accent",L"OpenCode bar accent"},
+            {L"cursor_accent",L"Cursor bar accent"},{L"grok_accent",L"Grok bar accent"},
+            {L"copilot_accent",L"Copilot bar accent"},
             {L"usage_text_color",L"Provider mark and percentage color"}}})
         {
             auto group = StackPanel(); group.Spacing(6); group.Children().Append(Label(title));
@@ -1725,7 +1894,7 @@ namespace winrt::SettingsUI::implementation
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(input, std::wstring(L"Color_") + key);
             input.PlaceholderText(L"Default color"); input.Width(145);
             const auto savedText = StoredColorText(State(), key);
-            const auto& draft = key == L"claude_accent" ? claudeColorDraft_ : key == L"codex_accent" ? codexColorDraft_ : usageTextColorDraft_;
+            const auto& draft = key == L"claude_accent" ? claudeColorDraft_ : key == L"codex_accent" ? codexColorDraft_ : key == L"antigravity_accent" ? antigravityColorDraft_ : key == L"opencode_accent" ? opencodeColorDraft_ : key == L"cursor_accent" ? cursorColorDraft_ : key == L"grok_accent" ? grokColorDraft_ : key == L"copilot_accent" ? copilotColorDraft_ : usageTextColorDraft_;
             input.Text(draft ? hstring(*draft) : hstring(savedText));
             input.TextChanging([this, key, refreshPreview](auto const& sender, auto const&)
             {
@@ -1733,9 +1902,19 @@ namespace winrt::SettingsUI::implementation
                 const auto text = std::wstring(sender.as<TextBox>().Text().c_str());
                 if (key == L"claude_accent") ++claudeColorDraftRevision_;
                 else if (key == L"codex_accent") ++codexColorDraftRevision_;
+                else if (key == L"antigravity_accent") ++antigravityColorDraftRevision_;
+                else if (key == L"opencode_accent") ++opencodeColorDraftRevision_;
+                else if (key == L"cursor_accent") ++cursorColorDraftRevision_;
+                else if (key == L"grok_accent") ++grokColorDraftRevision_;
+                else if (key == L"copilot_accent") ++copilotColorDraftRevision_;
                 else ++usageTextColorDraftRevision_;
                 if (key == L"claude_accent" && claudeColorApplyText_ && *claudeColorApplyText_ != text) claudeColorApplyText_.reset();
                 if (key == L"codex_accent" && codexColorApplyText_ && *codexColorApplyText_ != text) codexColorApplyText_.reset();
+                if (key == L"antigravity_accent" && antigravityColorApplyText_ && *antigravityColorApplyText_ != text) antigravityColorApplyText_.reset();
+                if (key == L"opencode_accent" && opencodeColorApplyText_ && *opencodeColorApplyText_ != text) opencodeColorApplyText_.reset();
+                if (key == L"cursor_accent" && cursorColorApplyText_ && *cursorColorApplyText_ != text) cursorColorApplyText_.reset();
+                if (key == L"grok_accent" && grokColorApplyText_ && *grokColorApplyText_ != text) grokColorApplyText_.reset();
+                if (key == L"copilot_accent" && copilotColorApplyText_ && *copilotColorApplyText_ != text) copilotColorApplyText_.reset();
                 if (key == L"usage_text_color" && usageTextColorApplyText_ && *usageTextColorApplyText_ != text) usageTextColorApplyText_.reset();
                 SetColorDraft(key, text); refreshPreview();
             });
@@ -1763,6 +1942,9 @@ namespace winrt::SettingsUI::implementation
                 if (!color && palette == L"system") color = ParseHexColor(EffectiveColorText(state_, key));
                 if (!color) color = ParseHexColor(key == L"claude_accent" ? L"#D97757" : key == L"codex_accent"
                     ? (dark ? L"#34D399" : L"#0F8F70")
+                    : key == L"antigravity_accent" ? L"#4285F4" : key == L"opencode_accent" ? L"#5B8DEF"
+                    : key == L"cursor_accent" ? L"#6E6E6E" : key == L"grok_accent" ? L"#A8A8A8"
+                    : key == L"copilot_accent" ? L"#A371F7"
                     : palette == L"system" ? (dark ? L"#888888" : L"#404040") : (dark ? L"#FFFFFF" : L"#101820"));
                 const auto rgb = color.value_or(std::array<uint8_t, 3>{217,119,87});
                 picker.Color(Windows::UI::Color{255, rgb[0], rgb[1], rgb[2]});
@@ -1774,6 +1956,11 @@ namespace winrt::SettingsUI::implementation
                 syncingColorText_ = true; input.Text(value); syncingColorText_ = false;
                 if (key == L"claude_accent") ++claudeColorDraftRevision_;
                 else if (key == L"codex_accent") ++codexColorDraftRevision_;
+                else if (key == L"antigravity_accent") ++antigravityColorDraftRevision_;
+                else if (key == L"opencode_accent") ++opencodeColorDraftRevision_;
+                else if (key == L"cursor_accent") ++cursorColorDraftRevision_;
+                else if (key == L"grok_accent") ++grokColorDraftRevision_;
+                else if (key == L"copilot_accent") ++copilotColorDraftRevision_;
                 else ++usageTextColorDraftRevision_;
                 SetColorDraft(key, value); refreshPreview(); flyout.Hide();
             });
@@ -1790,6 +1977,11 @@ namespace winrt::SettingsUI::implementation
                 SetColorDraft(key, normalized);
                 if (key == L"claude_accent") claudeColorApplyText_ = normalized;
                 else if (key == L"codex_accent") codexColorApplyText_ = normalized;
+                else if (key == L"antigravity_accent") antigravityColorApplyText_ = normalized;
+                else if (key == L"opencode_accent") opencodeColorApplyText_ = normalized;
+                else if (key == L"cursor_accent") cursorColorApplyText_ = normalized;
+                else if (key == L"grok_accent") grokColorApplyText_ = normalized;
+                else if (key == L"copilot_accent") copilotColorApplyText_ = normalized;
                 else usageTextColorApplyText_ = normalized;
                 auto value = JsonArray(); for (const auto component : *color) value.Append(JsonValue::CreateNumberValue(component)); SetValue(key, value);
             });
@@ -1801,6 +1993,11 @@ namespace winrt::SettingsUI::implementation
                 if (pendingChanges_ && pendingChanges_.HasKey(key)) { pendingChanges_.Remove(key); if (pendingChanges_.Size() == 0) pendingChanges_ = nullptr; }
                 if (key == L"claude_accent") claudeColorApplyText_.reset();
                 else if (key == L"codex_accent") codexColorApplyText_.reset();
+                else if (key == L"antigravity_accent") antigravityColorApplyText_.reset();
+                else if (key == L"opencode_accent") opencodeColorApplyText_.reset();
+                else if (key == L"cursor_accent") cursorColorApplyText_.reset();
+                else if (key == L"grok_accent") grokColorApplyText_.reset();
+                else if (key == L"copilot_accent") copilotColorApplyText_.reset();
                 else usageTextColorApplyText_.reset();
                 const bool wasHydrating = hydrating_.load(); hydrating_ = true;
                 syncingColorText_ = true; input.Text(StoredColorText(State(), key)); syncingColorText_ = false;
@@ -1831,6 +2028,13 @@ namespace winrt::SettingsUI::implementation
                 StickyPreviewHost().Children().RemoveAt(index);
             appearancePreviewCard_ = nullptr;
         }
+        if (appearancePreviewPlaceholder_)
+        {
+            uint32_t placeholderIndex{};
+            if (PageHost().Children().IndexOf(appearancePreviewPlaceholder_, placeholderIndex))
+                PageHost().Children().RemoveAt(placeholderIndex);
+            appearancePreviewPlaceholder_ = nullptr;
+        }
         StickyPreviewHost().Visibility(Visibility::Collapsed);
     }
 
@@ -1847,7 +2051,18 @@ namespace winrt::SettingsUI::implementation
                 if (top > 0) return;
                 uint32_t index{};
                 if (!PageHost().Children().IndexOf(appearancePreviewCard_, index)) return;
+                const auto cardHeight = appearancePreviewCard_.ActualHeight();
+                const auto cardMargin = appearancePreviewCard_.Margin();
                 PageHost().Children().RemoveAt(index);
+                if (cardHeight > 0)
+                {
+                    auto placeholder = Controls::Border();
+                    placeholder.Height(cardHeight);
+                    placeholder.Margin(cardMargin);
+                    placeholder.Background(nullptr);
+                    PageHost().Children().InsertAt(index, placeholder);
+                    appearancePreviewPlaceholder_ = placeholder;
+                }
                 StickyPreviewHost().Children().Append(appearancePreviewCard_);
                 StickyPreviewHost().Visibility(Visibility::Visible);
                 appearancePreviewCard_.Background(Application::Current().Resources().Lookup(box_value(L"SolidBackgroundFillColorBaseBrush")).as<Media::Brush>());
@@ -1859,6 +2074,13 @@ namespace winrt::SettingsUI::implementation
                 uint32_t index{};
                 if (StickyPreviewHost().Children().IndexOf(appearancePreviewCard_, index))
                     StickyPreviewHost().Children().RemoveAt(index);
+                if (appearancePreviewPlaceholder_)
+                {
+                    uint32_t placeholderIndex{};
+                    if (PageHost().Children().IndexOf(appearancePreviewPlaceholder_, placeholderIndex))
+                        PageHost().Children().RemoveAt(placeholderIndex);
+                    appearancePreviewPlaceholder_ = nullptr;
+                }
                 PageHost().Children().InsertAt(0, appearancePreviewCard_);
                 appearancePreviewCard_.Background(Application::Current().Resources().Lookup(box_value(L"CardBackgroundFillColorDefaultBrush")).as<Media::Brush>());
                 StickyPreviewHost().Visibility(Visibility::Collapsed);

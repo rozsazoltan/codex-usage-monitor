@@ -573,7 +573,24 @@ struct Appearance {
     claude_accent: Option<[u8; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codex_accent: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    antigravity_accent: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opencode_accent: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor_accent: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grok_accent: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    copilot_accent: Option<[u8; 3]>,
     show_provider_icon: bool,
+    show_claude_icon: bool,
+    show_codex_icon: bool,
+    show_antigravity_icon: bool,
+    show_opencode_icon: bool,
+    show_cursor_icon: bool,
+    show_grok_icon: bool,
+    show_copilot_icon: bool,
     show_percentage: bool,
     show_bar: bool,
     show_reset_time: bool,
@@ -590,7 +607,19 @@ impl Default for Appearance {
             font_size: FontSize::default(),
             claude_accent: None,
             codex_accent: None,
+            antigravity_accent: None,
+            opencode_accent: None,
+            cursor_accent: None,
+            grok_accent: None,
+            copilot_accent: None,
             show_provider_icon: true,
+            show_claude_icon: true,
+            show_codex_icon: true,
+            show_antigravity_icon: true,
+            show_opencode_icon: true,
+            show_cursor_icon: true,
+            show_grok_icon: true,
+            show_copilot_icon: true,
             show_percentage: true,
             show_bar: true,
             show_reset_time: true,
@@ -2599,6 +2628,22 @@ fn antigravity_accent_color() -> Color {
     Color::from_hex("#4285F4")
 }
 
+fn opencode_accent_color() -> Color {
+    Color::from_hex("#5B8DEF")
+}
+
+fn cursor_accent_color() -> Color {
+    Color::from_hex("#6E6E6E")
+}
+
+fn grok_accent_color() -> Color {
+    Color::from_hex("#A8A8A8")
+}
+
+fn copilot_accent_color() -> Color {
+    Color::from_hex("#A371F7")
+}
+
 pub fn run() {
     // Enable Per-Monitor DPI Awareness V2 for crisp rendering at any scale factor
     unsafe {
@@ -4535,6 +4580,11 @@ fn settings_snapshot() -> serde_json::Value {
     let dark = s.appearance.is_dark(s.is_dark);
     let claude = custom_color(s.appearance.claude_accent, claude_accent_color());
     let codex = custom_color(s.appearance.codex_accent, provider_icons::codex_color(dark));
+    let antigravity = custom_color(s.appearance.antigravity_accent, antigravity_accent_color());
+    let opencode = custom_color(s.appearance.opencode_accent, opencode_accent_color());
+    let cursor = custom_color(s.appearance.cursor_accent, cursor_accent_color());
+    let grok = custom_color(s.appearance.grok_accent, grok_accent_color());
+    let copilot = custom_color(s.appearance.copilot_accent, copilot_accent_color());
     let candidate = SettingsCandidate::from_app_state(s, startup);
     let preview = widget_preview_image(&candidate, s.language, s.is_dark);
     json!({
@@ -4554,15 +4604,25 @@ fn settings_snapshot() -> serde_json::Value {
             "palette":s.appearance.palette,"bar_style":s.appearance.bar_style,
             "bar_thickness":s.appearance.bar_thickness,"font_size":s.appearance.font_size,
             "show_provider_icon":s.appearance.show_provider_icon,
+            "show_claude_icon":s.appearance.show_claude_icon,
+            "show_codex_icon":s.appearance.show_codex_icon,
+            "show_antigravity_icon":s.appearance.show_antigravity_icon,
+            "show_opencode_icon":s.appearance.show_opencode_icon,
+            "show_cursor_icon":s.appearance.show_cursor_icon,
+            "show_grok_icon":s.appearance.show_grok_icon,
+            "show_copilot_icon":s.appearance.show_copilot_icon,
             "show_percentage":s.appearance.show_percentage,"show_bar":s.appearance.show_bar,
             "show_reset_time":s.appearance.show_reset_time,
             "usage_text_color":s.appearance.usage_text_color,
             "window_label_font_size":s.appearance.window_label_font_size,
             "claude_accent":s.appearance.claude_accent,"codex_accent":s.appearance.codex_accent,
+            "antigravity_accent":s.appearance.antigravity_accent,"opencode_accent":s.appearance.opencode_accent,
+            "cursor_accent":s.appearance.cursor_accent,"grok_accent":s.appearance.grok_accent,
+            "copilot_accent":s.appearance.copilot_accent,
             "monitor_device":s.monitor_device,"anchor_left":s.anchor_left
         },
         "effective_language":s.language.code(),"claude_code_available":s.claude_code_available,
-        "effective_appearance":{"dark":dark,"claude_accent":[claude.r,claude.g,claude.b],"codex_accent":[codex.r,codex.g,codex.b]},
+        "effective_appearance":{"dark":dark,"claude_accent":[claude.r,claude.g,claude.b],"codex_accent":[codex.r,codex.g,codex.b],"antigravity_accent":[antigravity.r,antigravity.g,antigravity.b],"opencode_accent":[opencode.r,opencode.g,opencode.b],"cursor_accent":[cursor.r,cursor.g,cursor.b],"grok_accent":[grok.r,grok.g,grok.b],"copilot_accent":[copilot.r,copilot.g,copilot.b]},
         "update_busy":matches!(s.update_status, UpdateStatus::Checking | UpdateStatus::Applying),
         "update_available":update_available(&s.update_status),
         "monitors":monitors,"version":env!("CARGO_PKG_VERSION"),
@@ -5097,6 +5157,42 @@ fn validate_settings_changes(
             }
             Key::CodexAccent => {
                 candidate.appearance.codex_accent = setting_value(change.value.clone())?
+            }
+            Key::AntigravityAccent => {
+                candidate.appearance.antigravity_accent = setting_value(change.value.clone())?
+            }
+            Key::OpencodeAccent => {
+                candidate.appearance.opencode_accent = setting_value(change.value.clone())?
+            }
+            Key::CursorAccent => {
+                candidate.appearance.cursor_accent = setting_value(change.value.clone())?
+            }
+            Key::GrokAccent => {
+                candidate.appearance.grok_accent = setting_value(change.value.clone())?
+            }
+            Key::CopilotAccent => {
+                candidate.appearance.copilot_accent = setting_value(change.value.clone())?
+            }
+            Key::ShowClaudeIcon => {
+                candidate.appearance.show_claude_icon = setting_value(change.value.clone())?
+            }
+            Key::ShowCodexIcon => {
+                candidate.appearance.show_codex_icon = setting_value(change.value.clone())?
+            }
+            Key::ShowAntigravityIcon => {
+                candidate.appearance.show_antigravity_icon = setting_value(change.value.clone())?
+            }
+            Key::ShowOpencodeIcon => {
+                candidate.appearance.show_opencode_icon = setting_value(change.value.clone())?
+            }
+            Key::ShowCursorIcon => {
+                candidate.appearance.show_cursor_icon = setting_value(change.value.clone())?
+            }
+            Key::ShowGrokIcon => {
+                candidate.appearance.show_grok_icon = setting_value(change.value.clone())?
+            }
+            Key::ShowCopilotIcon => {
+                candidate.appearance.show_copilot_icon = setting_value(change.value.clone())?
             }
             Key::MonitorDevice => {
                 let device: Option<String> = setting_value(change.value.clone())?;
@@ -6271,6 +6367,13 @@ mod tests {
             (Key::FontSize, json!("unknown")),
             (Key::ClaudeAccent, json!([256, 0, 0])),
             (Key::CodexAccent, json!([0, 0])),
+            (Key::AntigravityAccent, json!([256, 0, 0])),
+            (Key::OpencodeAccent, json!([0, 0])),
+            (Key::CursorAccent, json!("red")),
+            (Key::GrokAccent, json!([1, 2, 3, 4])),
+            (Key::CopilotAccent, json!([-1, 0, 0])),
+            (Key::ShowClaudeIcon, json!("true")),
+            (Key::ShowCopilotIcon, json!("false")),
             (Key::MonitorDevice, json!(r"\\.\DISPLAY99")),
         ] {
             let changes = [settings_ui::Change { key, value }];
@@ -6759,6 +6862,91 @@ mod tests {
     }
 
     #[test]
+    fn per_provider_marks_and_bar_colors_accept_valid_values() {
+        use serde_json::json;
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        let candidate = validate_settings_changes(
+            &current,
+            &[
+                settings_ui::Change {
+                    key: Key::ShowAntigravityIcon,
+                    value: json!(false),
+                },
+                settings_ui::Change {
+                    key: Key::ShowOpencodeIcon,
+                    value: json!(false),
+                },
+                settings_ui::Change {
+                    key: Key::ShowCursorIcon,
+                    value: json!(false),
+                },
+                settings_ui::Change {
+                    key: Key::ShowGrokIcon,
+                    value: json!(false),
+                },
+                settings_ui::Change {
+                    key: Key::ShowCopilotIcon,
+                    value: json!(false),
+                },
+                settings_ui::Change {
+                    key: Key::AntigravityAccent,
+                    value: json!([0x42, 0x85, 0xF4]),
+                },
+                settings_ui::Change {
+                    key: Key::OpencodeAccent,
+                    value: json!([0x5B, 0x8D, 0xEF]),
+                },
+                settings_ui::Change {
+                    key: Key::CursorAccent,
+                    value: json!([0x6E, 0x6E, 0x6E]),
+                },
+                settings_ui::Change {
+                    key: Key::GrokAccent,
+                    value: json!([0xA8, 0xA8, 0xA8]),
+                },
+                settings_ui::Change {
+                    key: Key::CopilotAccent,
+                    value: json!([0xA3, 0x71, 0xF7]),
+                },
+            ],
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(!candidate.appearance.show_antigravity_icon);
+        assert!(!candidate.appearance.show_opencode_icon);
+        assert!(!candidate.appearance.show_cursor_icon);
+        assert!(!candidate.appearance.show_grok_icon);
+        assert!(!candidate.appearance.show_copilot_icon);
+        assert_eq!(
+            candidate.appearance.antigravity_accent,
+            Some([0x42, 0x85, 0xF4])
+        );
+        assert_eq!(
+            candidate.appearance.opencode_accent,
+            Some([0x5B, 0x8D, 0xEF])
+        );
+        assert_eq!(candidate.appearance.cursor_accent, Some([0x6E, 0x6E, 0x6E]));
+        assert_eq!(candidate.appearance.grok_accent, Some([0xA8, 0xA8, 0xA8]));
+        assert_eq!(
+            candidate.appearance.copilot_accent,
+            Some([0xA3, 0x71, 0xF7])
+        );
+
+        let cleared = validate_settings_changes(
+            &candidate,
+            &[settings_ui::Change {
+                key: Key::GrokAccent,
+                value: json!(null),
+            }],
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cleared.appearance.grok_accent, None);
+    }
+
+    #[test]
     fn unavailable_quota_has_no_bar_fill() {
         assert_eq!(usage_bar_fill_percentage(100.0, "--"), 0.0);
         assert_eq!(usage_bar_fill_percentage(61.0, "剩余61%"), 61.0);
@@ -6876,11 +7064,41 @@ mod tests {
     }
 
     #[test]
+    fn per_provider_marks_default_to_visible_with_no_custom_bar_colors() {
+        let defaults = Appearance::default();
+        assert!(defaults.show_claude_icon);
+        assert!(defaults.show_codex_icon);
+        assert!(defaults.show_antigravity_icon);
+        assert!(defaults.show_opencode_icon);
+        assert!(defaults.show_cursor_icon);
+        assert!(defaults.show_grok_icon);
+        assert!(defaults.show_copilot_icon);
+        assert_eq!(defaults.antigravity_accent, None);
+        assert_eq!(defaults.opencode_accent, None);
+        assert_eq!(defaults.cursor_accent, None);
+        assert_eq!(defaults.grok_accent, None);
+        assert_eq!(defaults.copilot_accent, None);
+
+        let legacy: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert!(legacy.appearance.show_opencode_icon);
+        assert!(legacy.appearance.show_cursor_icon);
+        assert!(legacy.appearance.show_grok_icon);
+        assert!(legacy.appearance.show_copilot_icon);
+        assert_eq!(legacy.appearance.antigravity_accent, None);
+        assert_eq!(legacy.appearance.copilot_accent, None);
+    }
+
+    #[test]
     fn custom_provider_colors_survive_settings_round_trip() {
         let settings = SettingsFile {
             appearance: Appearance {
                 claude_accent: Some([0xD9, 0x77, 0x57]),
                 codex_accent: Some([0x34, 0xD3, 0x99]),
+                antigravity_accent: Some([0x42, 0x85, 0xF4]),
+                opencode_accent: Some([0x5B, 0x8D, 0xEF]),
+                cursor_accent: Some([0x6E, 0x6E, 0x6E]),
+                grok_accent: Some([0xA8, 0xA8, 0xA8]),
+                copilot_accent: Some([0xA3, 0x71, 0xF7]),
                 ..Appearance::default()
             },
             ..SettingsFile::default()
@@ -6890,6 +7108,17 @@ mod tests {
 
         assert_eq!(restored.appearance.claude_accent, Some([0xD9, 0x77, 0x57]));
         assert_eq!(restored.appearance.codex_accent, Some([0x34, 0xD3, 0x99]));
+        assert_eq!(
+            restored.appearance.antigravity_accent,
+            Some([0x42, 0x85, 0xF4])
+        );
+        assert_eq!(
+            restored.appearance.opencode_accent,
+            Some([0x5B, 0x8D, 0xEF])
+        );
+        assert_eq!(restored.appearance.cursor_accent, Some([0x6E, 0x6E, 0x6E]));
+        assert_eq!(restored.appearance.grok_accent, Some([0xA8, 0xA8, 0xA8]));
+        assert_eq!(restored.appearance.copilot_accent, Some([0xA3, 0x71, 0xF7]));
     }
 
     #[test]
@@ -7336,6 +7565,11 @@ unsafe fn handle_command(hwnd: HWND, id: u16) {
                 if let Some(s) = lock_state().as_mut() {
                     s.appearance.claude_accent = None;
                     s.appearance.codex_accent = None;
+                    s.appearance.antigravity_accent = None;
+                    s.appearance.opencode_accent = None;
+                    s.appearance.cursor_accent = None;
+                    s.appearance.grok_accent = None;
+                    s.appearance.copilot_accent = None;
                     s.appearance.usage_text_color = None;
                 }
             } else {

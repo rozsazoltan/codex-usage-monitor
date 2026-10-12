@@ -44,7 +44,11 @@
 //! alert_threshold_percent (0|10|20|30); palette
 //! (system|high_contrast_dark|high_contrast_light), bar_style
 //! (continuous|segmented), bar_thickness (standard|slim), font_size
-//! (standard|large), claude_accent/codex_accent (null or [u8,u8,u8]),
+//! (standard|large), claude_accent/codex_accent/antigravity_accent/
+//! opencode_accent/cursor_accent/grok_accent/copilot_accent (null or
+//! [u8,u8,u8]), show_claude_icon/show_codex_icon/show_antigravity_icon/
+//! show_opencode_icon/show_cursor_icon/show_grok_icon/show_copilot_icon
+//! (booleans, default true; refined by the show_provider_icon master),
 //! monitor_device (null for automatic/primary selection, or a device string
 //! present in state.monitors).
 //! Actions: refresh, update, uninstall, repository, exit, recommended,
@@ -139,6 +143,18 @@ pub enum Key {
     FontSize,
     ClaudeAccent,
     CodexAccent,
+    AntigravityAccent,
+    OpencodeAccent,
+    CursorAccent,
+    GrokAccent,
+    CopilotAccent,
+    ShowClaudeIcon,
+    ShowCodexIcon,
+    ShowAntigravityIcon,
+    ShowOpencodeIcon,
+    ShowCursorIcon,
+    ShowGrokIcon,
+    ShowCopilotIcon,
     MonitorDevice,
     AnchorLeft,
     SettingsPaneOpen,

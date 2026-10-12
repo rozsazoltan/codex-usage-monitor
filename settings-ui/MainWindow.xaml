@@ -49,7 +49,7 @@
                     <TextBlock Text="Changes take effect after you save them." FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}" Margin="2,4,0,0" TextWrapping="Wrap" />
                 </StackPanel>
             </ScrollViewer>
-            <Grid x:Name="StickyPreviewHost" VerticalAlignment="Top" HorizontalAlignment="Stretch" Margin="40,12,40,0" Visibility="Collapsed" />
+            <Grid x:Name="StickyPreviewHost" VerticalAlignment="Top" HorizontalAlignment="Stretch" Margin="40,0,40,0" Visibility="Collapsed" />
             <InfoBar x:Name="MessageBar" VerticalAlignment="Bottom" HorizontalAlignment="Right" MaxWidth="560" Margin="24,0,24,18" IsOpen="False" IsClosable="True" Severity="Informational" Background="{ThemeResource SolidBackgroundFillColorBaseBrush}" Foreground="{ThemeResource TextFillColorPrimaryBrush}" AutomationProperties.Name="Settings feedback" AutomationProperties.AutomationId="SettingsFeedback" AutomationProperties.LiveSetting="Polite" />
             <Border x:Name="SaveBar" VerticalAlignment="Bottom" HorizontalAlignment="Right" Margin="24,0,24,18" Visibility="Collapsed"
                     Background="{ThemeResource SolidBackgroundFillColorBaseBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="16,8,8,8"

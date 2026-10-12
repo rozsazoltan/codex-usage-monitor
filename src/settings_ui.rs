@@ -132,6 +132,7 @@ pub enum Key {
     ShowClaudeCode,
     ShowCodex,
     ShowAntigravity,
+    #[serde(rename = "show_opencode")]
     ShowOpenCode,
     ShowCursor,
     ShowGrok,
@@ -980,6 +981,10 @@ mod tests {
         .is_ok());
         assert!(parse_request(
             br#"{"v":1,"id":3,"op":"set_batch","changes":[{"key":"settings_pane_open","value":false}]}"#
+        )
+        .is_ok());
+        assert!(parse_request(
+            br#"{"v":1,"id":4,"op":"set_batch","changes":[{"key":"show_opencode","value":true},{"key":"show_cursor","value":false},{"key":"show_grok","value":false},{"key":"show_copilot","value":false}]}"#
         )
         .is_ok());
         assert!(parse_request(br#"{"v":1,"id":1,"op":"persist"}"#).is_ok());

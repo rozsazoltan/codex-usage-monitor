@@ -1,26 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 1024 1024" fill="none">
-  <defs>
-    <linearGradient id="meter" x1="120" y1="120" x2="904" y2="904" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#31D6C3"/>
-      <stop offset="0.52" stop-color="#438FFF"/>
-      <stop offset="1" stop-color="#8D76FF"/>
-    </linearGradient>
-  </defs>
-
-  <g transform="translate(122.88 122.88) scale(0.76)">
-    <!-- Three restrained scale marks sit in the open end of the quota arc. -->
-    <g stroke="#C7DFFF" stroke-linecap="round">
-      <path d="M 341 66 L 329 35" stroke-width="15"/>
-      <path d="M 512 64 L 512 28" stroke-width="15"/>
-      <path d="M 683 66 L 695 35" stroke-width="15"/>
-    </g>
-
-    <path d="M 737 152 A 424 424 0 1 1 287 152" stroke="url(#meter)" stroke-width="96" stroke-linecap="round"/>
-
-    <rect x="304" y="500" width="96" height="224" rx="48" fill="url(#meter)"/>
-    <rect x="464" y="402" width="96" height="322" rx="48" fill="url(#meter)"/>
-    <rect x="624" y="304" width="96" height="420" rx="48" fill="url(#meter)"/>
-
-    <circle cx="737" cy="152" r="34" fill="#FFC65A" stroke="#FFFFFF" stroke-width="10"/>
-  </g>
+  <rect x="80" y="80" width="864" height="864" rx="224" fill="#272725"/>
+  <path d="M 402 748 H 622 Q 658 748 658 712 V 492 H 366 V 712 Q 366 748 402 748 Z" fill="#F1EFE8"/>
+  <rect x="330" y="240" width="364" height="544" rx="72" stroke="#F1EFE8" stroke-width="72"/>
+  <path d="M 328 356 H 366 M 328 420 H 366 M 328 468 H 366" stroke="#272725" stroke-width="28" stroke-linecap="round"/>
 </svg>

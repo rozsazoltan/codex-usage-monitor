@@ -3,98 +3,77 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
 $script:CanvasSize = 1024.0
-$script:ArtworkScale = 0.76
-$script:Palette = @(
-    [System.Drawing.ColorTranslator]::FromHtml('#31D6C3'),
-    [System.Drawing.ColorTranslator]::FromHtml('#438FFF'),
-    [System.Drawing.ColorTranslator]::FromHtml('#8D76FF')
-)
-
-function New-MeterBrush {
-    $brush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
-        [System.Drawing.PointF]::new(120, 120),
-        [System.Drawing.PointF]::new(904, 904),
-        $script:Palette[0],
-        $script:Palette[2]
-    )
-    $blend = [System.Drawing.Drawing2D.ColorBlend]::new(3)
-    $blend.Colors = $script:Palette
-    $blend.Positions = [single[]]@(0, 0.52, 1)
-    $brush.InterpolationColors = $blend
-    return $brush
-}
-
-function Add-RoundedBar {
-    param(
-        [System.Drawing.Graphics]$Graphics,
-        [System.Drawing.Brush]$Brush,
-        [single]$X,
-        [single]$Y,
-        [single]$Width,
-        [single]$Height
-    )
-
-    $radius = $Width / 2
-    $path = [System.Drawing.Drawing2D.GraphicsPath]::new()
-    $path.AddArc($X, $Y, $Width, $Width, 180, 90)
-    $path.AddArc($X, $Y, $Width, $Width, 270, 90)
-    $path.AddLine($X + $Width, $Y + $radius, $X + $Width, $Y + $Height - $radius)
-    $path.AddArc($X, $Y + $Height - $Width, $Width, $Width, 0, 90)
-    $path.AddArc($X, $Y + $Height - $Width, $Width, $Width, 90, 90)
-    $path.CloseFigure()
-    $Graphics.FillPath($Brush, $path)
-    $path.Dispose()
-}
+$script:Supersample = 4
 
 function New-IconBitmap {
     param([int]$Size)
 
-    $bitmap = [System.Drawing.Bitmap]::new($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $renderSize = $Size * $script:Supersample
+    $renderBitmap = [System.Drawing.Bitmap]::new($renderSize, $renderSize, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $graphics = [System.Drawing.Graphics]::FromImage($renderBitmap)
     $graphics.Clear([System.Drawing.Color]::Transparent)
     $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $graphics.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceOver
     $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
     $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
     $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-    $scale = $Size / $script:CanvasSize * $script:ArtworkScale
-    $offset = ($Size - ($script:CanvasSize * $scale)) / 2
-    $transform = [System.Drawing.Drawing2D.Matrix]::new($scale, 0, 0, $scale, $offset, $offset)
+    $scale = $renderSize / $script:CanvasSize
+    $transform = [System.Drawing.Drawing2D.Matrix]::new($scale, 0, 0, $scale, 0, 0)
     $graphics.Transform = $transform
     $transform.Dispose()
 
-    $tickPen = [System.Drawing.Pen]::new([System.Drawing.ColorTranslator]::FromHtml('#C7DFFF'), 15)
+    $background = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml('#272725'))
+    $backgroundPath = [System.Drawing.Drawing2D.GraphicsPath]::new()
+    $backgroundPath.AddArc(80, 80, 448, 448, 180, 90)
+    $backgroundPath.AddArc(496, 80, 448, 448, 270, 90)
+    $backgroundPath.AddArc(496, 496, 448, 448, 0, 90)
+    $backgroundPath.AddArc(80, 496, 448, 448, 90, 90)
+    $backgroundPath.CloseFigure()
+    $graphics.FillPath($background, $backgroundPath)
+
+    $usageBrush = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml('#F1EFE8'))
+    $usagePath = [System.Drawing.Drawing2D.GraphicsPath]::new()
+    $usagePath.AddLine(366, 492, 658, 492)
+    $usagePath.AddLine(658, 492, 658, 712)
+    $usagePath.AddArc(586, 676, 72, 72, 0, 90)
+    $usagePath.AddLine(622, 748, 402, 748)
+    $usagePath.AddArc(366, 676, 72, 72, 90, 90)
+    $usagePath.CloseFigure()
+    $graphics.FillPath($usageBrush, $usagePath)
+
+    $framePath = [System.Drawing.Drawing2D.GraphicsPath]::new()
+    $framePath.AddArc(330, 240, 144, 144, 180, 90)
+    $framePath.AddArc(550, 240, 144, 144, 270, 90)
+    $framePath.AddArc(550, 640, 144, 144, 0, 90)
+    $framePath.AddArc(330, 640, 144, 144, 90, 90)
+    $framePath.CloseFigure()
+    $framePen = [System.Drawing.Pen]::new([System.Drawing.ColorTranslator]::FromHtml('#F1EFE8'), 72)
+    $graphics.DrawPath($framePen, $framePath)
+    $tickPen = [System.Drawing.Pen]::new([System.Drawing.ColorTranslator]::FromHtml('#272725'), 28)
     $tickPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
     $tickPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-    foreach ($tick in @(
-        @{ X1 = 341; Y1 = 66; X2 = 329; Y2 = 35 },
-        @{ X1 = 512; Y1 = 64; X2 = 512; Y2 = 28 },
-        @{ X1 = 683; Y1 = 66; X2 = 695; Y2 = 35 }
-    )) {
-        $graphics.DrawLine($tickPen, $tick.X1, $tick.Y1, $tick.X2, $tick.Y2)
+    foreach ($tickY in @(356, 420, 468)) {
+        $graphics.DrawLine($tickPen, 328, $tickY, 366, $tickY)
     }
+
+    $backgroundPath.Dispose()
+    $background.Dispose()
+    $usageBrush.Dispose()
+    $usagePath.Dispose()
+    $framePath.Dispose()
+    $framePen.Dispose()
     $tickPen.Dispose()
-
-    $meterBrush = New-MeterBrush
-    $arcPen = [System.Drawing.Pen]::new($meterBrush, 96)
-    $arcPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $arcPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $graphics.DrawArc($arcPen, 88, 88, 848, 848, -58, 296)
-
-    Add-RoundedBar $graphics $meterBrush 304 500 96 224
-    Add-RoundedBar $graphics $meterBrush 464 402 96 322
-    Add-RoundedBar $graphics $meterBrush 624 304 96 420
-
-    $dotFill = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml('#FFC65A'))
-    $dotOutline = [System.Drawing.Pen]::new([System.Drawing.Color]::White, 10)
-    $graphics.FillEllipse($dotFill, 703, 118, 68, 68)
-    $graphics.DrawEllipse($dotOutline, 703, 118, 68, 68)
-
-    $dotOutline.Dispose()
-    $dotFill.Dispose()
-    $arcPen.Dispose()
-    $meterBrush.Dispose()
     $graphics.Dispose()
+
+    $bitmap = [System.Drawing.Bitmap]::new($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $downsample = [System.Drawing.Graphics]::FromImage($bitmap)
+    $downsample.Clear([System.Drawing.Color]::Transparent)
+    $downsample.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $downsample.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+    $downsample.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+    $downsample.DrawImage($renderBitmap, 0, 0, $Size, $Size)
+    $downsample.Dispose()
+    $renderBitmap.Dispose()
     return $bitmap
 }
 

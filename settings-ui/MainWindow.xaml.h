@@ -29,6 +29,9 @@ namespace winrt::SettingsUI::implementation
         void ContinueDeferredWork();
         void ShowCloseSaveFailureDialog();
         void CompleteCloseSaveDecision(Microsoft::UI::Xaml::Controls::ContentDialogResult result, bool completed);
+        void CloseIfOpen();
+        void OnWindowClosed();
+        void RevokeWindowEvents();
         void SyncPaneState();
         void SetColorDraft(std::wstring const& key, std::optional<std::wstring> draft);
         void ClearResetColorDraftsIfUnchanged(uint64_t claudeRevision, uint64_t codexRevision);
@@ -90,6 +93,8 @@ namespace winrt::SettingsUI::implementation
         bool closeSaveDecisionDialogOpen_{};
         bool closeWithoutSavingApproved_{};
         bool closingFromParent_{};
+        bool closed_{};
+        bool closeCallInProgress_{};
         bool debounceElapsed_{};
         bool settingsActionInFlight_{};
         bool settingsRefreshPending_{};
@@ -114,8 +119,11 @@ namespace winrt::SettingsUI::implementation
         std::atomic<HANDLE> pipeHandle_{ INVALID_HANDLE_VALUE };
         HWND hwnd_{};
         HICON windowIcon_{};
+        Microsoft::UI::Windowing::AppWindow appWindow_{ nullptr };
+        Microsoft::UI::Xaml::Controls::NavigationView navigationView_{ nullptr };
         winrt::Microsoft::UI::Xaml::Window noticesWindow_{ nullptr };
         winrt::Microsoft::UI::Xaml::XamlRoot xamlRoot_{ nullptr };
+        winrt::event_token windowClosedToken_{};
         winrt::event_token appWindowChangedToken_{};
         winrt::event_token xamlRootChangedToken_{};
         winrt::event_token navigationLoadedToken_{};

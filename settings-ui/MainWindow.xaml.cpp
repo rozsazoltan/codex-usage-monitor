@@ -219,14 +219,27 @@ namespace winrt::SettingsUI::implementation
     {
         InitializeComponent();
         dispatcher_ = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+        appWindow_ = AppWindow();
+        navigationView_ = Navigation();
+        auto weak = get_weak();
         debounceTimer_ = dispatcher_.CreateTimer();
         debounceTimer_.Interval(std::chrono::seconds(4));
         debounceTimer_.IsRepeating(false);
-        debounceTimer_.Tick([this](auto const&, auto const&) { debounceElapsed_ = true; SendNextMutation(); });
+        debounceTimer_.Tick([weak](auto const&, auto const&)
+        {
+            if (auto self = weak.get(); self && !self->closed_)
+            {
+                self->debounceElapsed_ = true;
+                self->SendNextMutation();
+            }
+        });
         messageTimer_ = dispatcher_.CreateTimer();
         messageTimer_.Interval(std::chrono::seconds(10));
         messageTimer_.IsRepeating(false);
-        messageTimer_.Tick([this](auto const&, auto const&) { MessageBar().IsOpen(false); });
+        messageTimer_.Tick([weak](auto const&, auto const&)
+        {
+            if (auto self = weak.get(); self && !self->closed_) self->MessageBar().IsOpen(false);
+        });
         Navigation().PaneOpened([this](auto const&, auto const&)
         {
             if (paneStateKnown_ && !hydrating_ && !Bool(L"settings_pane_open"))
@@ -240,29 +253,33 @@ namespace winrt::SettingsUI::implementation
         check_hresult(m_inner.as<::IWindowNative>()->get_WindowHandle(&hwnd_));
         windowIcon_ = LoadResourceIcon();
         ApplyWindowIcon(*this, windowIcon_);
+        windowClosedToken_ = Closed([weak](auto const&, auto const&)
+        {
+            if (auto self = weak.get()) self->OnWindowClosed();
+        });
         ExtendsContentIntoTitleBar(true);
         SetTitleBar(TitleBarDragRegion());
-        AppWindow().TitleBar().IconShowOptions(Microsoft::UI::Windowing::IconShowOptions::HideIconAndSystemMenu);
+        appWindow_.TitleBar().IconShowOptions(Microsoft::UI::Windowing::IconShowOptions::HideIconAndSystemMenu);
         UpdateTitleBarLayout();
-        appWindowChangedToken_ = AppWindow().Changed([this](auto const&, auto const& args)
+        appWindowChangedToken_ = appWindow_.Changed([this](auto const&, auto const& args)
         {
             if (args.DidPositionChange() || args.DidSizeChange()) UpdateTitleBarLayout();
         });
-        navigationLoadedToken_ = Navigation().Loaded([this](auto const& sender, auto const&)
+        navigationLoadedToken_ = navigationView_.Loaded([this](auto const& sender, auto const&)
         {
             xamlRoot_ = sender.as<NavigationView>().XamlRoot();
             if (xamlRoot_)
                 xamlRootChangedToken_ = xamlRoot_.Changed([this](auto const&, auto const&) { UpdateTitleBarLayout(); });
             UpdateTitleBarLayout();
         });
-        closingToken_ = AppWindow().Closing([this](auto const& sender, auto const& args) { OnWindowClosing(sender, args); });
+        closingToken_ = appWindow_.Closing([this](auto const& sender, auto const& args) { OnWindowClosing(sender, args); });
         MONITORINFO monitor{ sizeof(monitor) };
         if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor))
         {
             const auto dpi = GetDpiForWindow(hwnd_);
             const auto width = std::min<int>(MulDiv(1080, dpi, 96), monitor.rcWork.right - monitor.rcWork.left);
             const auto height = std::min<int>(MulDiv(760, dpi, 96), monitor.rcWork.bottom - monitor.rcWork.top);
-            AppWindow().MoveAndResize({ monitor.rcWork.left + (monitor.rcWork.right - monitor.rcWork.left - width) / 2,
+            appWindow_.MoveAndResize({ monitor.rcWork.left + (monitor.rcWork.right - monitor.rcWork.left - width) / 2,
                 monitor.rcWork.top + (monitor.rcWork.bottom - monitor.rcWork.top - height) / 2, width, height });
         }
         HIGHCONTRASTW contrast{ sizeof(contrast) };
@@ -307,9 +324,7 @@ namespace winrt::SettingsUI::implementation
 
     MainWindow::~MainWindow()
     {
-        if (appWindowChangedToken_) AppWindow().Changed(appWindowChangedToken_);
-        if (navigationLoadedToken_) Navigation().Loaded(navigationLoadedToken_);
-        if (xamlRoot_ && xamlRootChangedToken_) xamlRoot_.Changed(xamlRootChangedToken_);
+        RevokeWindowEvents();
         if (closeSaveFailureDialog_)
         {
             closeSaveFailureDialog_.Hide();
@@ -329,18 +344,80 @@ namespace winrt::SettingsUI::implementation
         if (windowIcon_) DestroyIcon(windowIcon_);
     }
 
+    void MainWindow::RevokeWindowEvents()
+    {
+        if (appWindow_ && appWindowChangedToken_) appWindow_.Changed(appWindowChangedToken_);
+        appWindowChangedToken_ = {};
+        if (appWindow_ && closingToken_) appWindow_.Closing(closingToken_);
+        closingToken_ = {};
+        if (navigationView_ && navigationLoadedToken_) navigationView_.Loaded(navigationLoadedToken_);
+        navigationLoadedToken_ = {};
+        if (xamlRoot_ && xamlRootChangedToken_) xamlRoot_.Changed(xamlRootChangedToken_);
+        xamlRootChangedToken_ = {};
+        xamlRoot_ = nullptr;
+        if (windowClosedToken_) Closed(windowClosedToken_);
+        windowClosedToken_ = {};
+        appWindow_ = nullptr;
+        navigationView_ = nullptr;
+    }
+
+    void MainWindow::OnWindowClosed()
+    {
+        if (closed_) return;
+        closed_ = true;
+
+        stopping_.store(true);
+        requestsChanged_.notify_all();
+        const auto pipe = pipeHandle_.load();
+        if (pipe != INVALID_HANDLE_VALUE) CancelIoEx(pipe, nullptr);
+        if (messageTimer_) messageTimer_.Stop();
+        if (debounceTimer_) debounceTimer_.Stop();
+        RevokeWindowEvents();
+
+        if (closeSaveFailureDialog_)
+        {
+            closeSaveFailureDialog_.Hide();
+            closeSaveFailureDialog_ = nullptr;
+            closeSaveDecisionDialogOpen_ = false;
+        }
+        if (noticesWindow_)
+        {
+            auto window = noticesWindow_;
+            noticesWindow_ = nullptr;
+            window.Close();
+        }
+    }
+
+    void MainWindow::CloseIfOpen()
+    {
+        if (closed_ || closeCallInProgress_) return;
+        closeCallInProgress_ = true;
+        struct CloseCallReset
+        {
+            bool& inProgress;
+            ~CloseCallReset() { inProgress = false; }
+        } reset{ closeCallInProgress_ };
+        Close();
+    }
+
     void MainWindow::InitializePipe()
     {
         auto get = Request(L"get"); inFlight_ = nextId_++; initialGetPending_ = true;
         get.Insert(L"id", JsonValue::CreateNumberValue(inFlight_));
         const auto initialRequest = Utf8(get.Stringify().c_str());
-        ioThread_ = std::thread([this, initialRequest]()
+        auto weak = get_weak();
+        auto dispatcher = dispatcher_;
+        ioThread_ = std::thread([this, initialRequest, weak, dispatcher]()
         {
             try { winrt::init_apartment(winrt::apartment_type::multi_threaded); }
             catch (...)
             {
                 stopping_ = true;
-                dispatcher_.TryEnqueue([this]() { ShowMessage(L"The settings connection could not initialize.", true); });
+                dispatcher.TryEnqueue([weak]()
+                {
+                    if (auto self = weak.get(); self && !self->closed_)
+                        self->ShowMessage(L"The settings connection could not initialize.", true);
+                });
                 return;
             }
             struct ApartmentCleanup { ~ApartmentCleanup() { winrt::uninit_apartment(); } } apartmentCleanup;
@@ -354,13 +431,22 @@ namespace winrt::SettingsUI::implementation
             }
             if (pipe == INVALID_HANDLE_VALUE)
             {
-                dispatcher_.TryEnqueue([this]() { ShowMessage(L"Could not connect to Codex Usage. Close this window and try again from the widget.", true); }); return;
+                dispatcher.TryEnqueue([weak]()
+                {
+                    if (auto self = weak.get(); self && !self->closed_)
+                        self->ShowMessage(L"Could not connect to Codex Usage. Close this window and try again from the widget.", true);
+                });
+                return;
             }
             ULONG serverPid = 0;
             if (!GetNamedPipeServerProcessId(pipe, &serverPid) || !parentPid_ || serverPid != parentPid_)
             {
                 CloseHandle(pipe);
-                dispatcher_.TryEnqueue([this]() { ShowMessage(L"The settings connection could not be verified. Reopen settings from the widget.", true); });
+                dispatcher.TryEnqueue([weak]()
+                {
+                    if (auto self = weak.get(); self && !self->closed_)
+                        self->ShowMessage(L"The settings connection could not be verified. Reopen settings from the widget.", true);
+                });
                 stopping_ = true; return;
             }
             pipeHandle_ = pipe;
@@ -385,8 +471,13 @@ namespace winrt::SettingsUI::implementation
             std::array<uint8_t, 4> initialPrefix{ static_cast<uint8_t>(initialLength), static_cast<uint8_t>(initialLength >> 8), static_cast<uint8_t>(initialLength >> 16), static_cast<uint8_t>(initialLength >> 24) };
             if (!writeAll(initialPrefix.data(), 4) || !writeAll(initialRequest.data(), initialLength))
             {
+                pipeHandle_ = INVALID_HANDLE_VALUE;
                 CloseHandle(pipe);
-                dispatcher_.TryEnqueue([this]() { ShowMessage(L"The first settings request could not be sent. Reopen settings from the widget.", true); });
+                dispatcher.TryEnqueue([weak]()
+                {
+                    if (auto self = weak.get(); self && !self->closed_)
+                        self->ShowMessage(L"The first settings request could not be sent. Reopen settings from the widget.", true);
+                });
                 stopping_ = true; return;
             }
             auto readExact = [pipe](void* data, DWORD size)
@@ -437,13 +528,20 @@ namespace winrt::SettingsUI::implementation
                 try
                 {
                     auto message = JsonObject::Parse(Wide(body));
-                    dispatcher_.TryEnqueue([this, message]() { Receive(message); });
+                    dispatcher.TryEnqueue([weak, message]()
+                    {
+                        if (auto self = weak.get(); self && !self->closed_) self->Receive(message);
+                    });
                 }
                 catch (...) { connected = false; }
             }
             stopping_.store(true); requestsChanged_.notify_all(); CancelIoEx(pipe, nullptr); writer.join();
-            CloseHandle(pipe); pipeHandle_ = INVALID_HANDLE_VALUE;
-            dispatcher_.TryEnqueue([this]() { if (m_inner) Close(); });
+            pipeHandle_ = INVALID_HANDLE_VALUE;
+            CloseHandle(pipe);
+            dispatcher.TryEnqueue([weak]()
+            {
+                if (auto self = weak.get(); self && !self->closed_) self->CloseIfOpen();
+            });
         });
     }
 
@@ -570,7 +668,7 @@ namespace winrt::SettingsUI::implementation
             closeSaveDecisionPending_ = false;
             closeWithoutSavingApproved_ = false;
             closingFromParent_ = true;
-            Close();
+            CloseIfOpen();
             return;
         }
         if (deferredAction_ && !persistNeeded_ && !HasPendingChanges() && inFlight_ == 0)
@@ -645,6 +743,7 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::CompleteCloseSaveDecision(ContentDialogResult result, bool completed)
     {
+        if (closed_) return;
         closeSaveFailureDialog_ = nullptr;
         closeSaveDecisionDialogOpen_ = false;
         if (!completed)
@@ -701,10 +800,11 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::Receive(JsonObject const& message)
     {
+        if (closed_) return;
         if (message.HasKey(L"event"))
         {
             auto event = message.GetNamedString(L"event", L"");
-            if (event == L"shutdown") { stopping_ = true; closingFromParent_ = true; Close(); return; }
+            if (event == L"shutdown") { stopping_ = true; closingFromParent_ = true; CloseIfOpen(); return; }
             if (event == L"activate")
             {
                 auto target = std::wstring(message.GetNamedString(L"page", L"general").c_str());

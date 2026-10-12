@@ -87,6 +87,43 @@ Keep these files together. This is a folder deployment, not a standalone EXE.
 The executable statically links its C++ CRT; the shared Windows App Runtime has
 its own prerequisites. Shared runtime installation size is not included above.
 
+## Runtime smoke test
+
+On an interactive Windows desktop, run from the repository root after publishing:
+
+```powershell
+pwsh -NoProfile -File scripts\tests\settings-ui.smoke.ps1
+# Test a different coherent payload without building or republishing it:
+pwsh -NoProfile -File scripts\tests\settings-ui.smoke.ps1 -CompanionDirectory target\settings-portable-build
+```
+
+The PowerShell 7.2+ smoke client hosts a private current-user named pipe in its
+own process and supplies a synthetic snapshot. It checks the initial `get`, a
+visible HWND, all five startup page routes, UI Automation navigation across all
+five pages, and exit code 0 after a shutdown event, pipe disconnect, and ordinary
+window close. The client uses Windows' .NET Framework UI Automation assemblies;
+this does not add a .NET runtime requirement to the native companion.
+
+The companion runs from an unrelated temporary working directory. Test files
+and child diagnostic logs are isolated in a unique directory under
+`%TEMP%\opencode` by default (`-TemporaryDirectory` overrides the parent).
+The test cleans only its own files and processes. It does not use the widget,
+read credentials, change real settings, install a runtime, or invoke update,
+uninstall, reset, or provider actions. A failing check exits nonzero. This is a
+companion smoke test, not end-to-end validation of the Rust widget.
+
+If a development Settings launch exits before connecting, check which payload
+the widget actually uses. Debug builds without embedded settings use
+`settings-ui\bin\portable`; `scripts\build-release.ps1` publishes a separate
+`target\settings-portable-build` copy and does not refresh that developer folder.
+Rebuild and publish the complete five-file payload rather than copying individual
+files. A mixed EXE/XBF/PRI can fail XAML connection-ID binding with
+`E_NOINTERFACE` (`0x80004002`) and still exit with code 0, without an Application
+Error/WER crash record. Startup diagnostics, when emitted by the companion, are
+written to `%LOCALAPPDATA%\CodexUsage-SettingsUI-startup.log`, with a `%TEMP%`
+fallback. A settings window that opens successfully but crashes on close is a
+separate lifecycle failure; the smoke test checks that path explicitly.
+
 ## Observed validation (2026-10-10)
 
 - Full restore and clean Release x64 rebuild succeeded: **0 warnings, 0 errors**.

@@ -20,4 +20,8 @@ pub struct AppUsageData {
     pub claude_code: Option<UsageData>,
     pub codex: Option<UsageData>,
     pub antigravity: Option<UsageData>,
+    pub opencode: Option<UsageData>,
+    pub cursor: Option<UsageData>,
+    pub grok: Option<UsageData>,
+    pub copilot: Option<UsageData>,
 }

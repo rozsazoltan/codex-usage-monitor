@@ -33,7 +33,7 @@
 //!
 //! Set keys (snake_case): language ("system" or supported language code),
 //! startup, widget_visible, show_tray_icon, show_provider_icons,
-//! show_claude_code, show_codex, show_antigravity,
+//! show_claude_code, show_codex, show_antigravity, show_opencode, show_cursor, show_grok,
 //! show_session_window, show_weekly_window, adaptive_refresh, anchor_left,
 //! settings_pane_open (booleans); poll_interval_ms (60000..=3600000 integer),
 //! show_provider_icon (boolean, legacy show_provider_icons alias), show_percentage,
@@ -84,7 +84,7 @@ use std::time::{Duration, Instant};
 pub const WM_SETTINGS: u32 = 0x8000 + 20;
 const MAX_FRAME: usize = 65_536;
 const MAX_RESPONSE_FRAME: usize = 2 * 1024 * 1024;
-pub const MAX_BATCH_CHANGES: usize = 20;
+pub const MAX_BATCH_CHANGES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +132,10 @@ pub enum Key {
     ShowClaudeCode,
     ShowCodex,
     ShowAntigravity,
+    ShowOpenCode,
+    ShowCursor,
+    ShowGrok,
+    ShowCopilot,
     ShowSessionWindow,
     ShowWeeklyWindow,
     PollIntervalMs,

@@ -1689,6 +1689,10 @@ namespace winrt::SettingsUI::implementation
         add(L"show_claude_code",L"Claude Code",L"Monitor usage from your Claude CLI account.",Bool(L"show_claude_code"),!available);
         add(L"show_codex",L"Codex",L"Monitor your Codex account.",Bool(L"show_codex"),false);
         add(L"show_antigravity",L"Antigravity",L"Monitor your Antigravity account.",Bool(L"show_antigravity"),false);
+        add(L"show_opencode",L"OpenCode",L"Monitor your OpenCode Go usage.",Bool(L"show_opencode"),false);
+        add(L"show_cursor",L"Cursor",L"Monitor your Cursor usage.",Bool(L"show_cursor"),false);
+        add(L"show_grok",L"Grok",L"Monitor your Grok usage.",Bool(L"show_grok"),false);
+        add(L"show_copilot",L"Copilot",L"Monitor your GitHub Copilot usage.",Bool(L"show_copilot"),false);
         auto note=Label(L"At least one provider must stay enabled.",12);note.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());p.Children().Append(note);providers.Child(p);PageHost().Children().Append(providers);
         auto widgetCard = Card(); auto widgetSettings = StackPanel(); widgetSettings.Spacing(14);
         widgetSettings.Children().Append(Label(L"Widget contents", 19));

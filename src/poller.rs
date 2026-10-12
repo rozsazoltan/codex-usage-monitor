@@ -305,6 +305,7 @@ fn cli_refresh_token(source: &CredentialSource) {
     match source {
         CredentialSource::Windows(_) => cli_refresh_windows_token(),
         CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
+        CredentialSource::File(_) => {}
     }
 }
 
@@ -605,6 +606,20 @@ fn all_known_credential_sources() -> Vec<CredentialSource> {
     for distro in list_wsl_distros() {
         sources.push(CredentialSource::Wsl { distro });
     }
+    // New-provider credential files are watched for changes (login, token
+    // refresh, logout) so polls react to them. They never participate in
+    // Claude credential parsing or rotation. Copilot credentials live in
+    // Windows Credential Manager and environment variables, neither of which
+    // is a watchable file, so Copilot stays unwatched.
+    for path in opencode_config_paths() {
+        sources.push(CredentialSource::File(path));
+    }
+    if let Some(path) = grok_auth_path() {
+        sources.push(CredentialSource::File(path));
+    }
+    if let Some(path) = cursor_state_db_path() {
+        sources.push(CredentialSource::File(path));
+    }
     sources
 }
 
@@ -628,11 +643,16 @@ fn credential_watch_signature(source: &CredentialSource) -> Option<String> {
     match source {
         CredentialSource::Windows(path) => Some(windows_credential_watch_signature(path)),
         CredentialSource::Wsl { distro } => wsl_credential_watch_signature(distro),
+        CredentialSource::File(path) => Some(file_credential_watch_signature(path)),
     }
 }
 
-fn windows_credential_watch_signature(path: &PathBuf) -> String {
-    let key = format!("win:{}", path.display());
+fn file_credential_watch_signature(path: &PathBuf) -> String {
+    path_watch_signature("file", path)
+}
+
+fn path_watch_signature(prefix: &str, path: &PathBuf) -> String {
+    let key = format!("{prefix}:{}", path.display());
     match std::fs::metadata(path) {
         Ok(metadata) => {
             let modified = metadata
@@ -645,6 +665,10 @@ fn windows_credential_watch_signature(path: &PathBuf) -> String {
         }
         Err(_) => format!("{key}|missing"),
     }
+}
+
+fn windows_credential_watch_signature(path: &PathBuf) -> String {
+    path_watch_signature("win", path)
 }
 
 fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
@@ -2269,7 +2293,13 @@ struct Credentials {
 #[derive(Clone, Debug)]
 enum CredentialSource {
     Windows(PathBuf),
-    Wsl { distro: String },
+    Wsl {
+        distro: String,
+    },
+    /// Plain credential/config file watched for changes only. Unlike the
+    /// Claude-specific variants above, `File` sources never participate in
+    /// Claude credential parsing, rotation, or CLI refresh.
+    File(PathBuf),
 }
 
 fn read_first_credentials() -> Option<Credentials> {
@@ -2315,6 +2345,7 @@ fn read_credentials_from_source(source: &CredentialSource) -> Option<Credentials
             parse_credentials(&content, source.clone())
         }
         CredentialSource::Wsl { distro } => read_wsl_credentials(distro),
+        CredentialSource::File(_) => None,
     }
 }
 
@@ -2464,6 +2495,7 @@ fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials>
                 }
             }
         }
+        CredentialSource::File(_) => {}
     }
 
     None

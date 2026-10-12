@@ -40,6 +40,10 @@ pub enum TrayIconKind {
     Claude,
     Codex,
     Antigravity,
+    OpenCode,
+    Cursor,
+    Grok,
+    Copilot,
 }
 
 pub struct TrayIconData {

@@ -78,10 +78,30 @@ struct AppState {
     antigravity_session_text: String,
     antigravity_weekly_percent: f64,
     antigravity_weekly_text: String,
+    opencode_session_percent: f64,
+    opencode_session_text: String,
+    opencode_weekly_percent: f64,
+    opencode_weekly_text: String,
+    cursor_session_percent: f64,
+    cursor_session_text: String,
+    cursor_weekly_percent: f64,
+    cursor_weekly_text: String,
+    grok_session_percent: f64,
+    grok_session_text: String,
+    grok_weekly_percent: f64,
+    grok_weekly_text: String,
+    copilot_session_percent: f64,
+    copilot_session_text: String,
+    copilot_weekly_percent: f64,
+    copilot_weekly_text: String,
     claude_code_available: bool,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_opencode: bool,
+    show_cursor: bool,
+    show_grok: bool,
+    show_copilot: bool,
     show_tray_icon: bool,
     show_provider_icons: bool,
     show_session_window: bool,
@@ -707,6 +727,14 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
+    #[serde(default = "default_show_new_provider")]
+    show_opencode: bool,
+    #[serde(default = "default_show_new_provider")]
+    show_cursor: bool,
+    #[serde(default = "default_show_new_provider")]
+    show_grok: bool,
+    #[serde(default = "default_show_new_provider")]
+    show_copilot: bool,
     #[serde(default = "default_show_usage_window")]
     show_session_window: bool,
     #[serde(default = "default_show_usage_window")]
@@ -736,6 +764,10 @@ impl Default for SettingsFile {
             show_claude_code: false,
             show_codex: true,
             show_antigravity: false,
+            show_opencode: true,
+            show_cursor: true,
+            show_grok: true,
+            show_copilot: true,
             show_session_window: true,
             show_weekly_window: true,
             alert_threshold_percent: 0,
@@ -777,6 +809,10 @@ fn default_show_codex() -> bool {
 }
 
 fn default_show_antigravity() -> bool {
+    false
+}
+
+fn default_show_new_provider() -> bool {
     false
 }
 
@@ -856,7 +892,14 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     if !(POLL_1_MIN..=POLL_1_HOUR).contains(&settings.poll_interval_ms) {
         settings.poll_interval_ms = POLL_15_MIN;
     }
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
+    if !settings.show_claude_code
+        && !settings.show_codex
+        && !settings.show_antigravity
+        && !settings.show_opencode
+        && !settings.show_cursor
+        && !settings.show_grok
+        && !settings.show_copilot
+    {
         settings.show_codex = true;
     }
     if !settings.show_session_window && !settings.show_weekly_window {
@@ -918,6 +961,10 @@ fn persist_state_settings() -> Result<(), String> {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
+            show_opencode: s.show_opencode,
+            show_cursor: s.show_cursor,
+            show_grok: s.show_grok,
+            show_copilot: s.show_copilot,
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
             alert_threshold_percent: s.alert_threshold_percent,
@@ -1017,6 +1064,66 @@ fn collect_low_quota_alerts(state: &mut AppState, data: &AppUsageData) -> Vec<Qu
                 tray_icon::TrayIconKind::Antigravity,
                 "antigravity",
                 strings.antigravity_model,
+                usage,
+                strings,
+            );
+        }
+    }
+    if state.show_opencode {
+        if let Some(usage) = data.opencode.as_ref() {
+            append_provider_alerts(
+                &mut alerts,
+                &mut state.notified_quota_windows,
+                threshold,
+                state.language,
+                tray_icon::TrayIconKind::OpenCode,
+                "opencode",
+                strings.opencode_model,
+                usage,
+                strings,
+            );
+        }
+    }
+    if state.show_cursor {
+        if let Some(usage) = data.cursor.as_ref() {
+            append_provider_alerts(
+                &mut alerts,
+                &mut state.notified_quota_windows,
+                threshold,
+                state.language,
+                tray_icon::TrayIconKind::Cursor,
+                "cursor",
+                strings.cursor_model,
+                usage,
+                strings,
+            );
+        }
+    }
+    if state.show_grok {
+        if let Some(usage) = data.grok.as_ref() {
+            append_provider_alerts(
+                &mut alerts,
+                &mut state.notified_quota_windows,
+                threshold,
+                state.language,
+                tray_icon::TrayIconKind::Grok,
+                "grok",
+                strings.grok_model,
+                usage,
+                strings,
+            );
+        }
+    }
+    if state.show_copilot {
+        if let Some(usage) = data.copilot.as_ref() {
+            append_provider_alerts(
+                &mut alerts,
+                &mut state.notified_quota_windows,
+                threshold,
+                state.language,
+                tray_icon::TrayIconKind::Copilot,
+                "copilot",
+                strings.copilot_model,
                 usage,
                 strings,
             );
@@ -1148,6 +1255,42 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
                     s.show_weekly_window,
                 ));
             }
+            if s.show_opencode {
+                services.push(service_tooltip(
+                    strings.opencode_model,
+                    &s.opencode_session_text,
+                    &s.opencode_weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
+            }
+            if s.show_cursor {
+                services.push(service_tooltip(
+                    strings.cursor_model,
+                    &s.cursor_session_text,
+                    &s.cursor_weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
+            }
+            if s.show_grok {
+                services.push(service_tooltip(
+                    strings.grok_model,
+                    &s.grok_session_text,
+                    &s.grok_weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
+            }
+            if s.show_copilot {
+                services.push(service_tooltip(
+                    strings.copilot_model,
+                    &s.copilot_session_text,
+                    &s.copilot_weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
+            }
             Some(tray_icon::TrayIconData {
                 tooltip: if services.is_empty() {
                     strings.window_title.to_string()
@@ -1158,9 +1301,23 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
         }
         Some(s) => {
             let strings = s.language.strings();
-            let tooltip = match (s.show_claude_code, s.show_codex, s.show_antigravity) {
-                (false, true, false) => strings.codex_window_title,
-                (false, false, true) => strings.antigravity_window_title,
+            let tooltip = match (
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+                s.show_opencode,
+                s.show_cursor,
+                s.show_grok,
+                s.show_copilot,
+            ) {
+                (false, true, false, false, false, false, false) => strings.codex_window_title,
+                (false, false, true, false, false, false, false) => {
+                    strings.antigravity_window_title
+                }
+                (false, false, false, true, false, false, false) => strings.opencode_window_title,
+                (false, false, false, false, true, false, false) => strings.cursor_window_title,
+                (false, false, false, false, false, true, false) => strings.grok_window_title,
+                (false, false, false, false, false, false, true) => strings.copilot_window_title,
                 _ => strings.window_title,
             };
             Some(tray_icon::TrayIconData {
@@ -1813,6 +1970,94 @@ fn refresh_usage_texts(state: &mut AppState) {
         state.antigravity_session_text = label.to_string();
         state.antigravity_weekly_text = label.to_string();
     }
+
+    if let Some(opencode) = data.opencode.as_ref() {
+        state.opencode_session_text = poller::format_line(
+            &opencode.session,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Session,
+        );
+        state.opencode_weekly_text = poller::format_line(
+            &opencode.weekly,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Weekly,
+        );
+    } else if state.show_opencode {
+        let label = state.monitor.services[3]
+            .error
+            .map(|e| poll_error_display_label(e, state.language))
+            .unwrap_or("...");
+        state.opencode_session_text = label.to_string();
+        state.opencode_weekly_text = label.to_string();
+    }
+
+    if let Some(cursor) = data.cursor.as_ref() {
+        state.cursor_session_text = poller::format_line(
+            &cursor.session,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Session,
+        );
+        state.cursor_weekly_text = poller::format_line(
+            &cursor.weekly,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Weekly,
+        );
+    } else if state.show_cursor {
+        let label = state.monitor.services[4]
+            .error
+            .map(|e| poll_error_display_label(e, state.language))
+            .unwrap_or("...");
+        state.cursor_session_text = label.to_string();
+        state.cursor_weekly_text = label.to_string();
+    }
+
+    if let Some(grok) = data.grok.as_ref() {
+        state.grok_session_text = poller::format_line(
+            &grok.session,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Session,
+        );
+        state.grok_weekly_text = poller::format_line(
+            &grok.weekly,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Weekly,
+        );
+    } else if state.show_grok {
+        let label = state.monitor.services[5]
+            .error
+            .map(|e| poll_error_display_label(e, state.language))
+            .unwrap_or("...");
+        state.grok_session_text = label.to_string();
+        state.grok_weekly_text = label.to_string();
+    }
+
+    if let Some(copilot) = data.copilot.as_ref() {
+        state.copilot_session_text = poller::format_line(
+            &copilot.session,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Session,
+        );
+        state.copilot_weekly_text = poller::format_line(
+            &copilot.weekly,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Weekly,
+        );
+    } else if state.show_copilot {
+        let label = state.monitor.services[6]
+            .error
+            .map(|e| poll_error_display_label(e, state.language))
+            .unwrap_or("...");
+        state.copilot_session_text = label.to_string();
+        state.copilot_weekly_text = label.to_string();
+    }
     for (id, session, weekly) in [
         (0, &mut state.session_text, &mut state.weekly_text),
         (
@@ -1824,6 +2069,22 @@ fn refresh_usage_texts(state: &mut AppState) {
             2,
             &mut state.antigravity_session_text,
             &mut state.antigravity_weekly_text,
+        ),
+        (
+            3,
+            &mut state.opencode_session_text,
+            &mut state.opencode_weekly_text,
+        ),
+        (
+            4,
+            &mut state.cursor_session_text,
+            &mut state.cursor_weekly_text,
+        ),
+        (5, &mut state.grok_session_text, &mut state.grok_weekly_text),
+        (
+            6,
+            &mut state.copilot_session_text,
+            &mut state.copilot_weekly_text,
         ),
     ] {
         let stale = state.monitor.services[id].stale(SystemTime::now());
@@ -2422,8 +2683,23 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
     }
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
-    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
+fn active_model_count(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_opencode: bool,
+    show_cursor: bool,
+    show_grok: bool,
+    show_copilot: bool,
+) -> i32 {
+    (show_claude_code as i32
+        + show_codex as i32
+        + show_antigravity as i32
+        + show_opencode as i32
+        + show_cursor as i32
+        + show_grok as i32
+        + show_copilot as i32)
+        .max(1)
 }
 
 fn row_bar_segment_count(active_models: i32) -> i32 {
@@ -2569,7 +2845,15 @@ fn total_widget_width() -> i32 {
             .as_ref()
             .map(|s| {
                 (
-                    active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                    active_model_count(
+                        s.show_claude_code,
+                        s.show_codex,
+                        s.show_antigravity,
+                        s.show_opencode,
+                        s.show_cursor,
+                        s.show_grok,
+                        s.show_copilot,
+                    ),
                     s.language,
                     s.appearance,
                 )
@@ -2751,6 +3035,10 @@ pub fn run() {
             settings.show_claude_code,
             settings.show_codex,
             settings.show_antigravity,
+            settings.show_opencode,
+            settings.show_cursor,
+            settings.show_grok,
+            settings.show_copilot,
         );
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -2814,10 +3102,30 @@ pub fn run() {
                 antigravity_session_text: "--".to_string(),
                 antigravity_weekly_percent: 0.0,
                 antigravity_weekly_text: "--".to_string(),
+                opencode_session_percent: 0.0,
+                opencode_session_text: "--".to_string(),
+                opencode_weekly_percent: 0.0,
+                opencode_weekly_text: "--".to_string(),
+                cursor_session_percent: 0.0,
+                cursor_session_text: "--".to_string(),
+                cursor_weekly_percent: 0.0,
+                cursor_weekly_text: "--".to_string(),
+                grok_session_percent: 0.0,
+                grok_session_text: "--".to_string(),
+                grok_weekly_percent: 0.0,
+                grok_weekly_text: "--".to_string(),
+                copilot_session_percent: 0.0,
+                copilot_session_text: "--".to_string(),
+                copilot_weekly_percent: 0.0,
+                copilot_weekly_text: "--".to_string(),
                 claude_code_available,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
+                show_opencode: settings.show_opencode,
+                show_cursor: settings.show_cursor,
+                show_grok: settings.show_grok,
+                show_copilot: settings.show_copilot,
                 show_tray_icon: settings.show_tray_icon,
                 show_provider_icons: settings.show_provider_icons,
                 show_session_window: settings.show_session_window,
@@ -2832,6 +3140,10 @@ pub fn run() {
                         settings.show_claude_code,
                         settings.show_codex,
                         settings.show_antigravity,
+                        settings.show_opencode,
+                        settings.show_cursor,
+                        settings.show_grok,
+                        settings.show_copilot,
                     ],
                     Instant::now(),
                 ),
@@ -2976,7 +3288,15 @@ fn update_quota_tooltips() {
         let mut regions = Vec::new();
         if !s.dragging {
             let chinese = s.language == LanguageId::SimplifiedChinese;
-            let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
+            let count = active_model_count(
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+                s.show_opencode,
+                s.show_cursor,
+                s.show_grok,
+                s.show_copilot,
+            );
             let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
             let width = model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
             let mut left = sc(LEFT_DIVIDER_W)
@@ -3004,6 +3324,34 @@ fn update_quota_tooltips() {
                     "Antigravity",
                     &s.antigravity_session_text,
                     &s.antigravity_weekly_text,
+                ),
+                (
+                    3,
+                    s.show_opencode,
+                    "OpenCode",
+                    &s.opencode_session_text,
+                    &s.opencode_weekly_text,
+                ),
+                (
+                    4,
+                    s.show_cursor,
+                    "Cursor",
+                    &s.cursor_session_text,
+                    &s.cursor_weekly_text,
+                ),
+                (
+                    5,
+                    s.show_grok,
+                    "Grok",
+                    &s.grok_session_text,
+                    &s.grok_weekly_text,
+                ),
+                (
+                    6,
+                    s.show_copilot,
+                    "Copilot",
+                    &s.copilot_session_text,
+                    &s.copilot_weekly_text,
                 ),
             ] {
                 if !visible {
@@ -3067,9 +3415,29 @@ fn render_layered() {
         antigravity_session_text,
         antigravity_weekly_pct,
         antigravity_weekly_text,
+        opencode_session_pct,
+        opencode_session_text,
+        opencode_weekly_pct,
+        opencode_weekly_text,
+        cursor_session_pct,
+        cursor_session_text,
+        cursor_weekly_pct,
+        cursor_weekly_text,
+        grok_session_pct,
+        grok_session_text,
+        grok_weekly_pct,
+        grok_weekly_text,
+        copilot_session_pct,
+        copilot_session_text,
+        copilot_weekly_pct,
+        copilot_weekly_text,
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_opencode,
+        show_cursor,
+        show_grok,
+        show_copilot,
         show_provider_icons,
         show_session_window,
         show_weekly_window,
@@ -3095,9 +3463,29 @@ fn render_layered() {
                 s.antigravity_session_text.clone(),
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
+                s.opencode_session_percent,
+                s.opencode_session_text.clone(),
+                s.opencode_weekly_percent,
+                s.opencode_weekly_text.clone(),
+                s.cursor_session_percent,
+                s.cursor_session_text.clone(),
+                s.cursor_weekly_percent,
+                s.cursor_weekly_text.clone(),
+                s.grok_session_percent,
+                s.grok_session_text.clone(),
+                s.grok_weekly_percent,
+                s.grok_weekly_text.clone(),
+                s.copilot_session_percent,
+                s.copilot_session_text.clone(),
+                s.copilot_weekly_percent,
+                s.copilot_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_opencode,
+                s.show_cursor,
+                s.show_grok,
+                s.show_copilot,
                 s.show_provider_icons,
                 s.show_session_window,
                 s.show_weekly_window,
@@ -3133,6 +3521,10 @@ fn render_layered() {
         provider_icons::codex_color(appearance.is_dark(is_dark)),
     );
     let antigravity_accent = antigravity_accent_color();
+    let opencode_accent = custom_color(appearance.opencode_accent, opencode_accent_color());
+    let cursor_accent = custom_color(appearance.cursor_accent, cursor_accent_color());
+    let grok_accent = custom_color(appearance.grok_accent, grok_accent_color());
+    let copilot_accent = custom_color(appearance.copilot_accent, copilot_accent_color());
 
     unsafe {
         let screen_dc = GetDC(hwnd);
@@ -3191,14 +3583,38 @@ fn render_layered() {
             &antigravity_session_text,
             antigravity_weekly_pct,
             &antigravity_weekly_text,
+            opencode_session_pct,
+            &opencode_session_text,
+            opencode_weekly_pct,
+            &opencode_weekly_text,
+            cursor_session_pct,
+            &cursor_session_text,
+            cursor_weekly_pct,
+            &cursor_weekly_text,
+            grok_session_pct,
+            &grok_session_text,
+            grok_weekly_pct,
+            &grok_weekly_text,
+            copilot_session_pct,
+            &copilot_session_text,
+            copilot_weekly_pct,
+            &copilot_weekly_text,
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_opencode,
+            show_cursor,
+            show_grok,
+            show_copilot,
             show_provider_icons,
             show_session_window,
             show_weekly_window,
             &codex_accent,
             &antigravity_accent,
+            &opencode_accent,
+            &cursor_accent,
+            &grok_accent,
+            &copilot_accent,
         );
 
         // System mode blends with the taskbar. High contrast modes use a solid
@@ -3277,14 +3693,38 @@ fn paint_content(
     antigravity_session_text: &str,
     antigravity_weekly_pct: f64,
     antigravity_weekly_text: &str,
+    opencode_session_pct: f64,
+    opencode_session_text: &str,
+    opencode_weekly_pct: f64,
+    opencode_weekly_text: &str,
+    cursor_session_pct: f64,
+    cursor_session_text: &str,
+    cursor_weekly_pct: f64,
+    cursor_weekly_text: &str,
+    grok_session_pct: f64,
+    grok_session_text: &str,
+    grok_weekly_pct: f64,
+    grok_weekly_text: &str,
+    copilot_session_pct: f64,
+    copilot_session_text: &str,
+    copilot_weekly_pct: f64,
+    copilot_weekly_text: &str,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_opencode: bool,
+    show_cursor: bool,
+    show_grok: bool,
+    show_copilot: bool,
     _show_provider_icons: bool,
     show_session_window: bool,
     show_weekly_window: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    opencode_accent: &Color,
+    cursor_accent: &Color,
+    grok_accent: &Color,
+    copilot_accent: &Color,
 ) {
     unsafe {
         let is_dark = appearance.is_dark(is_dark);
@@ -3294,6 +3734,14 @@ fn paint_content(
         let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
         let antigravity_session_pct = usage_percent_for_display(language, antigravity_session_pct);
         let antigravity_weekly_pct = usage_percent_for_display(language, antigravity_weekly_pct);
+        let opencode_session_pct = usage_percent_for_display(language, opencode_session_pct);
+        let opencode_weekly_pct = usage_percent_for_display(language, opencode_weekly_pct);
+        let cursor_session_pct = usage_percent_for_display(language, cursor_session_pct);
+        let cursor_weekly_pct = usage_percent_for_display(language, cursor_weekly_pct);
+        let grok_session_pct = usage_percent_for_display(language, grok_session_pct);
+        let grok_weekly_pct = usage_percent_for_display(language, grok_weekly_pct);
+        let copilot_session_pct = usage_percent_for_display(language, copilot_session_pct);
+        let copilot_weekly_pct = usage_percent_for_display(language, copilot_weekly_pct);
         let (label_width, text_width) = usage_layout_widths(language, appearance);
 
         let client_rect = RECT {
@@ -3368,7 +3816,15 @@ fn paint_content(
         } else {
             single_row_y + (appearance.row_height() - icon_size) / 2
         };
-        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+        let active_models = active_model_count(
+            show_claude_code,
+            show_codex,
+            show_antigravity,
+            show_opencode,
+            show_cursor,
+            show_grok,
+            show_copilot,
+        );
         let model_width =
             model_usage_width(row_bar_segment_count(active_models), text_width, appearance)
                 + sc(MODEL_RIGHT_MARGIN);
@@ -3416,12 +3872,28 @@ fn paint_content(
                 codex_session_text,
                 antigravity_session_pct,
                 antigravity_session_text,
+                opencode_session_pct,
+                opencode_session_text,
+                cursor_session_pct,
+                cursor_session_text,
+                grok_session_pct,
+                grok_session_text,
+                copilot_session_pct,
+                copilot_session_text,
                 show_claude_code,
                 show_codex,
                 show_antigravity,
+                show_opencode,
+                show_cursor,
+                show_grok,
+                show_copilot,
                 accent,
                 codex_accent,
                 antigravity_accent,
+                opencode_accent,
+                cursor_accent,
+                grok_accent,
+                copilot_accent,
                 track,
                 label_width,
                 text_width,
@@ -3446,12 +3918,28 @@ fn paint_content(
                 codex_weekly_text,
                 antigravity_weekly_pct,
                 antigravity_weekly_text,
+                opencode_weekly_pct,
+                opencode_weekly_text,
+                cursor_weekly_pct,
+                cursor_weekly_text,
+                grok_weekly_pct,
+                grok_weekly_text,
+                copilot_weekly_pct,
+                copilot_weekly_text,
                 show_claude_code,
                 show_codex,
                 show_antigravity,
+                show_opencode,
+                show_cursor,
+                show_grok,
+                show_copilot,
                 accent,
                 codex_accent,
                 antigravity_accent,
+                opencode_accent,
+                cursor_accent,
+                grok_accent,
+                copilot_accent,
                 track,
                 label_width,
                 text_width,
@@ -3503,7 +3991,15 @@ fn request_poll(hwnd: SendHwnd, force: bool) {
     {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            let enabled = [s.show_claude_code, s.show_codex, s.show_antigravity];
+            let enabled = [
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+                s.show_opencode,
+                s.show_cursor,
+                s.show_grok,
+                s.show_copilot,
+            ];
             s.monitor.configure(enabled, Instant::now());
             if force {
                 s.monitor.force(Instant::now(), true);
@@ -3594,7 +4090,12 @@ fn complete_provider_poll(
             match job.id {
                 0 => fresh.claude_code = data,
                 1 => fresh.codex = data,
-                _ => fresh.antigravity = data,
+                2 => fresh.antigravity = data,
+                3 => fresh.opencode = data,
+                4 => fresh.cursor = data,
+                5 => fresh.grok = data,
+                6 => fresh.copilot = data,
+                _ => {}
             }
         }
         let alerts = collect_low_quota_alerts(s, &fresh);
@@ -3614,6 +4115,26 @@ fn complete_provider_poll(
                 cached.antigravity.as_ref(),
                 &mut s.antigravity_session_percent,
                 &mut s.antigravity_weekly_percent,
+            ),
+            (
+                cached.opencode.as_ref(),
+                &mut s.opencode_session_percent,
+                &mut s.opencode_weekly_percent,
+            ),
+            (
+                cached.cursor.as_ref(),
+                &mut s.cursor_session_percent,
+                &mut s.cursor_weekly_percent,
+            ),
+            (
+                cached.grok.as_ref(),
+                &mut s.grok_session_percent,
+                &mut s.grok_weekly_percent,
+            ),
+            (
+                cached.copilot.as_ref(),
+                &mut s.copilot_session_percent,
+                &mut s.copilot_weekly_percent,
             ),
         ] {
             *session = usage.map_or(0.0, |u| u.session.percentage);
@@ -3643,11 +4164,32 @@ fn complete_provider_poll(
                     strings.codex_token_expired_title,
                     strings.codex_token_expired_body,
                 ),
-                _ => (
+                2 => (
                     tray_icon::TrayIconKind::Antigravity,
                     strings.antigravity_token_expired_title,
                     strings.antigravity_token_expired_body,
                 ),
+                3 => (
+                    tray_icon::TrayIconKind::OpenCode,
+                    strings.opencode_token_expired_title,
+                    strings.opencode_token_expired_body,
+                ),
+                4 => (
+                    tray_icon::TrayIconKind::Cursor,
+                    strings.cursor_token_expired_title,
+                    strings.cursor_token_expired_body,
+                ),
+                5 => (
+                    tray_icon::TrayIconKind::Grok,
+                    strings.grok_token_expired_title,
+                    strings.grok_token_expired_body,
+                ),
+                6 => (
+                    tray_icon::TrayIconKind::Copilot,
+                    strings.copilot_token_expired_title,
+                    strings.copilot_token_expired_body,
+                ),
+                _ => (tray_icon::TrayIconKind::Copilot, "", ""),
             }
         });
         (alerts, notice)
@@ -4598,7 +5140,9 @@ fn settings_snapshot() -> serde_json::Value {
             "settings_pane_open":s.settings_pane_open,
             "show_tray_icon":s.show_tray_icon,"show_provider_icons":s.show_provider_icons,
             "show_claude_code":s.show_claude_code,"show_codex":s.show_codex,
-            "show_antigravity":s.show_antigravity,"show_session_window":s.show_session_window,
+            "show_antigravity":s.show_antigravity,"show_opencode":s.show_opencode,
+            "show_cursor":s.show_cursor,"show_grok":s.show_grok,
+            "show_copilot":s.show_copilot,"show_session_window":s.show_session_window,
             "show_weekly_window":s.show_weekly_window,"poll_interval_ms":s.poll_interval_ms,
             "adaptive_refresh":s.adaptive_refresh,"alert_threshold_percent":s.alert_threshold_percent,
             "palette":s.appearance.palette,"bar_style":s.appearance.bar_style,
@@ -4711,6 +5255,10 @@ fn widget_preview_image(
             candidate.show_claude_code,
             candidate.show_codex,
             candidate.show_antigravity,
+            candidate.show_opencode,
+            candidate.show_cursor,
+            candidate.show_grok,
+            candidate.show_copilot,
         ),
         language,
         appearance,
@@ -4730,6 +5278,10 @@ fn widget_preview_image(
         provider_icons::codex_color(appearance.is_dark(system_dark)),
     );
     let antigravity = antigravity_accent_color();
+    let opencode = custom_color(appearance.opencode_accent, opencode_accent_color());
+    let cursor = custom_color(appearance.cursor_accent, cursor_accent_color());
+    let grok = custom_color(appearance.grok_accent, grok_accent_color());
+    let copilot = custom_color(appearance.copilot_accent, copilot_accent_color());
     unsafe {
         let dc = CreateCompatibleDC(HDC::default());
         if dc.is_invalid() {
@@ -4790,14 +5342,38 @@ fn widget_preview_image(
             &session,
             42.0,
             &weekly,
+            18.0,
+            &session,
+            42.0,
+            &weekly,
+            18.0,
+            &session,
+            42.0,
+            &weekly,
+            18.0,
+            &session,
+            42.0,
+            &weekly,
+            18.0,
+            &session,
+            42.0,
+            &weekly,
             candidate.show_claude_code,
             candidate.show_codex,
             candidate.show_antigravity,
+            candidate.show_opencode,
+            candidate.show_cursor,
+            candidate.show_grok,
+            candidate.show_copilot,
             candidate.show_provider_icons,
             candidate.show_session_window,
             candidate.show_weekly_window,
             &codex,
             &antigravity,
+            &opencode,
+            &cursor,
+            &grok,
+            &copilot,
         );
         let _ = GdiFlush();
         // SAFETY: the selected DIB provides byte_count initialized bytes until
@@ -4981,6 +5557,10 @@ struct SettingsCandidate {
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_opencode: bool,
+    show_cursor: bool,
+    show_grok: bool,
+    show_copilot: bool,
     show_session_window: bool,
     show_weekly_window: bool,
     poll_interval_ms: u32,
@@ -5004,6 +5584,10 @@ impl SettingsCandidate {
             show_claude_code: settings.show_claude_code,
             show_codex: settings.show_codex,
             show_antigravity: settings.show_antigravity,
+            show_opencode: settings.show_opencode,
+            show_cursor: settings.show_cursor,
+            show_grok: settings.show_grok,
+            show_copilot: settings.show_copilot,
             show_session_window: settings.show_session_window,
             show_weekly_window: settings.show_weekly_window,
             poll_interval_ms: settings.poll_interval_ms,
@@ -5026,6 +5610,10 @@ impl SettingsCandidate {
             show_claude_code: state.show_claude_code,
             show_codex: state.show_codex,
             show_antigravity: state.show_antigravity,
+            show_opencode: state.show_opencode,
+            show_cursor: state.show_cursor,
+            show_grok: state.show_grok,
+            show_copilot: state.show_copilot,
             show_session_window: state.show_session_window,
             show_weekly_window: state.show_weekly_window,
             poll_interval_ms: state.poll_interval_ms,
@@ -5120,6 +5708,10 @@ fn validate_settings_changes(
             Key::ShowAntigravity => {
                 candidate.show_antigravity = setting_value(change.value.clone())?
             }
+            Key::ShowOpenCode => candidate.show_opencode = setting_value(change.value.clone())?,
+            Key::ShowCursor => candidate.show_cursor = setting_value(change.value.clone())?,
+            Key::ShowGrok => candidate.show_grok = setting_value(change.value.clone())?,
+            Key::ShowCopilot => candidate.show_copilot = setting_value(change.value.clone())?,
             Key::ShowSessionWindow => {
                 candidate.show_session_window = setting_value(change.value.clone())?
             }
@@ -5218,7 +5810,14 @@ fn validate_settings_changes(
             "At least one usage element must remain visible.",
         ));
     }
-    if !candidate.show_claude_code && !candidate.show_codex && !candidate.show_antigravity {
+    if !candidate.show_claude_code
+        && !candidate.show_codex
+        && !candidate.show_antigravity
+        && !candidate.show_opencode
+        && !candidate.show_cursor
+        && !candidate.show_grok
+        && !candidate.show_copilot
+    {
         return Err(invalid_setting(
             "At least one provider must remain enabled.",
         ));
@@ -5581,9 +6180,29 @@ fn paint(hdc: HDC, hwnd: HWND) {
         antigravity_session_text,
         antigravity_weekly_pct,
         antigravity_weekly_text,
+        opencode_session_pct,
+        opencode_session_text,
+        opencode_weekly_pct,
+        opencode_weekly_text,
+        cursor_session_pct,
+        cursor_session_text,
+        cursor_weekly_pct,
+        cursor_weekly_text,
+        grok_session_pct,
+        grok_session_text,
+        grok_weekly_pct,
+        grok_weekly_text,
+        copilot_session_pct,
+        copilot_session_text,
+        copilot_weekly_pct,
+        copilot_weekly_text,
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_opencode,
+        show_cursor,
+        show_grok,
+        show_copilot,
         show_provider_icons,
         show_session_window,
         show_weekly_window,
@@ -5607,9 +6226,29 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.antigravity_session_text.clone(),
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
+                s.opencode_session_percent,
+                s.opencode_session_text.clone(),
+                s.opencode_weekly_percent,
+                s.opencode_weekly_text.clone(),
+                s.cursor_session_percent,
+                s.cursor_session_text.clone(),
+                s.cursor_weekly_percent,
+                s.cursor_weekly_text.clone(),
+                s.grok_session_percent,
+                s.grok_session_text.clone(),
+                s.grok_weekly_percent,
+                s.grok_weekly_text.clone(),
+                s.copilot_session_percent,
+                s.copilot_session_text.clone(),
+                s.copilot_weekly_percent,
+                s.copilot_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_opencode,
+                s.show_cursor,
+                s.show_grok,
+                s.show_copilot,
                 s.show_provider_icons,
                 s.show_session_window,
                 s.show_weekly_window,
@@ -5625,6 +6264,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
         provider_icons::codex_color(appearance.is_dark(is_dark)),
     );
     let antigravity_accent = antigravity_accent_color();
+    let opencode_accent = custom_color(appearance.opencode_accent, opencode_accent_color());
+    let cursor_accent = custom_color(appearance.cursor_accent, cursor_accent_color());
+    let grok_accent = custom_color(appearance.grok_accent, grok_accent_color());
+    let copilot_accent = custom_color(appearance.copilot_accent, copilot_accent_color());
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -5664,14 +6307,38 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &antigravity_session_text,
             antigravity_weekly_pct,
             &antigravity_weekly_text,
+            opencode_session_pct,
+            &opencode_session_text,
+            opencode_weekly_pct,
+            &opencode_weekly_text,
+            cursor_session_pct,
+            &cursor_session_text,
+            cursor_weekly_pct,
+            &cursor_weekly_text,
+            grok_session_pct,
+            &grok_session_text,
+            grok_weekly_pct,
+            &grok_weekly_text,
+            copilot_session_pct,
+            &copilot_session_text,
+            copilot_weekly_pct,
+            &copilot_weekly_text,
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_opencode,
+            show_cursor,
+            show_grok,
+            show_copilot,
             show_provider_icons,
             show_session_window,
             show_weekly_window,
             &codex_accent,
             &antigravity_accent,
+            &opencode_accent,
+            &cursor_accent,
+            &grok_accent,
+            &copilot_accent,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -5696,17 +6363,41 @@ fn draw_row(
     codex_text: &str,
     antigravity_percent: f64,
     antigravity_text: &str,
+    opencode_percent: f64,
+    opencode_text: &str,
+    cursor_percent: f64,
+    cursor_text: &str,
+    grok_percent: f64,
+    grok_text: &str,
+    copilot_percent: f64,
+    copilot_text: &str,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_opencode: bool,
+    show_cursor: bool,
+    show_grok: bool,
+    show_copilot: bool,
     claude_accent: &Color,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    opencode_accent: &Color,
+    cursor_accent: &Color,
+    grok_accent: &Color,
+    copilot_accent: &Color,
     track: &Color,
     label_width: i32,
     text_width: i32,
 ) {
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let active_models = active_model_count(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        show_opencode,
+        show_cursor,
+        show_grok,
+        show_copilot,
+    );
     let segment_count = row_bar_segment_count(active_models);
     let value_color = custom_color(appearance.usage_text_color, *text_color);
 
@@ -5777,6 +6468,78 @@ fn draw_row(
                 antigravity_percent,
                 antigravity_text,
                 antigravity_accent,
+                track,
+                &value_color,
+                text_width,
+                is_dark,
+                appearance,
+            );
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_opencode {
+            draw_usage_bar(
+                hdc,
+                model_x + provider_icon_width(appearance),
+                y,
+                segment_count,
+                opencode_percent,
+                opencode_text,
+                opencode_accent,
+                track,
+                &value_color,
+                text_width,
+                is_dark,
+                appearance,
+            );
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_cursor {
+            draw_usage_bar(
+                hdc,
+                model_x + provider_icon_width(appearance),
+                y,
+                segment_count,
+                cursor_percent,
+                cursor_text,
+                cursor_accent,
+                track,
+                &value_color,
+                text_width,
+                is_dark,
+                appearance,
+            );
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_grok {
+            draw_usage_bar(
+                hdc,
+                model_x + provider_icon_width(appearance),
+                y,
+                segment_count,
+                grok_percent,
+                grok_text,
+                grok_accent,
+                track,
+                &value_color,
+                text_width,
+                is_dark,
+                appearance,
+            );
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_copilot {
+            draw_usage_bar(
+                hdc,
+                model_x + provider_icon_width(appearance),
+                y,
+                segment_count,
+                copilot_percent,
+                copilot_text,
+                copilot_accent,
                 track,
                 &value_color,
                 text_width,
@@ -6018,6 +6781,42 @@ mod tests {
     }
 
     #[test]
+    fn normalize_keeps_one_provider_of_seven() {
+        let all_off = SettingsFile {
+            show_claude_code: false,
+            show_codex: false,
+            show_antigravity: false,
+            show_opencode: false,
+            show_cursor: false,
+            show_grok: false,
+            show_copilot: false,
+            ..SettingsFile::default()
+        };
+        let normalized = normalize_settings(all_off);
+        assert!(normalized.show_codex);
+        assert!(
+            !normalized.show_claude_code
+                && !normalized.show_antigravity
+                && !normalized.show_opencode
+                && !normalized.show_cursor
+                && !normalized.show_grok
+                && !normalized.show_copilot
+        );
+        let one_on = SettingsFile {
+            show_claude_code: false,
+            show_codex: false,
+            show_antigravity: false,
+            show_opencode: false,
+            show_cursor: false,
+            show_grok: true,
+            show_copilot: false,
+            ..SettingsFile::default()
+        };
+        let kept = normalize_settings(one_on);
+        assert!(kept.show_grok && !kept.show_codex);
+    }
+
+    #[test]
     fn widget_element_validation_uses_final_candidate_and_rejects_last_element() {
         use serde_json::json;
         let current = SettingsCandidate::from_settings(
@@ -6211,7 +7010,15 @@ mod tests {
         assert!(
             draft["widget_preview_width"].as_i64().unwrap()
                 < i64::from(total_widget_width_for(
-                    1,
+                    active_model_count(
+                        current.show_claude_code,
+                        current.show_codex,
+                        current.show_antigravity,
+                        current.show_opencode,
+                        current.show_cursor,
+                        current.show_grok,
+                        current.show_copilot,
+                    ),
                     LanguageId::English,
                     current.appearance
                 ))
@@ -7316,6 +8123,10 @@ mod tests {
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
+            show_opencode: false,
+            show_cursor: false,
+            show_grok: false,
+            show_copilot: false,
             ..SettingsFile::default()
         };
 

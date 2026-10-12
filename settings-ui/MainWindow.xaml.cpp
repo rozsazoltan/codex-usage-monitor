@@ -1614,6 +1614,7 @@ namespace winrt::SettingsUI::implementation
         {
             if (previewTimer_) previewTimer_.Stop();
             previewPending_ = false;
+            detailProvider_ = -1;
         }
         claudeToggle_ = nullptr;
         widgetPreviewImage_ = nullptr;
@@ -1632,7 +1633,7 @@ namespace winrt::SettingsUI::implementation
             {L"Update",L"See the current update status and install the latest available version."}};
         PageSummary().Text(summaries.at(page));
         hydrating_ = true;
-        if (page == L"General") BuildGeneral(); else if (page == L"Monitoring") BuildMonitoring(); else if (page == L"Appearance") BuildAppearance(); else if (page == L"Placement") BuildPlacement(); else if (page == L"Update") BuildUpdate(); else BuildAbout();
+        if (page == L"General") BuildGeneral(); else if (page == L"Monitoring") BuildMonitoring(); else if (page == L"Appearance") { if (detailProvider_ >= 0 && detailProvider_ < 7) BuildProviderDetail(detailProvider_); else BuildAppearance(); } else if (page == L"Placement") BuildPlacement(); else if (page == L"Update") BuildUpdate(); else BuildAbout();
         hydrating_ = false;
     }
 
@@ -1748,6 +1749,155 @@ namespace winrt::SettingsUI::implementation
         options.Child(o);PageHost().Children().Append(options);
     }
 
+    struct ProviderAppearanceEntry
+    {
+        std::wstring enable;
+        std::wstring icon;
+        std::wstring accent;
+        std::wstring name;
+        std::wstring accentTitle;
+    };
+
+    static std::array<ProviderAppearanceEntry, 7> ProviderAppearanceMeta()
+    {
+        return {{
+            {L"show_claude_code", L"show_claude_icon", L"claude_accent", L"Claude Code", L"Claude Code bar accent"},
+            {L"show_codex", L"show_codex_icon", L"codex_accent", L"Codex", L"Codex bar accent"},
+            {L"show_antigravity", L"show_antigravity_icon", L"antigravity_accent", L"Antigravity", L"Antigravity bar accent"},
+            {L"show_opencode", L"show_opencode_icon", L"opencode_accent", L"OpenCode", L"OpenCode bar accent"},
+            {L"show_cursor", L"show_cursor_icon", L"cursor_accent", L"Cursor", L"Cursor bar accent"},
+            {L"show_grok", L"show_grok_icon", L"grok_accent", L"Grok", L"Grok bar accent"},
+            {L"show_copilot", L"show_copilot_icon", L"copilot_accent", L"Copilot", L"Copilot bar accent"},
+        }};
+    }
+
+    void MainWindow::AddAccentColorRow(StackPanel const& parent, std::wstring const& key, std::wstring const& title)
+    {
+        auto group = StackPanel(); group.Spacing(6); group.Children().Append(Label(title));
+        auto row = StackPanel(); row.Orientation(Orientation::Horizontal); row.Spacing(8);
+        row.SizeChanged([](auto const& sender, auto const&)
+        {
+            auto panel = sender.as<StackPanel>();
+            panel.Orientation(panel.ActualWidth() < 610 ? Orientation::Vertical : Orientation::Horizontal);
+        });
+        auto input = TextBox();
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(input, title);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(input, std::wstring(L"Color_") + key);
+        input.PlaceholderText(L"Default color"); input.Width(145);
+        const auto savedText = StoredColorText(State(), key);
+        const auto& draft = key == L"claude_accent" ? claudeColorDraft_ : key == L"codex_accent" ? codexColorDraft_ : key == L"antigravity_accent" ? antigravityColorDraft_ : key == L"opencode_accent" ? opencodeColorDraft_ : key == L"cursor_accent" ? cursorColorDraft_ : key == L"grok_accent" ? grokColorDraft_ : key == L"copilot_accent" ? copilotColorDraft_ : usageTextColorDraft_;
+        input.Text(draft ? hstring(*draft) : hstring(savedText));
+        input.TextChanging([this, key](auto const& sender, auto const&)
+        {
+            if (hydrating_ || syncingColorText_) return;
+            const auto text = std::wstring(sender.as<TextBox>().Text().c_str());
+            if (key == L"claude_accent") ++claudeColorDraftRevision_;
+            else if (key == L"codex_accent") ++codexColorDraftRevision_;
+            else if (key == L"antigravity_accent") ++antigravityColorDraftRevision_;
+            else if (key == L"opencode_accent") ++opencodeColorDraftRevision_;
+            else if (key == L"cursor_accent") ++cursorColorDraftRevision_;
+            else if (key == L"grok_accent") ++grokColorDraftRevision_;
+            else if (key == L"copilot_accent") ++copilotColorDraftRevision_;
+            else ++usageTextColorDraftRevision_;
+            if (key == L"claude_accent" && claudeColorApplyText_ && *claudeColorApplyText_ != text) claudeColorApplyText_.reset();
+            if (key == L"codex_accent" && codexColorApplyText_ && *codexColorApplyText_ != text) codexColorApplyText_.reset();
+            if (key == L"antigravity_accent" && antigravityColorApplyText_ && *antigravityColorApplyText_ != text) antigravityColorApplyText_.reset();
+            if (key == L"opencode_accent" && opencodeColorApplyText_ && *opencodeColorApplyText_ != text) opencodeColorApplyText_.reset();
+            if (key == L"cursor_accent" && cursorColorApplyText_ && *cursorColorApplyText_ != text) cursorColorApplyText_.reset();
+            if (key == L"grok_accent" && grokColorApplyText_ && *grokColorApplyText_ != text) grokColorApplyText_.reset();
+            if (key == L"copilot_accent" && copilotColorApplyText_ && *copilotColorApplyText_ != text) copilotColorApplyText_.reset();
+            if (key == L"usage_text_color" && usageTextColorApplyText_ && *usageTextColorApplyText_ != text) usageTextColorApplyText_.reset();
+            SetColorDraft(key, text); ScheduleWidgetPreview();
+        });
+
+        auto pickerButton = Button(); pickerButton.Content(box_value(L"Choose color…"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(pickerButton, std::wstring(L"ChooseColor_") + key);
+        auto flyout = Flyout(); auto pickerPanel = StackPanel(); pickerPanel.Spacing(10); pickerPanel.Padding(Thickness{12,12,12,12});
+        auto picker = ColorPicker(); picker.IsAlphaEnabled(false); picker.IsColorChannelTextInputVisible(true);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(picker, title + L" RGB color");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(picker, std::wstring(L"ColorPicker_") + key);
+        pickerPanel.Children().Append(picker);
+        auto pickerActions = StackPanel(); pickerActions.Orientation(Orientation::Horizontal); pickerActions.Spacing(8);
+        auto useColor = Button(); useColor.Content(box_value(L"Use color"));
+        auto cancelColor = Button(); cancelColor.Content(box_value(L"Cancel"));
+        pickerActions.Children().Append(useColor); pickerActions.Children().Append(cancelColor); pickerPanel.Children().Append(pickerActions);
+        flyout.Content(pickerPanel); pickerButton.Flyout(flyout);
+        flyout.Opened([this, picker, input, key](auto const&, auto const&)
+        {
+            auto color = ParseHexColor(std::wstring(input.Text().c_str()));
+            if (!color) color = ParseHexColor(StoredColorText(State(), key));
+            const auto effective = state_ ? state_.GetNamedObject(L"effective_appearance", JsonObject()) : JsonObject();
+            const bool systemDark = effective.GetNamedBoolean(L"dark", true);
+            const auto palette = Text(L"palette");
+            const bool dark = palette == L"high_contrast_dark" || (palette == L"system" && systemDark);
+            if (!color && palette == L"system") color = ParseHexColor(EffectiveColorText(state_, key));
+            if (!color) color = ParseHexColor(key == L"claude_accent" ? L"#D97757" : key == L"codex_accent"
+                ? (dark ? L"#34D399" : L"#0F8F70")
+                : key == L"antigravity_accent" ? L"#4285F4" : key == L"opencode_accent" ? L"#5B8DEF"
+                : key == L"cursor_accent" ? L"#6E6E6E" : key == L"grok_accent" ? L"#A8A8A8"
+                : key == L"copilot_accent" ? L"#A371F7"
+                : palette == L"system" ? (dark ? L"#888888" : L"#404040") : (dark ? L"#FFFFFF" : L"#101820"));
+            const auto rgb = color.value_or(std::array<uint8_t, 3>{217,119,87});
+            picker.Color(Windows::UI::Color{255, rgb[0], rgb[1], rgb[2]});
+        });
+        useColor.Click([this, picker, input, key, flyout](auto const&, auto const&)
+        {
+            const auto color = picker.Color();
+            const auto value = FormatHexColor({color.R, color.G, color.B});
+            syncingColorText_ = true; input.Text(value); syncingColorText_ = false;
+            if (key == L"claude_accent") ++claudeColorDraftRevision_;
+            else if (key == L"codex_accent") ++codexColorDraftRevision_;
+            else if (key == L"antigravity_accent") ++antigravityColorDraftRevision_;
+            else if (key == L"opencode_accent") ++opencodeColorDraftRevision_;
+            else if (key == L"cursor_accent") ++cursorColorDraftRevision_;
+            else if (key == L"grok_accent") ++grokColorDraftRevision_;
+            else if (key == L"copilot_accent") ++copilotColorDraftRevision_;
+            else ++usageTextColorDraftRevision_;
+            SetColorDraft(key, value); ScheduleWidgetPreview(); flyout.Hide();
+        });
+        cancelColor.Click([flyout](auto const&, auto const&) { flyout.Hide(); });
+
+        auto apply = Button(); apply.Content(box_value(L"Apply color"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(apply, std::wstring(L"ApplyColor_") + key);
+        apply.Click([this, input, key](auto const&, auto const&)
+        {
+            const std::wstring raw(input.Text().c_str()); const auto color = ParseHexColor(raw);
+            if (!color) { SetColorDraft(key, raw); ShowMessage(L"Enter exactly # followed by six ASCII hexadecimal digits, for example #D97757.", true); return; }
+            const auto normalized = FormatHexColor(*color);
+            syncingColorText_ = true; input.Text(normalized); syncingColorText_ = false;
+            SetColorDraft(key, normalized);
+            if (key == L"claude_accent") claudeColorApplyText_ = normalized;
+            else if (key == L"codex_accent") codexColorApplyText_ = normalized;
+            else if (key == L"antigravity_accent") antigravityColorApplyText_ = normalized;
+            else if (key == L"opencode_accent") opencodeColorApplyText_ = normalized;
+            else if (key == L"cursor_accent") cursorColorApplyText_ = normalized;
+            else if (key == L"grok_accent") grokColorApplyText_ = normalized;
+            else if (key == L"copilot_accent") copilotColorApplyText_ = normalized;
+            else usageTextColorApplyText_ = normalized;
+            auto value = JsonArray(); for (const auto component : *color) value.Append(JsonValue::CreateNumberValue(component)); SetValue(key, value);
+        });
+        auto discard = Button(); discard.Content(box_value(L"Discard"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(discard, std::wstring(L"DiscardColor_") + key);
+        discard.Click([this, input, key](auto const&, auto const&)
+        {
+            SetColorDraft(key, std::nullopt);
+            if (pendingChanges_ && pendingChanges_.HasKey(key)) { pendingChanges_.Remove(key); if (pendingChanges_.Size() == 0) pendingChanges_ = nullptr; }
+            if (key == L"claude_accent") claudeColorApplyText_.reset();
+            else if (key == L"codex_accent") codexColorApplyText_.reset();
+            else if (key == L"antigravity_accent") antigravityColorApplyText_.reset();
+            else if (key == L"opencode_accent") opencodeColorApplyText_.reset();
+            else if (key == L"cursor_accent") cursorColorApplyText_.reset();
+            else if (key == L"grok_accent") grokColorApplyText_.reset();
+            else if (key == L"copilot_accent") copilotColorApplyText_.reset();
+            else usageTextColorApplyText_.reset();
+            const bool wasHydrating = hydrating_.load(); hydrating_ = true;
+            syncingColorText_ = true; input.Text(StoredColorText(State(), key)); syncingColorText_ = false;
+            hydrating_ = wasHydrating; ScheduleWidgetPreview(); ShowMessage(L"Color draft discarded."); RefreshSettingsControlsIfSafe();
+        });
+        row.Children().Append(input); row.Children().Append(pickerButton); row.Children().Append(apply); row.Children().Append(discard);
+        group.Children().Append(row); parent.Children().Append(group);
+    }
+
     void MainWindow::BuildAppearance()
     {
         auto previewCard = Card();
@@ -1774,6 +1924,37 @@ namespace winrt::SettingsUI::implementation
         appearancePreviewCard_ = previewCard;
         ScheduleWidgetPreview();
         UpdateWidgetPreview(state_);
+
+        auto providersCard = Card(); auto providers = StackPanel(); providers.Spacing(10);
+        providers.Children().Append(Label(L"Providers", 19));
+        auto providersNote = Label(L"Edit each provider's widget appearance separately.", 12);
+        providersNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        providers.Children().Append(providersNote);
+        int providerRowIndex = 0;
+        for (auto const& meta : ProviderAppearanceMeta())
+        {
+            auto rowGrid = Grid();
+            auto starColumn = ColumnDefinition(); starColumn.Width(GridLength{ 1, GridUnitType::Star });
+            auto autoColumn = ColumnDefinition(); autoColumn.Width(GridLength{ 1, GridUnitType::Auto });
+            rowGrid.ColumnDefinitions().Append(starColumn); rowGrid.ColumnDefinitions().Append(autoColumn);
+            auto providerName = Label(meta.name); providerName.VerticalAlignment(VerticalAlignment::Center);
+            Grid::SetColumn(providerName, 0);
+            auto editProvider = Button(); editProvider.Content(SymbolIcon(Symbol::Edit));
+            Grid::SetColumn(editProvider, 1);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(editProvider, meta.name + L" appearance settings");
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(editProvider, std::wstring(L"EditProvider_") + meta.enable);
+            const int tappedProvider = providerRowIndex;
+            editProvider.Click([this, tappedProvider](auto const&, auto const&)
+            {
+                detailProvider_ = tappedProvider;
+                RenderPage(L"Appearance");
+                if (pageScroll_) pageScroll_.ScrollToVerticalOffset(0);
+            });
+            rowGrid.Children().Append(providerName); rowGrid.Children().Append(editProvider);
+            providers.Children().Append(rowGrid);
+            ++providerRowIndex;
+        }
+        providersCard.Child(providers); PageHost().Children().Append(providersCard);
 
         auto styleCard = Card();
         auto style = StackPanel(); style.Spacing(16);
@@ -1886,129 +2067,7 @@ namespace winrt::SettingsUI::implementation
             {L"copilot_accent",L"Copilot bar accent"},
             {L"usage_text_color",L"Provider mark and percentage color"}}})
         {
-            auto group = StackPanel(); group.Spacing(6); group.Children().Append(Label(title));
-            auto row = StackPanel(); row.Orientation(Orientation::Horizontal); row.Spacing(8);
-            row.SizeChanged([](auto const& sender, auto const&)
-            {
-                auto panel = sender.as<StackPanel>();
-                panel.Orientation(panel.ActualWidth() < 610 ? Orientation::Vertical : Orientation::Horizontal);
-            });
-            auto input = TextBox();
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(input, title);
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(input, std::wstring(L"Color_") + key);
-            input.PlaceholderText(L"Default color"); input.Width(145);
-            const auto savedText = StoredColorText(State(), key);
-            const auto& draft = key == L"claude_accent" ? claudeColorDraft_ : key == L"codex_accent" ? codexColorDraft_ : key == L"antigravity_accent" ? antigravityColorDraft_ : key == L"opencode_accent" ? opencodeColorDraft_ : key == L"cursor_accent" ? cursorColorDraft_ : key == L"grok_accent" ? grokColorDraft_ : key == L"copilot_accent" ? copilotColorDraft_ : usageTextColorDraft_;
-            input.Text(draft ? hstring(*draft) : hstring(savedText));
-            input.TextChanging([this, key, refreshPreview](auto const& sender, auto const&)
-            {
-                if (hydrating_ || syncingColorText_) return;
-                const auto text = std::wstring(sender.as<TextBox>().Text().c_str());
-                if (key == L"claude_accent") ++claudeColorDraftRevision_;
-                else if (key == L"codex_accent") ++codexColorDraftRevision_;
-                else if (key == L"antigravity_accent") ++antigravityColorDraftRevision_;
-                else if (key == L"opencode_accent") ++opencodeColorDraftRevision_;
-                else if (key == L"cursor_accent") ++cursorColorDraftRevision_;
-                else if (key == L"grok_accent") ++grokColorDraftRevision_;
-                else if (key == L"copilot_accent") ++copilotColorDraftRevision_;
-                else ++usageTextColorDraftRevision_;
-                if (key == L"claude_accent" && claudeColorApplyText_ && *claudeColorApplyText_ != text) claudeColorApplyText_.reset();
-                if (key == L"codex_accent" && codexColorApplyText_ && *codexColorApplyText_ != text) codexColorApplyText_.reset();
-                if (key == L"antigravity_accent" && antigravityColorApplyText_ && *antigravityColorApplyText_ != text) antigravityColorApplyText_.reset();
-                if (key == L"opencode_accent" && opencodeColorApplyText_ && *opencodeColorApplyText_ != text) opencodeColorApplyText_.reset();
-                if (key == L"cursor_accent" && cursorColorApplyText_ && *cursorColorApplyText_ != text) cursorColorApplyText_.reset();
-                if (key == L"grok_accent" && grokColorApplyText_ && *grokColorApplyText_ != text) grokColorApplyText_.reset();
-                if (key == L"copilot_accent" && copilotColorApplyText_ && *copilotColorApplyText_ != text) copilotColorApplyText_.reset();
-                if (key == L"usage_text_color" && usageTextColorApplyText_ && *usageTextColorApplyText_ != text) usageTextColorApplyText_.reset();
-                SetColorDraft(key, text); refreshPreview();
-            });
-
-            auto pickerButton = Button(); pickerButton.Content(box_value(L"Choose color…"));
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(pickerButton, std::wstring(L"ChooseColor_") + key);
-            auto flyout = Flyout(); auto pickerPanel = StackPanel(); pickerPanel.Spacing(10); pickerPanel.Padding(Thickness{12,12,12,12});
-            auto picker = ColorPicker(); picker.IsAlphaEnabled(false); picker.IsColorChannelTextInputVisible(true);
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(picker, title + L" RGB color");
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(picker, std::wstring(L"ColorPicker_") + key);
-            pickerPanel.Children().Append(picker);
-            auto pickerActions = StackPanel(); pickerActions.Orientation(Orientation::Horizontal); pickerActions.Spacing(8);
-            auto useColor = Button(); useColor.Content(box_value(L"Use color"));
-            auto cancelColor = Button(); cancelColor.Content(box_value(L"Cancel"));
-            pickerActions.Children().Append(useColor); pickerActions.Children().Append(cancelColor); pickerPanel.Children().Append(pickerActions);
-            flyout.Content(pickerPanel); pickerButton.Flyout(flyout);
-            flyout.Opened([this, picker, input, key, theme](auto const&, auto const&)
-            {
-                auto color = ParseHexColor(std::wstring(input.Text().c_str()));
-                if (!color) color = ParseHexColor(StoredColorText(State(), key));
-                const auto effective = state_ ? state_.GetNamedObject(L"effective_appearance", JsonObject()) : JsonObject();
-                const bool systemDark = effective.GetNamedBoolean(L"dark", true);
-                const auto palette = theme.SelectedItem() ? std::wstring(unbox_value<hstring>(theme.SelectedItem().as<ComboBoxItem>().Tag()).c_str()) : Text(L"palette");
-                const bool dark = palette == L"high_contrast_dark" || (palette == L"system" && systemDark);
-                if (!color && palette == L"system") color = ParseHexColor(EffectiveColorText(state_, key));
-                if (!color) color = ParseHexColor(key == L"claude_accent" ? L"#D97757" : key == L"codex_accent"
-                    ? (dark ? L"#34D399" : L"#0F8F70")
-                    : key == L"antigravity_accent" ? L"#4285F4" : key == L"opencode_accent" ? L"#5B8DEF"
-                    : key == L"cursor_accent" ? L"#6E6E6E" : key == L"grok_accent" ? L"#A8A8A8"
-                    : key == L"copilot_accent" ? L"#A371F7"
-                    : palette == L"system" ? (dark ? L"#888888" : L"#404040") : (dark ? L"#FFFFFF" : L"#101820"));
-                const auto rgb = color.value_or(std::array<uint8_t, 3>{217,119,87});
-                picker.Color(Windows::UI::Color{255, rgb[0], rgb[1], rgb[2]});
-            });
-            useColor.Click([this, picker, input, key, flyout, refreshPreview](auto const&, auto const&)
-            {
-                const auto color = picker.Color();
-                const auto value = FormatHexColor({color.R, color.G, color.B});
-                syncingColorText_ = true; input.Text(value); syncingColorText_ = false;
-                if (key == L"claude_accent") ++claudeColorDraftRevision_;
-                else if (key == L"codex_accent") ++codexColorDraftRevision_;
-                else if (key == L"antigravity_accent") ++antigravityColorDraftRevision_;
-                else if (key == L"opencode_accent") ++opencodeColorDraftRevision_;
-                else if (key == L"cursor_accent") ++cursorColorDraftRevision_;
-                else if (key == L"grok_accent") ++grokColorDraftRevision_;
-                else if (key == L"copilot_accent") ++copilotColorDraftRevision_;
-                else ++usageTextColorDraftRevision_;
-                SetColorDraft(key, value); refreshPreview(); flyout.Hide();
-            });
-            cancelColor.Click([flyout](auto const&, auto const&) { flyout.Hide(); });
-
-            auto apply = Button(); apply.Content(box_value(L"Apply color"));
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(apply, std::wstring(L"ApplyColor_") + key);
-            apply.Click([this, input, key](auto const&, auto const&)
-            {
-                const std::wstring raw(input.Text().c_str()); const auto color = ParseHexColor(raw);
-                if (!color) { SetColorDraft(key, raw); ShowMessage(L"Enter exactly # followed by six ASCII hexadecimal digits, for example #D97757.", true); return; }
-                const auto normalized = FormatHexColor(*color);
-                syncingColorText_ = true; input.Text(normalized); syncingColorText_ = false;
-                SetColorDraft(key, normalized);
-                if (key == L"claude_accent") claudeColorApplyText_ = normalized;
-                else if (key == L"codex_accent") codexColorApplyText_ = normalized;
-                else if (key == L"antigravity_accent") antigravityColorApplyText_ = normalized;
-                else if (key == L"opencode_accent") opencodeColorApplyText_ = normalized;
-                else if (key == L"cursor_accent") cursorColorApplyText_ = normalized;
-                else if (key == L"grok_accent") grokColorApplyText_ = normalized;
-                else if (key == L"copilot_accent") copilotColorApplyText_ = normalized;
-                else usageTextColorApplyText_ = normalized;
-                auto value = JsonArray(); for (const auto component : *color) value.Append(JsonValue::CreateNumberValue(component)); SetValue(key, value);
-            });
-            auto discard = Button(); discard.Content(box_value(L"Discard"));
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(discard, std::wstring(L"DiscardColor_") + key);
-            discard.Click([this, input, key, refreshPreview](auto const&, auto const&)
-            {
-                SetColorDraft(key, std::nullopt);
-                if (pendingChanges_ && pendingChanges_.HasKey(key)) { pendingChanges_.Remove(key); if (pendingChanges_.Size() == 0) pendingChanges_ = nullptr; }
-                if (key == L"claude_accent") claudeColorApplyText_.reset();
-                else if (key == L"codex_accent") codexColorApplyText_.reset();
-                else if (key == L"antigravity_accent") antigravityColorApplyText_.reset();
-                else if (key == L"opencode_accent") opencodeColorApplyText_.reset();
-                else if (key == L"cursor_accent") cursorColorApplyText_.reset();
-                else if (key == L"grok_accent") grokColorApplyText_.reset();
-                else if (key == L"copilot_accent") copilotColorApplyText_.reset();
-                else usageTextColorApplyText_.reset();
-                const bool wasHydrating = hydrating_.load(); hydrating_ = true;
-                syncingColorText_ = true; input.Text(StoredColorText(State(), key)); syncingColorText_ = false;
-                hydrating_ = wasHydrating; refreshPreview(); ShowMessage(L"Color draft discarded."); RefreshSettingsControlsIfSafe();
-            });
-            row.Children().Append(input); row.Children().Append(pickerButton); row.Children().Append(apply); row.Children().Append(discard);
-            group.Children().Append(row); colors.Children().Append(group);
+            AddAccentColorRow(colors, key, title);
         }
         colorsCard.Child(colors); PageHost().Children().Append(colorsCard);
         if (pageScroll_ && pageScroll_.VerticalOffset() > 8)
@@ -2019,6 +2078,56 @@ namespace winrt::SettingsUI::implementation
                 if (auto self = weak.get()) self->UpdateStickyPreview();
             });
         }
+    }
+
+    void MainWindow::BuildProviderDetail(int provider)
+    {
+        const auto metas = ProviderAppearanceMeta();
+        if (provider < 0 || provider >= static_cast<int>(metas.size()))
+        {
+            BuildAppearance();
+            return;
+        }
+        const auto& meta = metas[static_cast<size_t>(provider)];
+        auto card = Card(); auto stack = StackPanel(); stack.Spacing(12);
+        auto back = Button(); back.Content(box_value(L"Back"));
+        back.HorizontalAlignment(HorizontalAlignment::Left);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(back, L"ProviderDetailBack");
+        back.Click([this](auto const&, auto const&)
+        {
+            detailProvider_ = -1;
+            RenderPage(L"Appearance");
+            if (pageScroll_) pageScroll_.ScrollToVerticalOffset(0);
+        });
+        stack.Children().Append(back);
+        stack.Children().Append(Label(meta.name, 19));
+        auto enableCopy = StackPanel(); enableCopy.Spacing(3); enableCopy.Children().Append(Label(L"Show in widget"));
+        auto enableToggle = ToggleSwitch(); SetSwitchContent(enableToggle);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(enableToggle, meta.name);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(enableToggle, std::wstring(L"Setting_") + meta.enable);
+        enableToggle.IsOn(Bool(meta.enable));
+        enableToggle.Toggled([this, meta](auto const& sender, auto const&)
+        {
+            auto control = sender.as<ToggleSwitch>();
+            if (hydrating_) return;
+            SetValue(meta.enable, JsonValue::CreateBooleanValue(control.IsOn()));
+        });
+        stack.Children().Append(ToggleRow(enableCopy, enableToggle));
+        auto iconCopy = StackPanel(); iconCopy.Spacing(3); iconCopy.Children().Append(Label(L"Provider mark"));
+        auto iconToggle = ToggleSwitch(); SetSwitchContent(iconToggle);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(iconToggle, meta.name + L" mark");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(iconToggle, std::wstring(L"Setting_") + meta.icon);
+        iconToggle.IsOn(State().GetNamedBoolean(meta.icon, true));
+        iconToggle.Toggled([this, meta](auto const& sender, auto const&)
+        {
+            auto control = sender.as<ToggleSwitch>();
+            if (hydrating_) return;
+            SetValue(meta.icon, JsonValue::CreateBooleanValue(control.IsOn()));
+        });
+        stack.Children().Append(ToggleRow(iconCopy, iconToggle));
+        stack.Children().Append(Label(L"Bar accent", 14));
+        AddAccentColorRow(stack, meta.accent, meta.accentTitle);
+        card.Child(stack); PageHost().Children().Append(card);
     }
 
     void MainWindow::ClearStickyPreview()

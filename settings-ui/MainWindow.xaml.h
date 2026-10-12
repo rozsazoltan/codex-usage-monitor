@@ -62,6 +62,9 @@ namespace winrt::SettingsUI::implementation
         void BuildGeneral();
         void BuildMonitoring();
         void BuildAppearance();
+        void BuildProviderDetail(int provider);
+        void AddAccentColorRow(Microsoft::UI::Xaml::Controls::StackPanel const& parent,
+            std::wstring const& key, std::wstring const& title);
         void BuildPlacement();
         void BuildAbout();
         void BuildUpdate();
@@ -74,6 +77,7 @@ namespace winrt::SettingsUI::implementation
         std::wstring pipeName_;
         uint32_t parentPid_{};
         std::wstring page_{ L"General" };
+        int detailProvider_{ -1 };
         winrt::Windows::Data::Json::JsonObject state_{ nullptr };
         winrt::Windows::Data::Json::JsonObject flightChanges_{ nullptr };
         winrt::Windows::Data::Json::JsonObject pendingChanges_{ nullptr };

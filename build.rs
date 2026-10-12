@@ -20,6 +20,8 @@ fn main() {
 fn embed_settings_payload() {
     use std::{env, fs, path::PathBuf};
     println!("cargo:rerun-if-env-changed=CODEX_SETTINGS_PAYLOAD");
+    println!("cargo:rerun-if-env-changed=CODEX_SETTINGS_MSBUILD");
+    println!("cargo:rerun-if-env-changed=CODEX_SETTINGS_SKIP_NATIVE_BUILD");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/icons/icon.ico");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
@@ -38,10 +40,64 @@ fn embed_settings_payload() {
             assert!(!bytes.is_empty(), "Empty settings payload");
             fs::write(out.join(name), bytes).unwrap();
         }
-    } else {
+    } else if env::var_os("CODEX_SETTINGS_SKIP_NATIVE_BUILD").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
         assert_ne!(env::var("PROFILE").unwrap(), "release", "Release builds require the native settings payload. Run scripts/build-release.ps1 (no restore is performed by build.rs).");
+        println!("cargo:warning=Native Settings build explicitly disabled; debug Settings may use the unverified settings-ui/bin/portable fallback. Remove CODEX_SETTINGS_SKIP_NATIVE_BUILD to build current sources.");
         fs::write(out.join("manifest.json"), []).unwrap();
         fs::write(out.join("payload.bin"), []).unwrap();
+    } else {
+        assert_ne!(
+            env::var("PROFILE").unwrap(),
+            "release",
+            "Release builds require the native settings payload. Run scripts/build-release.ps1."
+        );
+        assert_eq!(
+            env::var("CARGO_CFG_TARGET_ARCH").unwrap(),
+            "x86_64",
+            "The native settings companion is built for x64 only"
+        );
+        track_native_inputs(std::path::Path::new("settings-ui"));
+        for input in [
+            "src/icons/256x256.png",
+            "THIRD-PARTY-NOTICES.txt",
+            "scripts/build-settings-dev.ps1",
+            "scripts/publish-settings.ps1",
+            "scripts/package-settings.ps1",
+        ] {
+            println!("cargo:rerun-if-changed={input}");
+        }
+        let status = std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-NonInteractive", "-File", "scripts/build-settings-dev.ps1", "-OutputDirectory"])
+            .arg(&out)
+            .status()
+            .expect("Cannot start PowerShell 7.2+. Install pwsh and the native build prerequisites in settings-ui/BUILDING.md, or explicitly set CODEX_SETTINGS_SKIP_NATIVE_BUILD=1 for Rust-only work.");
+        assert!(status.success(), "Native Settings build failed; refusing to embed stale UI. See the MSBuild error above and settings-ui/BUILDING.md. Set CODEX_SETTINGS_MSBUILD to the full VS 2022 MSBuild.exe path if discovery fails. CODEX_SETTINGS_SKIP_NATIVE_BUILD=1 explicitly opts out for Rust-only work.");
+        for name in ["manifest.json", "payload.bin"] {
+            assert!(
+                fs::metadata(out.join(name)).is_ok_and(|file| file.len() > 0),
+                "Native Settings build did not produce {name}"
+            );
+        }
+    }
+}
+
+fn track_native_inputs(directory: &std::path::Path) {
+    // Do not watch the project root recursively: restore/build outputs live there.
+    for entry in std::fs::read_dir(directory).expect("Cannot read native Settings sources") {
+        let path = entry.expect("Cannot read native Settings input").path();
+        if path.is_dir() {
+            if matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("bin" | "obj" | "packages" | ".git")
+            ) {
+                continue;
+            }
+            println!("cargo:rerun-if-changed={}", path.display());
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
     }
 }
 

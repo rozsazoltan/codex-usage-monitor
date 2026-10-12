@@ -10,7 +10,7 @@
         </Grid.RowDefinitions>
         <Grid x:Name="TitleBarDragRegion" Grid.Row="0" Background="Transparent"
               AutomationProperties.Name="Window drag area" AutomationProperties.AutomationId="SettingsTitleBarDragRegion" />
-        <NavigationView x:Name="Navigation" Grid.Row="1" PaneDisplayMode="Left" CompactPaneLength="48" IsBackButtonVisible="Collapsed"
+        <NavigationView x:Name="Navigation" Grid.Row="0" Grid.RowSpan="2" PaneDisplayMode="Left" CompactPaneLength="48" IsBackButtonVisible="Collapsed"
         IsSettingsVisible="False" OpenPaneLength="244" SelectionChanged="OnNavigationChanged"
         Background="Transparent" IsPaneToggleButtonVisible="True">
         <NavigationView.Resources>
@@ -36,7 +36,7 @@
         <NavigationView.FooterMenuItems>
             <NavigationViewItem Content="About" Tag="About" Icon="Help" AutomationProperties.AutomationId="NavigationAbout" />
         </NavigationView.FooterMenuItems>
-        <Grid>
+        <Grid x:Name="PageContent">
             <ScrollViewer x:Name="PageScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                 <StackPanel MaxWidth="1040" HorizontalAlignment="Left" Padding="40,30,40,40" Spacing="22">
                     <StackPanel Spacing="5">

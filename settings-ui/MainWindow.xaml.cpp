@@ -1043,6 +1043,7 @@ namespace winrt::SettingsUI::implementation
         const auto heightDip = nativeHeight > 0 ? static_cast<double>(nativeHeight) / scale : 32.0;
         TitleBarRow().Height(GridLengthHelper::FromValueAndType(heightDip, GridUnitType::Pixel));
         TitleBarDragRegion().Height(heightDip);
+        PageContent().Margin(Thickness{ 0, heightDip, 0, 0 });
         TitleBarDragRegion().Margin(Thickness{
             static_cast<double>(titleBar.LeftInset()) / scale,
             0,

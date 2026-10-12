@@ -199,6 +199,12 @@ extern "system" {
         reserved_flags: u32,
         credential: *mut *mut CredentialW,
     ) -> i32;
+    fn CredEnumerateW(
+        filter: *const u16,
+        flags: u32,
+        count: *mut u32,
+        credentials: *mut *mut *mut CredentialW,
+    ) -> i32;
     fn CredFree(buffer: *mut c_void);
 }
 
@@ -210,6 +216,7 @@ pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
         3 => poll_opencode(),
         4 => poll_cursor(),
         5 => poll_grok(),
+        6 => poll_copilot(),
         _ => Err(PollError::RequestFailed),
     }
 }
@@ -2721,9 +2728,583 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
     Duration::from_secs(total_secs.saturating_sub(current_bucket_start) + 1)
 }
 
+// ---- GitHub Copilot provider (ported from CodeZeno src/poller/copilot.rs).
+// The quota endpoint the Copilot editors and CLI read for their own usage
+// panels. A GitHub OAuth token from any Copilot-enabled login can read it.
+const COPILOT_USER_URL: &str = "https://api.github.com/copilot_internal/user";
+// The precedence the Copilot CLI itself gives its token variables.
+const COPILOT_TOKEN_ENVIRONMENT: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+// Newer Copilot CLI builds store `https://github.com:<login>.copilot-cli`,
+// older ones `copilot-cli/https://github.com:<login>`.
+const COPILOT_CLI_TARGET_PREFIX: &str = "https://github.com:";
+const COPILOT_CLI_TARGET_SUFFIX: &str = ".copilot-cli";
+const LEGACY_COPILOT_CLI_TARGET_PREFIX: &str = "copilot-cli/https://github.com:";
+// The GitHub CLI keeps the active account under `gh:github.com:` and every
+// signed-in account under `gh:github.com:<login>`.
+const GH_CLI_TARGET_PREFIX: &str = "gh:github.com:";
+const GH_CLI_ACTIVE_TARGET: &str = "gh:github.com:";
+const PREMIUM_QUOTA: &str = "premium_interactions";
+
+#[derive(Debug, Deserialize)]
+struct CopilotUserResponse {
+    #[serde(default)]
+    copilot_plan: Option<String>,
+    #[serde(default)]
+    quota_reset_date_utc: Option<String>,
+    // Date-only fallback, e.g. `2026-11-01`.
+    #[serde(default)]
+    quota_reset_date: Option<String>,
+    // Kept as raw values so one unfamiliar snapshot cannot fail the rest.
+    #[serde(default)]
+    quota_snapshots: BTreeMap<String, serde_json::Value>,
+    // Copilot Free accounts without snapshots report what is left of each
+    // monthly allowance here, against the totals in `monthly_quotas`.
+    #[serde(default)]
+    limited_user_quotas: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    monthly_quotas: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    limited_user_reset_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotQuotaSnapshot {
+    #[serde(default)]
+    entitlement: Option<f64>,
+    #[serde(default)]
+    remaining: Option<f64>,
+    #[serde(default)]
+    percent_remaining: Option<f64>,
+    #[serde(default)]
+    unlimited: bool,
+}
+
+impl CopilotQuotaSnapshot {
+    fn used_percentage(&self) -> Option<f64> {
+        if self.unlimited {
+            return Some(0.0);
+        }
+        if let Some(remaining) = self.percent_remaining.filter(|value| value.is_finite()) {
+            return Some((100.0 - remaining).clamp(0.0, 100.0));
+        }
+        copilot_used_from_remaining(self.entitlement?, self.remaining?)
+    }
+}
+
+struct CopilotTokenCandidate {
+    source: String,
+    token: String,
+}
+
+struct CopilotStoredCredential {
+    target: String,
+    secret: String,
+    last_written: u64,
+}
+
+fn poll_copilot() -> Result<UsageData, PollError> {
+    let candidates = copilot_token_candidates();
+    if candidates.is_empty() {
+        diagnose::log(
+            "Copilot usage poll failed: no GitHub login found (sign in with 'copilot' or 'gh auth login', or set GH_TOKEN)",
+        );
+        return Err(PollError::NoCredentials);
+    }
+
+    let mut last_error = PollError::AuthRequired;
+    for candidate in &candidates {
+        match fetch_copilot_usage(&candidate.token, COPILOT_USER_URL) {
+            Ok(usage) => return Ok(usage),
+            // Another stored login may still hold a Copilot seat.
+            Err(PollError::AuthRequired) => {
+                diagnose::log(format!(
+                    "Copilot rejected the login from {}",
+                    candidate.source
+                ));
+                last_error = PollError::AuthRequired;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error)
+}
+
+fn copilot_token_candidates() -> Vec<CopilotTokenCandidate> {
+    let environment = COPILOT_TOKEN_ENVIRONMENT.iter().filter_map(|name| {
+        opencode_non_empty_env(name).map(|token| CopilotTokenCandidate {
+            source: format!("environment variable {name}"),
+            token,
+        })
+    });
+    let stored = copilot_cli_credentials()
+        .into_iter()
+        .chain(gh_cli_credentials())
+        .map(|credential| CopilotTokenCandidate {
+            source: format!("Windows credential {}", credential.target),
+            token: credential.secret.trim().to_string(),
+        });
+
+    let mut candidates: Vec<CopilotTokenCandidate> = Vec::new();
+    for candidate in environment.chain(stored) {
+        if copilot_is_header_safe_token(&candidate.token)
+            && !candidates
+                .iter()
+                .any(|existing| existing.token == candidate.token)
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+fn copilot_cli_credentials() -> Vec<CopilotStoredCredential> {
+    let mut credentials = enumerate_windows_generic_credentials(COPILOT_CLI_TARGET_PREFIX)
+        .into_iter()
+        .filter(|credential| credential.target.ends_with(COPILOT_CLI_TARGET_SUFFIX))
+        .chain(enumerate_windows_generic_credentials(
+            LEGACY_COPILOT_CLI_TARGET_PREFIX,
+        ))
+        .collect::<Vec<_>>();
+    credentials.sort_by_key(|credential| std::cmp::Reverse(credential.last_written));
+    credentials
+}
+
+// The active account first, then the most recently written.
+fn gh_cli_credentials() -> Vec<CopilotStoredCredential> {
+    let mut credentials = enumerate_windows_generic_credentials(GH_CLI_TARGET_PREFIX);
+    credentials.sort_by_key(|credential| {
+        (
+            credential.target != GH_CLI_ACTIVE_TARGET,
+            std::cmp::Reverse(credential.last_written),
+        )
+    });
+    credentials
+}
+
+fn enumerate_windows_generic_credentials(prefix: &str) -> Vec<CopilotStoredCredential> {
+    let mut out = Vec::new();
+    let filter_text = format!("{prefix}*");
+    let filter_wide: Vec<u16> = filter_text
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut count: u32 = 0;
+    let mut credentials: *mut *mut CredentialW = std::ptr::null_mut();
+    let ok = unsafe { CredEnumerateW(filter_wide.as_ptr(), 0, &mut count, &mut credentials) };
+    if ok == 0 || credentials.is_null() {
+        return out;
+    }
+    unsafe {
+        for index in 0..count as usize {
+            let credential = *credentials.add(index);
+            if credential.is_null() {
+                continue;
+            }
+            let entry = &*credential;
+            if entry.target_name.is_null()
+                || entry.credential_blob.is_null()
+                || entry.credential_blob_size == 0
+            {
+                continue;
+            }
+            let mut target_len = 0;
+            while *entry.target_name.add(target_len) != 0 {
+                target_len += 1;
+            }
+            let target =
+                String::from_utf16_lossy(std::slice::from_raw_parts(entry.target_name, target_len));
+            let bytes = std::slice::from_raw_parts(
+                entry.credential_blob,
+                entry.credential_blob_size as usize,
+            );
+            let secret = match String::from_utf8(bytes.to_vec()) {
+                Ok(secret) => secret,
+                Err(_) => continue,
+            };
+            out.push(CopilotStoredCredential {
+                target,
+                secret,
+                last_written: entry.last_written,
+            });
+        }
+        CredFree(credentials as *mut c_void);
+    }
+    out
+}
+
+fn fetch_copilot_usage(token: &str, url: &str) -> Result<UsageData, PollError> {
+    let agent = build_agent()?;
+    let response = match agent
+        .get(url)
+        .set("Authorization", &format!("token {token}"))
+        .set("Accept", "application/json")
+        .set(
+            "User-Agent",
+            concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
+        )
+        .call()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            // Deviation from upstream (which continues the candidate loop on
+            // 404 = valid login without a seat): our classifier has no
+            // per-status variant past AuthRequired, so 404 surfaces as
+            // RequestFailed and stops the loop. Single-login behavior is
+            // identical in outcome (an error); revisit if multi-login
+            // seat-fallback needs it.
+            if let ureq::Error::Status(404, _) = &error {
+                diagnose::log("Copilot login has no Copilot access (404)");
+            }
+            return Err(classify_ureq_error(&error));
+        }
+    };
+
+    let response: CopilotUserResponse = response.into_json().map_err(|error| {
+        diagnose::log(format!("unable to parse Copilot usage response: {error:?}"));
+        PollError::RequestFailed
+    })?;
+    if let Some(plan) = response.copilot_plan.as_deref() {
+        diagnose::log(format!("Copilot plan: {plan}"));
+    }
+    copilot_usage_from_user(response).ok_or_else(|| {
+        diagnose::log("Copilot usage response missing quota snapshots");
+        PollError::RequestFailed
+    })
+}
+
+fn copilot_usage_from_user(response: CopilotUserResponse) -> Option<UsageData> {
+    let snapshots = response
+        .quota_snapshots
+        .into_iter()
+        .filter_map(|(key, value)| {
+            Some((
+                key,
+                serde_json::from_value::<CopilotQuotaSnapshot>(value).ok()?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let reset = parse_iso8601(response.quota_reset_date_utc.as_deref())
+        .or_else(|| copilot_parse_reset_date(response.quota_reset_date.as_deref()));
+
+    let premium = snapshots
+        .get(PREMIUM_QUOTA)
+        .and_then(CopilotQuotaSnapshot::used_percentage);
+    let (pool, resets_at) = match premium {
+        Some(premium) => (premium, reset),
+        None => {
+            // Older Copilot Free responses carry no snapshots at all; chat is
+            // the allowance those accounts run out of.
+            let reset = reset
+                .or_else(|| copilot_parse_reset_date(response.limited_user_reset_date.as_deref()));
+            let free =
+                copilot_free_quota_usage(&response.limited_user_quotas, &response.monthly_quotas);
+            (*free.get("chat")?, reset)
+        }
+    };
+
+    // Copilot spends one pool per calendar month and has no short window, so
+    // the pool lands in `weekly`, which is what tray badges read. The
+    // monthly window and the "30d" label need P5 model fields
+    // (weekly_label/monthly/limits are not on UsageData yet).
+    Some(UsageData {
+        session: UsageSection::default(),
+        weekly: UsageSection {
+            percentage: pool,
+            resets_at,
+        },
+    })
+}
+
+fn copilot_free_quota_usage(
+    remaining: &BTreeMap<String, serde_json::Value>,
+    totals: &BTreeMap<String, serde_json::Value>,
+) -> BTreeMap<String, f64> {
+    totals
+        .iter()
+        .filter_map(|(key, total)| {
+            let used = copilot_used_from_remaining(total.as_f64()?, remaining.get(key)?.as_f64()?)?;
+            Some((key.clone(), used))
+        })
+        .collect()
+}
+
+fn copilot_used_from_remaining(entitlement: f64, remaining: f64) -> Option<f64> {
+    if !entitlement.is_finite() || entitlement <= 0.0 || !remaining.is_finite() {
+        return None;
+    }
+    Some(((entitlement - remaining) / entitlement * 100.0).clamp(0.0, 100.0))
+}
+
+// Copilot quotas reset at midnight UTC on the given day.
+fn copilot_parse_reset_date(date: Option<&str>) -> Option<SystemTime> {
+    let date = date?.trim();
+    parse_iso8601(Some(&format!("{date}T00:00:00Z")))
+}
+
+// Tokens go into a header, so anything that could split it is unusable.
+fn copilot_is_header_safe_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn copilot_usage(json: serde_json::Value) -> Option<UsageData> {
+        copilot_usage_from_user(serde_json::from_value(json).unwrap())
+    }
+
+    #[test]
+    fn copilot_enterprise_response_maps_premium_requests_to_the_monthly_pool() {
+        // Shape captured from api.github.com on an Enterprise seat (upstream
+        // fixture); identifiers and organisation details dropped.
+        let data = copilot_usage(serde_json::json!({
+            "access_type_sku": "copilot_enterprise_seat_quota",
+            "copilot_plan": "enterprise",
+            "quota_reset_date": "2026-11-01",
+            "quota_reset_date_utc": "2026-11-01T00:00:00.000Z",
+            "token_based_billing": true,
+            "quota_snapshots": {
+                "chat": {
+                    "entitlement": 0, "remaining": 0, "percent_remaining": 100.0,
+                    "quota_id": "chat", "unlimited": true, "overage_permitted": false
+                },
+                "completions": {
+                    "entitlement": 0, "remaining": 0, "percent_remaining": 100.0,
+                    "quota_id": "completions", "unlimited": true
+                },
+                "premium_interactions": {
+                    "entitlement": 30000, "remaining": 22500, "percent_remaining": 75.0,
+                    "quota_id": "premium_interactions", "unlimited": false,
+                    "overage_permitted": true, "credits_used": 0
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(data.weekly.percentage, 25.0);
+        assert_eq!(
+            data.weekly.resets_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1_793_491_200))
+        );
+        // Copilot has no short window, so the session slot stays default.
+        assert_eq!(data.session.percentage, 0.0);
+        assert!(data.session.resets_at.is_none());
+    }
+
+    #[test]
+    fn copilot_metered_snapshots_feed_only_the_pool_without_model_fields() {
+        // Upstream exposes metered snapshots as opt-in limits; our UsageData
+        // has no limits field yet (P5), so only the pool is asserted here.
+        let data = copilot_usage(serde_json::json!({
+            "copilot_plan": "free",
+            "quota_reset_date_utc": "2026-11-01T00:00:00.000Z",
+            "quota_snapshots": {
+                "chat": {"entitlement": 50, "remaining": 10, "percent_remaining": 20.0},
+                "completions": {"entitlement": 2000, "remaining": 2000, "percent_remaining": 100.0},
+                "premium_interactions": {"entitlement": 50, "remaining": 45, "percent_remaining": 90.0}
+            }
+        }))
+        .unwrap();
+        assert_eq!(data.weekly.percentage, 10.0);
+        assert_eq!(
+            data.weekly.resets_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1_793_491_200))
+        );
+    }
+
+    #[test]
+    fn copilot_overage_and_missing_percentages_fall_back_to_counts() {
+        let data = copilot_usage(serde_json::json!({
+            "quota_reset_date": "2026-11-01",
+            "quota_snapshots": {
+                "premium_interactions": {"entitlement": 300, "remaining": -12}
+            }
+        }))
+        .unwrap();
+        assert_eq!(data.weekly.percentage, 100.0);
+        // The date-only field still yields a reset time.
+        assert_eq!(
+            data.weekly.resets_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1_793_491_200))
+        );
+
+        let data = copilot_usage(serde_json::json!({
+            "quota_snapshots": {
+                "premium_interactions": {"entitlement": 300, "remaining": 225}
+            }
+        }))
+        .unwrap();
+        assert_eq!(data.weekly.percentage, 25.0);
+        assert!(data.weekly.resets_at.is_none());
+    }
+
+    #[test]
+    fn copilot_legacy_free_response_reads_the_chat_allowance() {
+        let data = copilot_usage(serde_json::json!({
+            "copilot_plan": "individual",
+            "limited_user_reset_date": "2026-10-15",
+            "limited_user_quotas": {"chat": 40, "completions": 1500},
+            "monthly_quotas": {"chat": 50, "completions": 2000}
+        }))
+        .unwrap();
+        assert_eq!(data.weekly.percentage, 20.0);
+        assert!(data.weekly.resets_at.is_some());
+    }
+
+    #[test]
+    fn copilot_responses_without_a_readable_pool_are_rejected() {
+        assert!(copilot_usage(serde_json::json!({})).is_none());
+        assert!(copilot_usage(serde_json::json!({
+            "quota_snapshots": {
+                "premium_interactions": "unexpected",
+                "chat": {"unlimited": true}
+            }
+        }))
+        .is_none());
+        assert!(copilot_usage(serde_json::json!({
+            "quota_snapshots": {"premium_interactions": {"entitlement": 0, "remaining": 0}}
+        }))
+        .is_none());
+        assert!(copilot_usage(serde_json::json!({
+            "limited_user_quotas": {"chat": 1},
+            "monthly_quotas": {"chat": 0}
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn copilot_unlimited_premium_pool_reads_as_idle() {
+        let data = copilot_usage(serde_json::json!({
+            "quota_snapshots": {"premium_interactions": {"unlimited": true}}
+        }))
+        .unwrap();
+        assert_eq!(data.weekly.percentage, 0.0);
+    }
+
+    #[test]
+    fn copilot_tokens_that_could_split_a_header_are_refused() {
+        assert!(copilot_is_header_safe_token("gho_abc123"));
+        assert!(!copilot_is_header_safe_token(""));
+        assert!(!copilot_is_header_safe_token("gho_abc\r\nInjected: yes"));
+        assert!(!copilot_is_header_safe_token("two words"));
+    }
+
+    static COPILOT_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn copilot_environment_candidates_keep_cli_precedence_order() {
+        let _guard = COPILOT_TEST_ENV_LOCK.lock().unwrap();
+        let saved: Vec<(String, Option<String>)> = COPILOT_TOKEN_ENVIRONMENT
+            .iter()
+            .map(|name| (name.to_string(), std::env::var(name).ok()))
+            .collect();
+        std::env::set_var("COPILOT_GITHUB_TOKEN", "env-first-token");
+        std::env::set_var("GH_TOKEN", "env-second-token");
+        std::env::set_var("GITHUB_TOKEN", "env-third-token");
+        let candidates = copilot_token_candidates();
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(&name, value),
+                None => std::env::remove_var(&name),
+            }
+        }
+        // Environment candidates always come first in CLI precedence order,
+        // ahead of any stored Windows credentials on the machine.
+        assert!(candidates.len() >= 3);
+        assert_eq!(candidates[0].token, "env-first-token");
+        assert_eq!(candidates[1].token, "env-second-token");
+        assert_eq!(candidates[2].token, "env-third-token");
+    }
+
+    fn mock_copilot_user_request(
+        status: u16,
+        body: &str,
+    ) -> (Result<UsageData, PollError>, String) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/copilot_internal/user",
+            listener.local_addr().unwrap()
+        );
+        let response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let result = fetch_copilot_usage("test-token", &url);
+        (result, server.join().unwrap())
+    }
+
+    #[test]
+    fn copilot_request_sends_token_auth_and_maps_premium_pool() {
+        let body = serde_json::json!({
+            "copilot_plan": "business",
+            "quota_reset_date_utc": "2026-11-01T00:00:00.000Z",
+            "quota_snapshots": {
+                "premium_interactions": {
+                    "entitlement": 300, "remaining": 225, "percent_remaining": 75.0
+                }
+            }
+        })
+        .to_string();
+        let (result, request) = mock_copilot_user_request(200, &body);
+        assert!(request.contains("GET /copilot_internal/user"));
+        assert!(request.contains("Authorization: token test-token"));
+        assert!(request.contains("Accept: application/json"));
+        assert!(request.contains(&format!("User-Agent: {}/", env!("CARGO_PKG_NAME"))));
+        let data = result.unwrap();
+        assert_eq!(data.weekly.percentage, 25.0);
+        assert_eq!(
+            data.weekly.resets_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1_793_491_200))
+        );
+    }
+
+    #[test]
+    fn copilot_request_auth_and_status_mapping() {
+        let body = serde_json::json!({
+            "quota_snapshots": {
+                "premium_interactions": {"entitlement": 100, "remaining": 50}
+            }
+        })
+        .to_string();
+        let (result, _) = mock_copilot_user_request(401, &body);
+        assert!(matches!(result, Err(PollError::AuthRequired)));
+        let (result, _) = mock_copilot_user_request(
+            404,
+            &serde_json::json!({"message": "Not Found"}).to_string(),
+        );
+        // Documented deviation: 404 (valid login, no seat) surfaces as
+        // RequestFailed instead of continuing the candidate loop.
+        assert!(matches!(result, Err(PollError::RequestFailed)));
+        let (result, _) = mock_copilot_user_request(500, &body);
+        assert!(matches!(result, Err(PollError::ServerError)));
+        let (result, _) = mock_copilot_user_request(200, "not json");
+        assert!(matches!(result, Err(PollError::RequestFailed)));
+        let (result, _) = mock_copilot_user_request(200, "{}");
+        assert!(matches!(result, Err(PollError::RequestFailed)));
+    }
 
     const OPENCODE_GO_STATUS_FIXTURE: &str = r#"{
         "subscriberUserID": "usr_example",

@@ -3,12 +3,21 @@
 //! Launch: `SettingsUI.exe --pipe <full-name> --parent-pid <decimal> --page
 //! <general|monitoring|appearance|placement|about>`. No settings-file access.
 //! Duplex byte pipe: u32 little-endian byte length followed by UTF-8 JSON,
-//! 1..=65536 bytes. The server restricts access to the current token user,
+//! requests 1..=65536 bytes, responses 1..=2097152 bytes. The server restricts access to the current token user,
 //! rejects remote clients, and checks the client PID against the spawned child.
 //! Requests: {"v":1,"id":42,"op":"get"}, op="set" with "key" and
 //! "value", op="set_batch" with a sparse "changes" array (at most 20
 //! distinct settings), op="persist" to retry saving already-applied settings,
 //! or op="action" with "action". Unknown fields/keys are rejected.
+//! Draft preview: {"v":1,"id":42,"op":"preview","changes":{"show_bar":false}}.
+//! Uses the same validation as set_batch without persistence or publication.
+//! Preview responses retain canonical settings and effective metadata; only the
+//! preview image reflects the draft. They do not advance the revision.
+//! State includes optional widget_preview_image (data:image/bmp;base64,...),
+//! widget_preview_width and widget_preview_height in physical pixels, plus
+//! widget_preview_dpi (integer; convert pixels to DIP with pixels * 96 / DPI). Sample
+//! quotas are deterministic, not live usage. Outgoing frames allow up to 2 MiB;
+//! incoming requests retain their 64 KiB bound.
 //! IDs are unsigned 32-bit integers. Send one request at a time.
 //! Replies: {"v":1,"id":42,"ok":true,"revision":N,"state":{...}} or
 //! {"v":1,"id":42,"ok":false,"revision":N,"state":{...},"error":"...",
@@ -27,6 +36,11 @@
 //! show_claude_code, show_codex, show_antigravity,
 //! show_session_window, show_weekly_window, adaptive_refresh, anchor_left,
 //! settings_pane_open (booleans); poll_interval_ms (60000..=3600000 integer),
+//! show_provider_icon (boolean, legacy show_provider_icons alias), show_percentage,
+//! show_bar, show_reset_time (booleans; at least one of the latter three required),
+//! usage_text_color (null for palette text defaults, or [u8,u8,u8]; tints marks
+//! and percentages independently of provider bars), window_label_font_size
+//! (8..=14 integer, default 9; regular-weight usage-window labels),
 //! alert_threshold_percent (0|10|20|30); palette
 //! (system|high_contrast_dark|high_contrast_light), bar_style
 //! (continuous|segmented), bar_thickness (standard|slim), font_size
@@ -65,6 +79,7 @@ use std::time::{Duration, Instant};
 
 pub const WM_SETTINGS: u32 = 0x8000 + 20;
 const MAX_FRAME: usize = 65_536;
+const MAX_RESPONSE_FRAME: usize = 2 * 1024 * 1024;
 pub const MAX_BATCH_CHANGES: usize = 20;
 
 #[derive(Clone, Copy, Debug, Deserialize, serde::Serialize)]
@@ -83,6 +98,7 @@ pub enum Operation {
     Get,
     Set { key: Key, value: Value },
     SetBatch { changes: Vec<Change> },
+    Preview { changes: Vec<Change> },
     Persist,
     Action { action: Action },
 }
@@ -103,6 +119,12 @@ pub enum Key {
     WidgetVisible,
     ShowTrayIcon,
     ShowProviderIcons,
+    ShowProviderIcon,
+    ShowPercentage,
+    ShowBar,
+    ShowResetTime,
+    UsageTextColor,
+    WindowLabelFontSize,
     ShowClaudeCode,
     ShowCodex,
     ShowAntigravity,
@@ -435,6 +457,11 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
             id: u32,
             changes: Vec<Change>,
         },
+        Preview {
+            v: u32,
+            id: u32,
+            changes: std::collections::BTreeMap<String, Value>,
+        },
         Persist {
             v: u32,
             id: u32,
@@ -469,6 +496,26 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
                 operation: Operation::SetBatch { changes },
             }
         }
+        WireRequest::Preview { v, id, changes } => {
+            if changes.len() > MAX_BATCH_CHANGES {
+                return Err(format!(
+                    "A settings preview may contain at most {MAX_BATCH_CHANGES} changes"
+                ));
+            }
+            let changes = changes
+                .into_iter()
+                .map(|(key, value)| {
+                    let key =
+                        serde_json::from_value(Value::String(key)).map_err(|e| e.to_string())?;
+                    Ok(Change { key, value })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Request {
+                v,
+                id,
+                operation: Operation::Preview { changes },
+            }
+        }
         WireRequest::Persist { v, id } => Request {
             v,
             id,
@@ -488,7 +535,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
 
 fn frame(value: &Value) -> io::Result<Vec<u8>> {
     let bytes = serde_json::to_vec(value)?;
-    if bytes.is_empty() || bytes.len() > MAX_FRAME {
+    if bytes.is_empty() || bytes.len() > MAX_RESPONSE_FRAME {
         return Err(io::Error::other("Frame too large"));
     }
     let mut result = Vec::with_capacity(bytes.len() + 4);
@@ -945,7 +992,8 @@ mod tests {
             bytes.len() - 4
         );
         assert_eq!(serde_json::from_slice::<Value>(&bytes[4..]).unwrap(), value);
-        assert!(frame(&json!("x".repeat(MAX_FRAME))).is_err());
+        assert!(frame(&json!("x".repeat(MAX_FRAME))).is_ok());
+        assert!(frame(&json!("x".repeat(MAX_RESPONSE_FRAME))).is_err());
     }
 
     #[test]
@@ -1133,5 +1181,28 @@ mod tests {
         stop.store(true, Ordering::Release);
         worker.join().unwrap().unwrap();
         assert!(replied, "Authenticated child did not deliver its request");
+    }
+    #[test]
+    fn preview_requests_accept_only_a_bounded_known_changes_object() {
+        let request = parse_request(br#"{"v":1,"id":7,"op":"preview","changes":{"show_bar":false,"usage_text_color":[1,2,3],"window_label_font_size":9}}"#).unwrap();
+        let Operation::Preview { changes } = request.operation else {
+            panic!("expected preview");
+        };
+        assert_eq!(changes.len(), 3);
+        for wire in [
+            br#"{"v":1,"id":7,"op":"preview","changes":{"arbitrary":false}}"#.as_slice(),
+            br#"{"v":1,"id":7,"op":"preview","changes":[]}"#,
+            br#"{"v":1,"id":7,"op":"preview","changes":{},"extra":true}"#,
+            br#"{"v":2,"id":7,"op":"preview","changes":{}}"#,
+        ] {
+            assert!(parse_request(wire).is_err());
+        }
+        let changes: serde_json::Map<String, Value> = (0..=MAX_BATCH_CHANGES)
+            .map(|i| (format!("key_{i}"), json!(true)))
+            .collect();
+        assert!(parse_request(
+            &serde_json::to_vec(&json!({"v":1,"id":7,"op":"preview","changes":changes})).unwrap()
+        )
+        .is_err());
     }
 }

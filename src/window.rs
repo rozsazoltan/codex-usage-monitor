@@ -562,7 +562,7 @@ enum FontSize {
     Large,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct Appearance {
     palette: Palette,
@@ -573,6 +573,31 @@ struct Appearance {
     claude_accent: Option<[u8; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codex_accent: Option<[u8; 3]>,
+    show_provider_icon: bool,
+    show_percentage: bool,
+    show_bar: bool,
+    show_reset_time: bool,
+    usage_text_color: Option<[u8; 3]>,
+    window_label_font_size: u8,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            palette: Palette::default(),
+            bar_style: BarStyle::default(),
+            bar_thickness: BarThickness::default(),
+            font_size: FontSize::default(),
+            claude_accent: None,
+            codex_accent: None,
+            show_provider_icon: true,
+            show_percentage: true,
+            show_bar: true,
+            show_reset_time: true,
+            usage_text_color: None,
+            window_label_font_size: 9,
+        }
+    }
 }
 
 impl Appearance {
@@ -584,6 +609,7 @@ impl Appearance {
             font_size: FontSize::Large,
             claude_accent: None,
             codex_accent: None,
+            ..Self::default()
         }
     }
     fn is_dark(self, system_is_dark: bool) -> bool {
@@ -603,10 +629,11 @@ impl Appearance {
 
     /// Physical row height; large text needs one more pixel of line height.
     fn row_height(self) -> i32 {
-        sc(match self.font_size {
+        sc((match self.font_size {
             FontSize::Standard => ROW_HEIGHT,
             FontSize::Large => ROW_HEIGHT + 1,
         })
+        .max(i32::from(self.window_label_font_size) + 6))
     }
 
     fn bar_height(self) -> i32 {
@@ -783,6 +810,20 @@ fn load_settings_from_paths(
 }
 
 fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
+    // Preserve the pre-existing widget-icon preference on legacy settings.
+    if !settings.show_provider_icons {
+        settings.appearance.show_provider_icon = false;
+    }
+    settings.show_provider_icons = settings.appearance.show_provider_icon;
+    if !settings.appearance.show_percentage
+        && !settings.appearance.show_bar
+        && !settings.appearance.show_reset_time
+    {
+        settings.appearance.show_percentage = true;
+    }
+    if !(8..=14).contains(&settings.appearance.window_label_font_size) {
+        settings.appearance.window_label_font_size = 9;
+    }
     if !(POLL_1_MIN..=POLL_1_HOUR).contains(&settings.poll_interval_ms) {
         settings.poll_interval_ms = POLL_15_MIN;
     }
@@ -2445,7 +2486,8 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
             widest
         };
         let (labels, resets) = usage_layout_samples(language);
-        let label_font = create_widget_font(appearance);
+        let label_font =
+            quota_text::create_reset_font(sc(i32::from(appearance.window_label_font_size)));
         let reset_font = quota_text::create_reset_font(sc(appearance.font_px()));
         let widths = if label_font.is_invalid() || reset_font.is_invalid() {
             let _ = DeleteObject(label_font);
@@ -2459,7 +2501,13 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
             )
         };
         ReleaseDC(HWND::default(), hdc);
-        widths
+        let text_width = match (appearance.show_percentage, appearance.show_reset_time) {
+            (true, true) => widths.1,
+            (true, false) => sc(quota_text::percent_width(appearance.font_px())),
+            (false, true) => widths.1 - reset_x,
+            (false, false) => 0,
+        };
+        (widths.0, text_width)
     }
 }
 
@@ -2474,7 +2522,7 @@ fn usage_percent_for_display(language: LanguageId, used_percentage: f64) -> f64 
 fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: Appearance) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
     let (label_width, text_width) = usage_layout_widths(language, appearance);
-    let model_width = model_usage_width(bar_segments, text_width);
+    let model_width = model_usage_width(bar_segments, text_width, appearance);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
@@ -2549,22 +2597,6 @@ fn reset_text_color(appearance: Appearance, is_dark: bool) -> Color {
 
 fn antigravity_accent_color() -> Color {
     Color::from_hex("#4285F4")
-}
-
-fn claude_usage_text_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#F09A7A")
-    } else {
-        Color::from_hex("#A94F32")
-    }
-}
-
-fn antigravity_usage_text_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#8AB4F8")
-    } else {
-        Color::from_hex("#1967D2")
-    }
 }
 
 pub fn run() {
@@ -2901,7 +2933,7 @@ fn update_quota_tooltips() {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
             let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
-            let width = model_usage_width(row_bar_segment_count(count), text_width);
+            let width = model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + label_width
@@ -3203,7 +3235,7 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
-    show_provider_icons: bool,
+    _show_provider_icons: bool,
     show_session_window: bool,
     show_weekly_window: bool,
     codex_accent: &Color,
@@ -3272,7 +3304,8 @@ fn paint_content(
             sc(2)
         } else {
             sc(8)
-        };
+        }
+        .min((height - 2 * appearance.row_height()).max(0));
         let row1_y = (height - 2 * appearance.row_height() - row_gap).max(0) / 2;
         let row2_y = row1_y + appearance.row_height() + row_gap;
         let single_row_y = (height - appearance.row_height()) / 2;
@@ -3285,23 +3318,38 @@ fn paint_content(
 
         // Anchor provider marks to first row instead of floating at widget center.
         let icon_size = sc(provider_icons::SIZE);
-        let icon_y = if show_session_window {
+        let icon_y = if show_session_window && show_weekly_window {
             row1_y + (appearance.row_height() - icon_size) / 2
         } else {
             single_row_y + (appearance.row_height() - icon_size) / 2
         };
         let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-        let model_width = model_usage_width(row_bar_segment_count(active_models), text_width)
-            + sc(MODEL_RIGHT_MARGIN);
+        let model_width =
+            model_usage_width(row_bar_segment_count(active_models), text_width, appearance)
+                + sc(MODEL_RIGHT_MARGIN);
         let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
-            if show_provider_icons {
-                provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Claude);
+            if appearance.show_provider_icon {
+                provider_icons::draw(
+                    hdc,
+                    icon_x,
+                    icon_y,
+                    icon_size,
+                    Provider::Claude,
+                    appearance.usage_text_color,
+                );
             }
             icon_x += model_width;
         }
-        if show_codex && show_provider_icons {
-            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
+        if show_codex && appearance.show_provider_icon {
+            provider_icons::draw(
+                hdc,
+                icon_x,
+                icon_y,
+                icon_size,
+                Provider::Codex,
+                appearance.usage_text_color,
+            );
         }
 
         if show_session_window {
@@ -4487,7 +4535,13 @@ fn settings_snapshot() -> serde_json::Value {
     let dark = s.appearance.is_dark(s.is_dark);
     let claude = custom_color(s.appearance.claude_accent, claude_accent_color());
     let codex = custom_color(s.appearance.codex_accent, provider_icons::codex_color(dark));
+    let candidate = SettingsCandidate::from_app_state(s, startup);
+    let preview = widget_preview_image(&candidate, s.language, s.is_dark);
     json!({
+        "widget_preview_image":preview.as_ref().map(|image| image.0.as_str()),
+        "widget_preview_width":preview.as_ref().map(|image| image.1),
+        "widget_preview_height":preview.as_ref().map(|image| image.2),
+        "widget_preview_dpi":CURRENT_DPI.load(Ordering::Relaxed),
         "settings": {
             "language":s.language_override.map_or("system", LanguageId::code),
             "startup":startup, "widget_visible":s.widget_visible,
@@ -4499,6 +4553,11 @@ fn settings_snapshot() -> serde_json::Value {
             "adaptive_refresh":s.adaptive_refresh,"alert_threshold_percent":s.alert_threshold_percent,
             "palette":s.appearance.palette,"bar_style":s.appearance.bar_style,
             "bar_thickness":s.appearance.bar_thickness,"font_size":s.appearance.font_size,
+            "show_provider_icon":s.appearance.show_provider_icon,
+            "show_percentage":s.appearance.show_percentage,"show_bar":s.appearance.show_bar,
+            "show_reset_time":s.appearance.show_reset_time,
+            "usage_text_color":s.appearance.usage_text_color,
+            "window_label_font_size":s.appearance.window_label_font_size,
             "claude_accent":s.appearance.claude_accent,"codex_accent":s.appearance.codex_accent,
             "monitor_device":s.monitor_device,"anchor_left":s.anchor_left
         },
@@ -4513,6 +4572,234 @@ fn settings_snapshot() -> serde_json::Value {
     })
 }
 
+/// Return canonical settings with a draft bitmap, without changing or publishing state.
+fn preview_settings_snapshot(
+    changes: &[settings_ui::Change],
+) -> Result<serde_json::Value, SettingsApplyError> {
+    let snapshot = settings_snapshot();
+    let (current, available, language, system_dark) = {
+        let state = lock_state();
+        let s = state
+            .as_ref()
+            .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
+        (
+            SettingsCandidate::from_app_state(
+                s,
+                snapshot["settings"]["startup"].as_bool().unwrap_or(false),
+            ),
+            s.claude_code_available,
+            s.language,
+            s.is_dark,
+        )
+    };
+    let monitors = snapshot["monitors"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value["device"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    draft_settings_snapshot(
+        snapshot,
+        &current,
+        changes,
+        available,
+        &monitors,
+        language,
+        system_dark,
+    )
+}
+
+fn draft_settings_snapshot(
+    mut snapshot: serde_json::Value,
+    current: &SettingsCandidate,
+    changes: &[settings_ui::Change],
+    available: bool,
+    monitors: &[String],
+    language: LanguageId,
+    system_dark: bool,
+) -> Result<serde_json::Value, SettingsApplyError> {
+    let candidate = validate_settings_changes(current, changes, available, monitors)?;
+    let language = candidate.language_override.unwrap_or_else(|| {
+        if changes.iter().any(|change| change.key == Key::Language) {
+            localization::detect_system_language()
+        } else {
+            language
+        }
+    });
+    let preview = widget_preview_image(&candidate, language, system_dark);
+    snapshot["widget_preview_image"] =
+        serde_json::json!(preview.as_ref().map(|image| image.0.as_str()));
+    snapshot["widget_preview_width"] = serde_json::json!(preview.as_ref().map(|image| image.1));
+    snapshot["widget_preview_height"] = serde_json::json!(preview.as_ref().map(|image| image.2));
+    snapshot["widget_preview_dpi"] = CURRENT_DPI.load(Ordering::Relaxed).into();
+    Ok(snapshot)
+}
+
+/// Paint deterministic sample quotas through the real widget renderer into an
+/// isolated top-down DIB. No window handles or live quota state are involved.
+fn widget_preview_image(
+    candidate: &SettingsCandidate,
+    language: LanguageId,
+    system_dark: bool,
+) -> Option<(String, i32, i32)> {
+    let appearance = candidate.appearance;
+    let width = total_widget_width_for(
+        active_model_count(
+            candidate.show_claude_code,
+            candidate.show_codex,
+            candidate.show_antigravity,
+        ),
+        language,
+        appearance,
+    );
+    let height = sc(WIDGET_HEIGHT);
+    let byte_count = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(4)?;
+    if byte_count == 0 || byte_count > 1024 * 1024 {
+        return None;
+    }
+    let (bg, text, track) = appearance_colors(appearance, system_dark);
+    let claude = custom_color(appearance.claude_accent, claude_accent_color());
+    let codex = custom_color(
+        appearance.codex_accent,
+        provider_icons::codex_color(appearance.is_dark(system_dark)),
+    );
+    let antigravity = antigravity_accent_color();
+    unsafe {
+        let dc = CreateCompatibleDC(HDC::default());
+        if dc.is_invalid() {
+            return None;
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap =
+            CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+        if bitmap.is_invalid() || bits.is_null() {
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+            return None;
+        }
+        // Initialize the entire allocation even if a later GDI paint fails.
+        std::ptr::write_bytes(bits.cast::<u8>(), 0, byte_count);
+        let previous = SelectObject(dc, bitmap);
+        let strings = language.strings();
+        let (session, weekly) = if language == LanguageId::SimplifiedChinese {
+            ("82%  23:59重置".to_string(), "58%  12/31重置".to_string())
+        } else {
+            (
+                format!("18% · 2{}", strings.hour_suffix),
+                format!("42% · 3{}", strings.day_suffix),
+            )
+        };
+        paint_content(
+            dc,
+            width,
+            height,
+            system_dark,
+            appearance,
+            &bg,
+            &text,
+            &claude,
+            &track,
+            language,
+            strings,
+            18.0,
+            &session,
+            42.0,
+            &weekly,
+            18.0,
+            &session,
+            42.0,
+            &weekly,
+            18.0,
+            &session,
+            42.0,
+            &weekly,
+            candidate.show_claude_code,
+            candidate.show_codex,
+            candidate.show_antigravity,
+            candidate.show_provider_icons,
+            candidate.show_session_window,
+            candidate.show_weekly_window,
+            &codex,
+            &antigravity,
+        );
+        let _ = GdiFlush();
+        // SAFETY: the selected DIB provides byte_count initialized bytes until
+        // deletion below. Copy before releasing the bitmap and its DC.
+        let pixels = std::slice::from_raw_parts(bits.cast::<u8>(), byte_count);
+        let image = encode_preview_bmp(width, height, pixels);
+        SelectObject(dc, previous);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(dc);
+        Some((
+            format!("data:image/bmp;base64,{}", base64_encode(&image)),
+            width,
+            height,
+        ))
+    }
+}
+
+fn encode_preview_bmp(width: i32, height: i32, pixels: &[u8]) -> Vec<u8> {
+    let mut bmp = Vec::with_capacity(54 + pixels.len());
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&((54 + pixels.len()) as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&width.to_le_bytes());
+    bmp.extend_from_slice(&(-height).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0; 16]);
+    // BI_RGB is opaque BGRX: explicitly clear GDI's unspecified alpha byte.
+    bmp.extend_from_slice(pixels);
+    for alpha_index in (57..bmp.len()).step_by(4) {
+        bmp[alpha_index] = 0;
+    }
+    bmp
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let bits = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        encoded.push(char::from(ALPHABET[(bits >> 18) as usize]));
+        encoded.push(char::from(ALPHABET[((bits >> 12) & 63) as usize]));
+        encoded.push(if chunk.len() > 1 {
+            char::from(ALPHABET[((bits >> 6) & 63) as usize])
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            char::from(ALPHABET[(bits & 63) as usize])
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
 fn publish_settings() {
     settings_ui::publish(settings_snapshot());
 }
@@ -4525,7 +4812,6 @@ fn refresh_settings_availability() {
 }
 
 fn handle_settings_requests(hwnd: HWND) {
-    refresh_settings_availability();
     if let Some(error) = settings_ui::take_error() {
         show_error_message(hwnd, "Settings unavailable", &error);
     }
@@ -4535,6 +4821,19 @@ fn handle_settings_requests(hwnd: HWND) {
             continue;
         }
         handled_request = true;
+        if let Operation::Preview { changes } = &pending.request.operation {
+            // Drafts are read-only: no credential polling, publication, revision
+            // increment, persistence, HWND operation or backend reconfiguration.
+            let preview = preview_settings_snapshot(changes);
+            let (state, result) = match preview {
+                Ok(state) => (state, Ok(())),
+                Err(error) => (settings_snapshot(), Err(error)),
+            };
+            let reply = settings_reply(pending.request.id, settings_ui::revision(), state, result);
+            let _ = pending.reply.try_send(reply);
+            continue;
+        }
+        refresh_settings_availability();
         SETTINGS_SAVE_ERROR.with(|slot| slot.borrow_mut().take());
         let result = match pending.request.operation {
             Operation::Get => Ok(()),
@@ -4542,6 +4841,7 @@ fn handle_settings_requests(hwnd: HWND) {
                 apply_settings_batch(hwnd, &[settings_ui::Change { key, value }])
             }
             Operation::SetBatch { changes } => apply_settings_batch(hwnd, &changes),
+            Operation::Preview { .. } => unreachable!("preview handled without side effects"),
             Operation::Persist => persist_settings_request(),
             Operation::Action { action } => apply_settings_action(hwnd, action)
                 .map_err(|message| SettingsApplyError::new("action_failed", message))
@@ -4559,6 +4859,7 @@ fn handle_settings_requests(hwnd: HWND) {
         let _ = pending.reply.try_send(reply);
     }
     if !handled_request {
+        refresh_settings_availability();
         publish_settings();
     }
 }
@@ -4695,7 +4996,12 @@ fn validate_settings_changes(
     let mut candidate = current.clone();
     let mut seen = HashSet::with_capacity(changes.len());
     for change in changes {
-        if !seen.insert(change.key) {
+        let canonical_key = if change.key == Key::ShowProviderIcons {
+            Key::ShowProviderIcon
+        } else {
+            change.key
+        };
+        if !seen.insert(canonical_key) {
             return Err(invalid_setting(format!(
                 "The setting {:?} occurs more than once in the batch.",
                 change.key
@@ -4721,7 +5027,31 @@ fn validate_settings_changes(
             }
             Key::ShowTrayIcon => candidate.show_tray_icon = setting_value(change.value.clone())?,
             Key::ShowProviderIcons => {
-                candidate.show_provider_icons = setting_value(change.value.clone())?
+                candidate.show_provider_icons = setting_value(change.value.clone())?;
+                candidate.appearance.show_provider_icon = candidate.show_provider_icons;
+            }
+            Key::ShowProviderIcon => {
+                candidate.appearance.show_provider_icon = setting_value(change.value.clone())?;
+                candidate.show_provider_icons = candidate.appearance.show_provider_icon;
+            }
+            Key::ShowPercentage => {
+                candidate.appearance.show_percentage = setting_value(change.value.clone())?
+            }
+            Key::ShowBar => candidate.appearance.show_bar = setting_value(change.value.clone())?,
+            Key::ShowResetTime => {
+                candidate.appearance.show_reset_time = setting_value(change.value.clone())?
+            }
+            Key::UsageTextColor => {
+                candidate.appearance.usage_text_color = setting_value(change.value.clone())?
+            }
+            Key::WindowLabelFontSize => {
+                let size: u8 = setting_value(change.value.clone())?;
+                if !(8..=14).contains(&size) {
+                    return Err(invalid_setting(
+                        "Window label font size must be an integer between 8 and 14.",
+                    ));
+                }
+                candidate.appearance.window_label_font_size = size;
             }
             Key::ShowClaudeCode => {
                 candidate.show_claude_code = setting_value(change.value.clone())?
@@ -4784,6 +5114,14 @@ fn validate_settings_changes(
         }
     }
 
+    if !candidate.appearance.show_percentage
+        && !candidate.appearance.show_bar
+        && !candidate.appearance.show_reset_time
+    {
+        return Err(invalid_setting(
+            "At least one usage element must remain visible.",
+        ));
+    }
     if !candidate.show_claude_code && !candidate.show_codex && !candidate.show_antigravity {
         return Err(invalid_setting(
             "At least one provider must remain enabled.",
@@ -5274,22 +5612,13 @@ fn draw_row(
 ) {
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1 && appearance.palette == Palette::System;
-    let is_dark = appearance.is_dark(is_dark);
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = provider_icons::codex_color(is_dark);
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
+    let value_color = custom_color(appearance.usage_text_color, *text_color);
 
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let label_font =
+            quota_text::create_reset_font(sc(i32::from(appearance.window_label_font_size)));
+        let previous_font = SelectObject(hdc, label_font);
         let mut label_wide: Vec<u16> = label.encode_utf16().collect();
         let mut label_rect = RECT {
             left: x,
@@ -5303,53 +5632,57 @@ fn draw_row(
             &mut label_rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
+        SelectObject(hdc, previous_font);
+        let _ = DeleteObject(label_font);
 
         let mut model_x = x + label_width + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + provider_icon_width(appearance),
                 y,
                 segment_count,
                 claude_percent,
                 claude_text,
                 claude_accent,
                 track,
-                &claude_value_color,
+                &value_color,
                 text_width,
                 is_dark,
                 appearance,
             );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + provider_icon_width(appearance),
                 y,
                 segment_count,
                 codex_percent,
                 codex_text,
                 codex_accent,
                 track,
-                &codex_value_color,
+                &value_color,
                 text_width,
                 is_dark,
                 appearance,
             );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + provider_icon_width(appearance),
                 y,
                 segment_count,
                 antigravity_percent,
                 antigravity_text,
                 antigravity_accent,
                 track,
-                &antigravity_value_color,
+                &value_color,
                 text_width,
                 is_dark,
                 appearance,
@@ -5358,11 +5691,26 @@ fn draw_row(
     }
 }
 
-fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
-    sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN)
-        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
-        - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
+fn provider_icon_width(appearance: Appearance) -> i32 {
+    if appearance.show_provider_icon {
+        sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN)
+    } else {
+        0
+    }
+}
+
+fn model_usage_width(segment_count: i32, text_width: i32, appearance: Appearance) -> i32 {
+    provider_icon_width(appearance)
+        + if appearance.show_bar {
+            (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
+                + if text_width > 0 {
+                    sc(BAR_RIGHT_MARGIN)
+                } else {
+                    0
+                }
+        } else {
+            0
+        }
         + text_width
 }
 
@@ -5396,7 +5744,9 @@ fn draw_usage_bar(
     let bar_y = y + (appearance.row_height() - seg_h) / 2;
 
     let percent_clamped = usage_bar_fill_percentage(percent, text);
-    if appearance.bar_style == BarStyle::Segmented {
+    if !appearance.show_bar {
+        // Hidden bars reserve no width and perform no GDI drawing.
+    } else if appearance.bar_style == BarStyle::Segmented {
         for i in 0..segment_count {
             let rect = RECT {
                 left: bar_x + i * (seg_w + seg_gap),
@@ -5420,7 +5770,12 @@ fn draw_usage_bar(
         fill_rounded_bar(hdc, &rect, percent_clamped / 100.0, accent, corner_r);
     }
 
-    let text_x = bar_x + bar_width + sc(BAR_RIGHT_MARGIN);
+    let text_x = bar_x
+        + if appearance.show_bar {
+            bar_width + sc(BAR_RIGHT_MARGIN)
+        } else {
+            0
+        };
     quota_text::draw(
         hdc,
         text_x,
@@ -5431,6 +5786,8 @@ fn draw_usage_bar(
         text_color,
         &reset_text_color(appearance, is_dark),
         appearance.font_px(),
+        appearance.show_percentage,
+        appearance.show_reset_time,
         sc,
     );
 }
@@ -5520,6 +5877,355 @@ fn draw_rounded_shape(hdc: HDC, rect: &RECT, color: &Color, radius: i32, fractio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widget_elements_default_and_legacy_settings_round_trip() {
+        let legacy: SettingsFile = serde_json::from_str("{}").unwrap();
+        let a = legacy.appearance;
+        assert!(a.show_provider_icon && a.show_percentage && a.show_bar && a.show_reset_time);
+        assert_eq!(a.usage_text_color, None);
+        assert_eq!(a.window_label_font_size, 9);
+        let settings = SettingsFile {
+            appearance: Appearance {
+                show_provider_icon: false,
+                show_percentage: false,
+                show_bar: false,
+                usage_text_color: Some([12, 34, 56]),
+                window_label_font_size: 14,
+                ..Appearance::default()
+            },
+            ..SettingsFile::default()
+        };
+        let loaded: SettingsFile =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.appearance, settings.appearance);
+        let old_icons =
+            normalize_settings(serde_json::from_str(r#"{"show_provider_icons":false}"#).unwrap());
+        assert!(!old_icons.appearance.show_provider_icon);
+    }
+
+    #[test]
+    fn widget_elements_normalize_invalid_saved_settings() {
+        let normalized = normalize_settings(SettingsFile {
+            appearance: Appearance {
+                show_percentage: false,
+                show_bar: false,
+                show_reset_time: false,
+                window_label_font_size: 255,
+                ..Appearance::default()
+            },
+            ..SettingsFile::default()
+        });
+        assert!(normalized.appearance.show_percentage);
+        assert!(!normalized.appearance.show_bar && !normalized.appearance.show_reset_time);
+        assert_eq!(normalized.appearance.window_label_font_size, 9);
+    }
+
+    #[test]
+    fn widget_element_validation_uses_final_candidate_and_rejects_last_element() {
+        use serde_json::json;
+        let current = SettingsCandidate::from_settings(
+            &SettingsFile {
+                appearance: Appearance {
+                    show_bar: false,
+                    show_reset_time: false,
+                    ..Appearance::default()
+                },
+                ..SettingsFile::default()
+            },
+            false,
+        );
+        let off = settings_ui::Change {
+            key: Key::ShowPercentage,
+            value: json!(false),
+        };
+        let on = settings_ui::Change {
+            key: Key::ShowBar,
+            value: json!(true),
+        };
+        assert!(
+            validate_settings_changes(&current, std::slice::from_ref(&off), false, &[]).is_err()
+        );
+        for changes in [[off.clone(), on.clone()], [on.clone(), off.clone()]] {
+            let candidate = validate_settings_changes(&current, &changes, false, &[]).unwrap();
+            assert!(!candidate.appearance.show_percentage && candidate.appearance.show_bar);
+        }
+        let default = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        let changes = [Key::ShowPercentage, Key::ShowBar, Key::ShowResetTime].map(|key| {
+            settings_ui::Change {
+                key,
+                value: json!(false),
+            }
+        });
+        assert!(validate_settings_changes(&default, &changes, false, &[]).is_err());
+        assert!(current.appearance.show_percentage && !current.appearance.show_bar);
+    }
+
+    #[test]
+    fn widget_colors_font_and_switches_are_strictly_typed() {
+        use serde_json::json;
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        for (key, value) in [
+            (Key::UsageTextColor, json!([256, 0, 0])),
+            (Key::UsageTextColor, json!([-1, 0, 0])),
+            (Key::UsageTextColor, json!([0, 0])),
+            (Key::UsageTextColor, json!("#ffffff")),
+            (Key::WindowLabelFontSize, json!(7)),
+            (Key::WindowLabelFontSize, json!(15)),
+            (Key::WindowLabelFontSize, json!(9.5)),
+            (Key::WindowLabelFontSize, json!("9")),
+            (Key::ShowProviderIcon, json!(0)),
+            (Key::ShowPercentage, json!("false")),
+            (Key::ShowBar, json!(null)),
+            (Key::ShowResetTime, json!(1)),
+        ] {
+            assert!(validate_settings_changes(
+                &current,
+                &[settings_ui::Change { key, value }],
+                false,
+                &[]
+            )
+            .is_err());
+        }
+        for size in 8..=14 {
+            let candidate = validate_settings_changes(
+                &current,
+                &[settings_ui::Change {
+                    key: Key::WindowLabelFontSize,
+                    value: json!(size),
+                }],
+                false,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(candidate.appearance.window_label_font_size, size);
+        }
+        let candidate = validate_settings_changes(
+            &current,
+            &[settings_ui::Change {
+                key: Key::UsageTextColor,
+                value: json!([0, 128, 255]),
+            }],
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(candidate.appearance.usage_text_color, Some([0, 128, 255]));
+        assert_eq!(
+            candidate.appearance.codex_accent,
+            current.appearance.codex_accent
+        );
+        let cleared = validate_settings_changes(
+            &candidate,
+            &[settings_ui::Change {
+                key: Key::UsageTextColor,
+                value: json!(null),
+            }],
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cleared.appearance.usage_text_color, None);
+    }
+
+    #[test]
+    fn hidden_widget_columns_release_their_width() {
+        let a = Appearance::default();
+        let width = total_widget_width_for(1, LanguageId::English, a);
+        for hidden in [
+            Appearance {
+                show_provider_icon: false,
+                ..a
+            },
+            Appearance {
+                show_bar: false,
+                ..a
+            },
+            Appearance {
+                show_percentage: false,
+                ..a
+            },
+            Appearance {
+                show_reset_time: false,
+                ..a
+            },
+        ] {
+            assert!(total_widget_width_for(1, LanguageId::English, hidden) < width);
+        }
+        let bar_only = Appearance {
+            show_provider_icon: false,
+            show_percentage: false,
+            show_reset_time: false,
+            ..a
+        };
+        assert_eq!(usage_layout_widths(LanguageId::English, bar_only).1, 0);
+        assert_eq!(
+            model_usage_width(10, 0, bar_only),
+            (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * 10 - sc(SEGMENT_GAP)
+        );
+    }
+
+    #[test]
+    fn recommended_and_reset_appearance_restore_widget_defaults() {
+        for a in [
+            Appearance::default(),
+            Appearance::translucent_dark_taskbar(),
+        ] {
+            assert!(a.show_provider_icon && a.show_percentage && a.show_bar && a.show_reset_time);
+            assert_eq!(a.window_label_font_size, 9);
+            assert_eq!(a.usage_text_color, None);
+        }
+    }
+
+    #[test]
+    fn draft_preview_renders_without_mutating_canonical_snapshot_or_candidate() {
+        use serde_json::json;
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        let original = current.clone();
+        let canonical = json!({"settings":{"show_bar":true},"monitors":[],"effective_language":"en","effective_appearance":{"dark":true}});
+        let original_snapshot = canonical.clone();
+        let draft = draft_settings_snapshot(
+            canonical.clone(),
+            &current,
+            &[settings_ui::Change {
+                key: Key::ShowBar,
+                value: json!(false),
+            }],
+            false,
+            &[],
+            LanguageId::English,
+            true,
+        )
+        .unwrap();
+        assert_eq!(draft["settings"], canonical["settings"]);
+        assert_eq!(draft["effective_language"], canonical["effective_language"]);
+        assert_eq!(
+            draft["effective_appearance"],
+            canonical["effective_appearance"]
+        );
+        assert_eq!(
+            draft["widget_preview_dpi"],
+            CURRENT_DPI.load(Ordering::Relaxed)
+        );
+        assert!(draft["widget_preview_image"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/bmp;base64,Qk"));
+        assert_eq!(draft["widget_preview_height"], sc(WIDGET_HEIGHT));
+        assert!(
+            draft["widget_preview_width"].as_i64().unwrap()
+                < i64::from(total_widget_width_for(
+                    1,
+                    LanguageId::English,
+                    current.appearance
+                ))
+        );
+        assert_eq!(current, original);
+        assert_eq!(canonical, original_snapshot);
+        let invalid = [Key::ShowBar, Key::ShowPercentage, Key::ShowResetTime].map(|key| {
+            settings_ui::Change {
+                key,
+                value: json!(false),
+            }
+        });
+        assert!(draft_settings_snapshot(
+            canonical.clone(),
+            &current,
+            &invalid,
+            false,
+            &[],
+            LanguageId::English,
+            true
+        )
+        .is_err());
+        assert_eq!(canonical, original_snapshot);
+    }
+
+    #[test]
+    fn preview_bmp_is_top_down_bgrx_and_base64_padding_is_standard() {
+        for (bytes, expected) in [
+            (b"".as_slice(), ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+        ] {
+            assert_eq!(base64_encode(bytes), expected);
+        }
+        let bmp = encode_preview_bmp(1, 1, &[1, 2, 3, 255]);
+        assert_eq!(&bmp[..2], b"BM");
+        assert_eq!(u32::from_le_bytes(bmp[2..6].try_into().unwrap()), 58);
+        assert_eq!(i32::from_le_bytes(bmp[22..26].try_into().unwrap()), -1);
+        assert_eq!(&bmp[54..], &[1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn real_widget_preview_round_trips_through_the_windows_bitmap_loader() {
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        let (image, width, height) =
+            widget_preview_image(&current, LanguageId::English, true).unwrap();
+        let encoded = image.strip_prefix("data:image/bmp;base64,").unwrap();
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut bytes = Vec::new();
+        for group in encoded.as_bytes().chunks_exact(4) {
+            let mut bits = 0u32;
+            for glyph in group {
+                let digit = if *glyph == b'=' {
+                    0
+                } else {
+                    alphabet.iter().position(|value| value == glyph).unwrap() as u32
+                };
+                bits = (bits << 6) | digit;
+            }
+            bytes.push((bits >> 16) as u8);
+            if group[2] != b'=' {
+                bytes.push((bits >> 8) as u8);
+            }
+            if group[3] != b'=' {
+                bytes.push(bits as u8);
+            }
+        }
+        assert_eq!(bytes.len(), 54 + (width * height * 4) as usize);
+        assert_eq!(height, sc(WIDGET_HEIGHT));
+        let path = std::env::temp_dir().join(format!(
+            "codex-widget-preview-{}-{}.bmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let wide_path = native_interop::wide_str(path.to_str().unwrap());
+        let loaded = unsafe {
+            LoadImageW(
+                None,
+                PCWSTR(wide_path.as_ptr()),
+                IMAGE_BITMAP,
+                0,
+                0,
+                LR_LOADFROMFILE | LR_CREATEDIBSECTION,
+            )
+        };
+        std::fs::remove_file(&path).unwrap();
+        let loaded =
+            loaded.expect("the Windows bitmap decoder must accept the actual renderer output");
+        let mut bitmap = BITMAP::default();
+        let size = unsafe {
+            GetObjectW(
+                HGDIOBJ(loaded.0),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some((&mut bitmap as *mut BITMAP).cast()),
+            )
+        };
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(loaded.0));
+        }
+        assert_eq!(size, std::mem::size_of::<BITMAP>() as i32);
+        assert_eq!(bitmap.bmWidth, width);
+        assert_eq!(bitmap.bmHeight, height);
+        assert_eq!(bitmap.bmBitsPixel, 32);
+    }
 
     #[test]
     fn automatic_update_check_remains_due_every_24_hours() {
@@ -6073,28 +6779,35 @@ mod tests {
                 (rect.right, rect.bottom)
             };
             for language in LanguageId::ALL {
-                for (palette, font_size) in [
+                for (palette, font_size, window_label_font_size) in [
                     (Palette::System, FontSize::Standard),
                     (Palette::System, FontSize::Large),
                     (Palette::HighContrastDark, FontSize::Standard),
                     (Palette::HighContrastDark, FontSize::Large),
-                ] {
+                ]
+                .into_iter()
+                .flat_map(|(palette, font_size)| {
+                    (8..=14).map(move |size| (palette, font_size, size))
+                }) {
                     let appearance = Appearance {
                         palette,
                         font_size,
+                        window_label_font_size,
                         ..Appearance::default()
                     };
                     let (label_width, text_width) = usage_layout_widths(language, appearance);
                     let reset_width =
                         text_width - sc(quota_text::reset_offset(appearance.font_px()));
-                    let label_font = create_widget_font(appearance);
+                    let label_font = quota_text::create_reset_font(sc(i32::from(
+                        appearance.window_label_font_size,
+                    )));
                     let reset_font = quota_text::create_reset_font(sc(appearance.font_px()));
                     assert!(!label_font.is_invalid() && !reset_font.is_invalid());
                     let (labels, resets) = usage_layout_samples(language);
                     for label in labels {
                         let (width, height) = width_of(label_font, label);
                         assert!(width <= label_width, "{language:?}: {label:?}");
-                        assert!(height <= appearance.row_height(), "{language:?}: {label:?}");
+                        assert!(height <= appearance.row_height(), "{language:?}: {label:?}, label size {window_label_font_size}, height {height}, row {}", appearance.row_height());
                     }
                     for reset in &resets {
                         let (width, height) = width_of(reset_font, reset);
@@ -6623,6 +7336,7 @@ unsafe fn handle_command(hwnd: HWND, id: u16) {
                 if let Some(s) = lock_state().as_mut() {
                     s.appearance.claude_accent = None;
                     s.appearance.codex_accent = None;
+                    s.appearance.usage_text_color = None;
                 }
             } else {
                 let initial = {
@@ -6687,6 +7401,9 @@ unsafe fn handle_command(hwnd: HWND, id: u16) {
                         IDM_FONT_STANDARD => s.appearance.font_size = FontSize::Standard,
                         IDM_FONT_LARGE => s.appearance.font_size = FontSize::Large,
                         _ => {}
+                    }
+                    if matches!(id, IDM_APPEARANCE_RECOMMENDED | IDM_APPEARANCE_RESET) {
+                        s.show_provider_icons = s.appearance.show_provider_icon;
                     }
                 }
             }

@@ -15,7 +15,7 @@ fn cell(width: i32, font_px: i32) -> i32 {
     (width * font_px + BASE_FONT_PX - 1) / BASE_FONT_PX
 }
 
-fn percent_width(font_px: i32) -> i32 {
+pub fn percent_width(font_px: i32) -> i32 {
     cell(DIGIT_CELL, font_px) * 3 + cell(PERCENT_CELL, font_px)
 }
 
@@ -90,6 +90,8 @@ pub fn draw(
     primary: &Color,
     secondary: &Color,
     font_px: i32,
+    show_percentage: bool,
+    show_reset_time: bool,
     scale: impl Fn(i32) -> i32,
 ) {
     let (percentage, reset) = parts(value);
@@ -102,7 +104,9 @@ pub fn draw(
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(primary.to_colorref()));
     }
-    if let Some(cells) = percentage_cells(percentage) {
+    if !show_percentage {
+        // The reset column moves to the start; hidden values reserve no cells.
+    } else if let Some(cells) = percentage_cells(percentage) {
         for (index, glyph) in cells.chars().enumerate() {
             if glyph == ' ' {
                 continue;
@@ -130,11 +134,15 @@ pub fn draw(
     } else {
         text(hdc, percentage, rect, DT_RIGHT);
     }
-    if reset.is_empty() {
+    if reset.is_empty() || !show_reset_time {
         return;
     }
 
-    let reset_x = x + scale(reset_offset(font_px));
+    let reset_x = x + if show_percentage {
+        scale(reset_offset(font_px))
+    } else {
+        0
+    };
     unsafe {
         let font = create_reset_font(scale(font_px));
         let old_font = SelectObject(hdc, font);

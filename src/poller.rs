@@ -1,9 +1,12 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -206,6 +209,7 @@ pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
         2 => poll_antigravity(),
         3 => poll_opencode(),
         4 => poll_cursor(),
+        5 => poll_grok(),
         _ => Err(PollError::RequestFailed),
     }
 }
@@ -1846,6 +1850,400 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
+// ---------------------------------------------------------------------------
+// Grok Build provider (P3).
+//
+// Ported from CodeZeno's `src/poller/grok.rs`: Grok Build reads its own
+// `/usage` panel from the CLI chat proxy, and the monitor asks the same
+// endpoint with the session the CLI already stored. The billing pool lands
+// in the weekly slot (Grok has no five-hour window); per-product limits,
+// the monthly label, and on-demand credits reach UsageData in P5.
+// ---------------------------------------------------------------------------
+
+const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+/// Static marker the proxy uses to route CLI user-token requests.
+const GROK_TOKEN_AUTH: &str = "xai-grok-cli";
+const GROK_CLIENT_MODE: &str = "cli";
+/// Used only when the installed CLI cannot be asked for its own version.
+const DEFAULT_GROK_CLIENT_VERSION: &str = "1.0.0";
+const GROK_HOME_ENV: &str = "GROK_HOME";
+const GROK_CLIENT_VERSION_ENV: &str = "GROK_CLIENT_VERSION";
+
+/// One entry of `auth.json`, keyed by `"{issuer}::{client_id}"` or the
+/// legacy `"https://accounts.x.ai/sign-in"` scope.
+#[derive(Clone, Debug, Deserialize)]
+struct GrokAuthEntry {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrokBillingResponse {
+    #[serde(default)]
+    config: Option<GrokBillingConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrokBillingConfig {
+    #[serde(default, rename = "creditUsagePercent")]
+    credit_usage_percent: Option<f64>,
+    #[serde(default, rename = "currentPeriod")]
+    current_period: Option<GrokBillingPeriod>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrokBillingPeriod {
+    #[serde(default)]
+    end: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GrokSession {
+    access_token: String,
+    user_id: String,
+    /// The CLI can renew this session silently, without a browser.
+    can_refresh: bool,
+}
+
+fn poll_grok() -> Result<UsageData, PollError> {
+    let path = grok_auth_path().ok_or(PollError::NoCredentials)?;
+    let session = match read_grok_session(&path) {
+        Some(session) => session,
+        None => {
+            diagnose::log(
+                "Grok usage poll failed: no Grok session found (run 'grok login' to sign in)",
+            );
+            return Err(PollError::NoCredentials);
+        }
+    };
+
+    match fetch_grok_usage(&session, GROK_BILLING_URL) {
+        Err(PollError::AuthRequired) => {
+            // The CLI owns this file and refreshes it silently whenever it
+            // needs a token, so let it do the work rather than racing its
+            // lock with a refresh of our own. Without a refresh token it
+            // would fall back to an interactive browser sign-in, which a
+            // background monitor must never trigger.
+            if !session.can_refresh {
+                return Err(PollError::TokenExpired);
+            }
+            cli_refresh_grok_token();
+            let refreshed = read_grok_session(&path).ok_or(PollError::TokenExpired)?;
+            if refreshed.access_token == session.access_token {
+                return Err(PollError::TokenExpired);
+            }
+            fetch_grok_usage(&refreshed, GROK_BILLING_URL)
+        }
+        other => other,
+    }
+}
+
+fn grok_auth_path() -> Option<PathBuf> {
+    if let Some(home) = opencode_non_empty_env(GROK_HOME_ENV) {
+        return Some(PathBuf::from(home).join("auth.json"));
+    }
+    Some(dirs::home_dir()?.join(".grok").join("auth.json"))
+}
+
+fn read_grok_session(path: &Path) -> Option<GrokSession> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            diagnose::log_error(
+                &format!("unable to read Grok credentials at {}", path.display()),
+                error,
+            );
+            return None;
+        }
+    };
+    select_grok_session(&content)
+}
+
+/// `auth.json` can also hold corporate OIDC tokens and plain API keys. Only
+/// xAI sign-in scopes belong at the fixed production billing endpoint.
+/// Prefer the latest-expiring usable xAI session.
+fn select_grok_session(content: &str) -> Option<GrokSession> {
+    let entries: BTreeMap<String, GrokAuthEntry> = serde_json::from_str(content).ok()?;
+    entries
+        .into_iter()
+        .filter(|(scope, _)| {
+            scope == "https://accounts.x.ai/sign-in"
+                || scope
+                    .strip_prefix("https://auth.x.ai::")
+                    .is_some_and(|client| !client.is_empty())
+        })
+        .map(|(_, entry)| entry)
+        .filter(|entry| !entry.key.trim().is_empty())
+        .max_by_key(|entry| {
+            entry
+                .expires_at
+                .as_deref()
+                .and_then(|value| parse_iso8601(Some(value)))
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_secs())
+                .unwrap_or(0)
+        })
+        .map(|entry| GrokSession {
+            access_token: entry.key.trim().to_string(),
+            user_id: entry.user_id.unwrap_or_default().trim().to_string(),
+            can_refresh: entry
+                .refresh_token
+                .is_some_and(|token| !token.trim().is_empty()),
+        })
+}
+
+fn fetch_grok_usage(session: &GrokSession, url: &str) -> Result<UsageData, PollError> {
+    let agent = build_agent()?;
+    let mut request = agent
+        .get(url)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .set("X-XAI-Token-Auth", GROK_TOKEN_AUTH)
+        .set("x-grok-client-mode", GROK_CLIENT_MODE)
+        .set("x-grok-client-version", &grok_client_version());
+    if !session.user_id.is_empty() {
+        request = request.set("x-userid", &session.user_id);
+    }
+
+    let resp = match request.call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            diagnose::log(format!(
+                "Grok billing endpoint returned auth error status {code}; refresh required"
+            ));
+            return Err(PollError::AuthRequired);
+        }
+        Err(error) => {
+            diagnose::log(format!("Grok billing endpoint request failed: {error:?}"));
+            return Err(classify_ureq_error(&error));
+        }
+    };
+
+    let response: GrokBillingResponse = match resp.into_json() {
+        Ok(response) => response,
+        Err(error) => {
+            diagnose::log(format!("unable to parse Grok billing response: {error:?}"));
+            return Err(PollError::RequestFailed);
+        }
+    };
+    grok_usage_from_billing(response).ok_or_else(|| {
+        diagnose::log("Grok billing response missing credit usage".to_string());
+        PollError::RequestFailed
+    })
+}
+
+fn grok_usage_from_billing(response: GrokBillingResponse) -> Option<UsageData> {
+    let config = response.config?;
+    let period = config.current_period.as_ref();
+    let resets_at = period.and_then(|period| grok_period_end(period.end.as_ref()));
+    // The proxy speaks protobuf JSON, which omits zero values: right after a
+    // reset a complete period (with a usable end) arrives without
+    // `creditUsagePercent`. That is 0% spent.
+    let percentage = config.credit_usage_percent.or(resets_at.map(|_| 0.0))?;
+    // Grok spends one pool per billing period and has no five-hour window, so
+    // the pool lands in `weekly`, which is what tray badges read. The
+    // monthly label and on-demand credits reach UsageData in P5.
+    Some(UsageData {
+        session: UsageSection::default(),
+        weekly: UsageSection {
+            percentage: percentage.clamp(0.0, 100.0),
+            resets_at,
+        },
+    })
+}
+
+/// The proxy returns an RFC 3339 timestamp, but proto3 JSON also allows a
+/// bare number of seconds.
+fn grok_period_end(value: Option<&serde_json::Value>) -> Option<SystemTime> {
+    match value? {
+        serde_json::Value::String(text) => parse_iso8601(Some(text)),
+        serde_json::Value::Number(number) => {
+            let seconds = number.as_f64()?;
+            // Milliseconds once the value is far past any plausible epoch second.
+            let seconds = if seconds > 100_000_000_000.0 {
+                seconds / 1000.0
+            } else {
+                seconds
+            };
+            if seconds <= 0.0 {
+                return None;
+            }
+            UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(seconds).ok()?)
+        }
+        _ => None,
+    }
+}
+
+/// Cache a detected CLI version, but retry after transient detection failures.
+fn grok_client_version() -> String {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    cached_grok_cli_detection(&VERSION, || {
+        opencode_non_empty_env(GROK_CLIENT_VERSION_ENV).or_else(cli_grok_version)
+    })
+    .unwrap_or_else(|| DEFAULT_GROK_CLIENT_VERSION.to_string())
+}
+
+/// Only successful discovery is stable enough to cache for this process.
+fn cached_grok_cli_detection(
+    cache: &OnceLock<String>,
+    detect: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    cache.get().cloned().or_else(|| {
+        let detected = detect()?;
+        let _ = cache.set(detected.clone());
+        Some(detected)
+    })
+}
+
+fn cli_grok_version() -> Option<String> {
+    let version = read_grok_cli_version(&resolve_windows_grok_path(), Duration::from_secs(5))?;
+    diagnose::log(format!("Grok CLI reports version {version}"));
+    Some(version)
+}
+
+fn read_grok_cli_version(path: &str, timeout: Duration) -> Option<String> {
+    let start = std::time::Instant::now();
+    let mut child = grok_command(path, &["version"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Drain while the process runs so a full pipe cannot block its exit.
+    // Bound both the captured output and the wait, including inherited pipes.
+    std::thread::spawn(move || {
+        let mut output = String::new();
+        let result = stdout.take(64 * 1024).read_to_string(&mut output);
+        let _ = sender.send(result.ok().map(|_| output));
+    });
+    if !wait_for_grok_command(&mut child, timeout) {
+        return None;
+    }
+    let output = receiver
+        .recv_timeout(timeout.saturating_sub(start.elapsed()))
+        .ok()??;
+    first_grok_version(&output)
+}
+
+/// Pick the first `major.minor.patch` token out of arbitrary CLI output.
+fn first_grok_version(text: &str) -> Option<String> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map(|token| token.trim_matches('.'))
+        .find(|token| {
+            let mut parts = token.split('.');
+            let numeric = |part: Option<&str>| {
+                part.is_some_and(|part| {
+                    !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+                })
+            };
+            numeric(parts.next()) && numeric(parts.next()) && numeric(parts.next())
+        })
+        .map(str::to_string)
+}
+
+/// `grok models` needs a valid token but no model call, so it refreshes the
+/// stored session without spending any of the allowance.
+fn cli_refresh_grok_token() {
+    let grok_path = resolve_windows_grok_path();
+    diagnose::log(format!(
+        "attempting Windows Grok token refresh via {grok_path}"
+    ));
+
+    let mut child = match grok_command(&grok_path, &["models"]).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            diagnose::log_error("unable to spawn Windows Grok token refresh", error);
+            return;
+        }
+    };
+    wait_for_grok_command(&mut child, Duration::from_secs(30));
+}
+
+fn grok_command(grok_path: &str, args: &[&str]) -> Command {
+    let lowercase = grok_path.to_lowercase();
+    let mut command = if lowercase.ends_with(".cmd") || lowercase.ends_with(".bat") {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/d").arg("/c").arg(grok_path).args(args);
+        command
+    } else if lowercase.ends_with(".ps1") {
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(grok_path)
+            .args(args);
+        command
+    } else {
+        let mut command = Command::new(grok_path);
+        command.args(args);
+        command
+    };
+    command
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    command
+}
+
+fn resolve_windows_grok_path() -> String {
+    static PATH: OnceLock<String> = OnceLock::new();
+    cached_grok_cli_detection(&PATH, || {
+        // The official installer drops a real executable in ~/.grok/bin;
+        // prefer it over an npm shim that would cost an extra cmd.exe hop.
+        for name in ["grok.exe", "grok.cmd", "grok.ps1", "grok"] {
+            if let Ok(output) = Command::new("where.exe")
+                .arg(name)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Some(path) = stdout
+                        .lines()
+                        .next()
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                    {
+                        return Some(path.to_string());
+                    }
+                }
+            }
+        }
+        None
+    })
+    .unwrap_or_else(|| "grok.cmd".to_string())
+}
+
+fn wait_for_grok_command(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 struct Credentials {
     access_token: String,
     expires_at: Option<i64>,
@@ -2889,6 +3287,349 @@ mod tests {
         std::fs::remove_file(&fixture).unwrap();
         std::fs::remove_file(&empty_fixture).unwrap();
         std::fs::remove_dir_all(&appdata).unwrap();
+    }
+
+    /// Serializes Grok test env mutation. Both request tests pin the same
+    /// client version so the process-wide version cache is deterministic
+    /// regardless of test execution order.
+    static GROK_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_grok_test_version<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = GROK_TEST_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(GROK_CLIENT_VERSION_ENV).ok();
+        unsafe {
+            std::env::set_var(GROK_CLIENT_VERSION_ENV, "9.9.9-test");
+        }
+        let result = f();
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var(GROK_CLIENT_VERSION_ENV, value),
+                None => std::env::remove_var(GROK_CLIENT_VERSION_ENV),
+            }
+        }
+        result
+    }
+
+    const GROK_BILLING_FIXTURE: &str = r#"{
+        "config": {
+            "creditUsagePercent": 48.0,
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "end": "2026-09-27T13:10:00.412622+00:00"
+            },
+            "productUsage": [{"product": "GrokBuild", "usagePercent": 48.0}]
+        }
+    }"#;
+
+    fn test_grok_session() -> GrokSession {
+        GrokSession {
+            access_token: "tok".to_string(),
+            user_id: "u-1".to_string(),
+            can_refresh: false,
+        }
+    }
+
+    fn mock_grok_billing_request(
+        status: u16,
+        body: &str,
+        session: &GrokSession,
+    ) -> (Result<UsageData, PollError>, String) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/v1/billing?format=credits",
+            listener.local_addr().unwrap()
+        );
+        let response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let result = fetch_grok_usage(session, &url);
+        (result, server.join().unwrap())
+    }
+
+    #[test]
+    fn grok_selects_latest_expiring_xai_session_and_skips_blank() {
+        let content = r#"{
+            "https://auth.x.ai::old": {
+                "key": "older",
+                "user_id": "u-old",
+                "expires_at": "2026-01-01T00:00:00Z"
+            },
+            "https://auth.x.ai::new": {
+                "key": "newer",
+                "user_id": "u-new",
+                "refresh_token": "rt-new",
+                "expires_at": "2026-06-01T00:00:00Z"
+            },
+            "https://auth.x.ai::blank": {
+                "key": "   ",
+                "user_id": "u-blank",
+                "expires_at": "2027-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let session = select_grok_session(content).unwrap();
+        assert_eq!(session.access_token, "newer");
+        assert_eq!(session.user_id, "u-new");
+        assert!(session.can_refresh);
+    }
+
+    #[test]
+    fn grok_accepts_legacy_signin_scope_without_refresh() {
+        let session = select_grok_session(
+            r#"{"https://accounts.x.ai/sign-in":{"key":"token","user_id":"u-app"}}"#,
+        )
+        .unwrap();
+        assert_eq!(session.access_token, "token");
+        // Nothing to renew with, so the CLI must not be asked to sign in.
+        assert!(!session.can_refresh);
+        assert!(select_grok_session("{}").is_none());
+        assert!(select_grok_session("not json").is_none());
+    }
+
+    #[test]
+    fn grok_rejects_unrelated_identity_providers_and_api_keys() {
+        let unrelated = r#"{
+            "https://idp.example.com::client": {
+                "key": "corporate-token", "expires_at": "2099-01-01T00:00:00Z"
+            },
+            "https://auth.x.ai.example.com::client": {"key": "lookalike-token"},
+            "xai::api_key": {"key": "api-key"}
+        }"#;
+        assert!(select_grok_session(unrelated).is_none());
+        let mut entries: serde_json::Value = serde_json::from_str(unrelated).unwrap();
+        entries["https://auth.x.ai::grok-cli"] = serde_json::json!({
+            "key": "session", "expires_at": "2026-01-01T00:00:00Z"
+        });
+        assert_eq!(
+            select_grok_session(&entries.to_string())
+                .unwrap()
+                .access_token,
+            "session"
+        );
+    }
+
+    #[test]
+    fn grok_billing_pool_maps_to_weekly_window() {
+        let response: GrokBillingResponse = serde_json::from_str(
+            r#"{
+                "config": {
+                    "creditUsagePercent": 42.5,
+                    "currentPeriod": {
+                        "periodType": "weekly",
+                        "end": "2026-09-28T19:27:24.000Z"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let data = grok_usage_from_billing(response).unwrap();
+        assert_eq!(data.weekly.percentage, 42.5);
+        assert!(data.weekly.resets_at.is_some());
+        // Grok has no five-hour window, so nothing claims the session slot.
+        assert_eq!(data.session.percentage, 0.0);
+        assert!(data.session.resets_at.is_none());
+    }
+
+    #[test]
+    fn grok_fresh_period_without_spending_reads_as_zero() {
+        // The proxy speaks protobuf JSON, which drops the zero
+        // `creditUsagePercent`: a complete period without it is 0% spent.
+        let response: GrokBillingResponse = serde_json::from_str(
+            r#"{
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "end": "2026-10-04T13:10:00.412622+00:00"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let data = grok_usage_from_billing(response).unwrap();
+        assert_eq!(data.weekly.percentage, 0.0);
+        assert!(data.weekly.resets_at.is_some());
+    }
+
+    #[test]
+    fn grok_config_without_period_or_percentage_is_rejected() {
+        let response: GrokBillingResponse =
+            serde_json::from_str(r#"{"config":{"isUnifiedBillingUser":true}}"#).unwrap();
+        assert!(grok_usage_from_billing(response).is_none());
+        let empty: GrokBillingResponse = serde_json::from_str("{}").unwrap();
+        assert!(grok_usage_from_billing(empty).is_none());
+    }
+
+    #[test]
+    fn grok_unusable_period_end_does_not_imply_zero_usage() {
+        for end in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!("invalid"),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1e100),
+        ] {
+            let response = serde_json::from_value(serde_json::json!({
+                "config": {"currentPeriod": {"end": end}}
+            }))
+            .unwrap();
+            assert!(grok_usage_from_billing(response).is_none(), "{end}");
+        }
+    }
+
+    #[test]
+    fn grok_explicit_usage_does_not_require_a_usable_period() {
+        for period in [
+            serde_json::json!(null),
+            serde_json::json!({"end": "invalid"}),
+        ] {
+            for percentage in [0.0, 42.5] {
+                let response = serde_json::from_value(serde_json::json!({
+                    "config": {"creditUsagePercent": percentage, "currentPeriod": period}
+                }))
+                .unwrap();
+                let data = grok_usage_from_billing(response).unwrap();
+                assert_eq!(data.weekly.percentage, percentage);
+                assert!(data.weekly.resets_at.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn grok_numeric_period_end_accepts_seconds_and_millis() {
+        // A numeric end reads as-is; the monthly label itself arrives in P5.
+        let response = serde_json::from_value(serde_json::json!({
+            "config": {"currentPeriod": {"end": 1790000000}}
+        }))
+        .unwrap();
+        let data = grok_usage_from_billing(response).unwrap();
+        assert_eq!(data.weekly.percentage, 0.0);
+        assert_eq!(
+            data.weekly.resets_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1_790_000_000))
+        );
+        assert_eq!(
+            grok_period_end(Some(&serde_json::json!(1_790_000_000_000u64))),
+            Some(UNIX_EPOCH + Duration::from_secs(1_790_000_000))
+        );
+        for value in [serde_json::json!(1e300), serde_json::json!(1e25)] {
+            assert_eq!(grok_period_end(Some(&value)), None);
+        }
+    }
+
+    #[test]
+    fn grok_request_sends_cli_markers_and_maps_billing_pool() {
+        with_grok_test_version(|| {
+            let (result, request) =
+                mock_grok_billing_request(200, GROK_BILLING_FIXTURE, &test_grok_session());
+            let data = result.unwrap();
+            assert_eq!(data.weekly.percentage, 48.0);
+            assert!(data.weekly.resets_at.is_some());
+            let request = request.to_ascii_lowercase();
+            assert!(request.starts_with("get /v1/billing?format=credits http/1.1\r\n"));
+            assert!(request.contains("\r\nauthorization: bearer tok\r\n"));
+            assert!(request.contains("\r\nx-xai-token-auth: xai-grok-cli\r\n"));
+            assert!(request.contains("\r\nx-grok-client-mode: cli\r\n"));
+            assert!(request.contains("\r\nx-grok-client-version: 9.9.9-test\r\n"));
+            assert!(request.contains("\r\nx-userid: u-1\r\n"));
+        });
+    }
+
+    #[test]
+    fn grok_request_distinguishes_auth_errors_from_bad_responses() {
+        with_grok_test_version(|| {
+            let session = test_grok_session();
+            for status in [401, 403] {
+                assert!(matches!(
+                    mock_grok_billing_request(status, "{}", &session).0,
+                    Err(PollError::AuthRequired)
+                ));
+            }
+            // Transport-level classification: 500 maps to ServerError.
+            assert!(matches!(
+                mock_grok_billing_request(500, "{}", &session).0,
+                Err(PollError::ServerError)
+            ));
+            for body in ["<html></html>", "{invalid", "{}", "null"] {
+                assert!(matches!(
+                    mock_grok_billing_request(200, body, &session).0,
+                    Err(PollError::RequestFailed)
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn grok_auth_path_prefers_explicit_home() {
+        let _guard = GROK_TEST_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(GROK_HOME_ENV).ok();
+        let home = std::env::temp_dir().join(format!("grok-home-{}", std::process::id()));
+        unsafe {
+            std::env::set_var(GROK_HOME_ENV, &home);
+        }
+        assert_eq!(grok_auth_path().unwrap(), home.join("auth.json"));
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var(GROK_HOME_ENV, value),
+                None => std::env::remove_var(GROK_HOME_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn grok_version_is_picked_out_of_arbitrary_output() {
+        assert_eq!(
+            first_grok_version("grok 1.24.3 (abc1234)").as_deref(),
+            Some("1.24.3")
+        );
+        assert_eq!(
+            first_grok_version("grok-build v2.0.11\n").as_deref(),
+            Some("2.0.11")
+        );
+        assert_eq!(first_grok_version("no version here"), None);
+    }
+
+    #[test]
+    fn grok_cli_detection_retries_failures_and_caches_success() {
+        let cache = OnceLock::new();
+        assert_eq!(cached_grok_cli_detection(&cache, || None), None);
+        assert_eq!(
+            cached_grok_cli_detection(&cache, || Some("1.2.3".into())).as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            cached_grok_cli_detection(&cache, || panic!("successful detection must be cached"))
+                .as_deref(),
+            Some("1.2.3")
+        );
     }
 
     #[test]

@@ -5923,6 +5923,10 @@ fn apply_settings_batch(
         candidate.show_claude_code != current.show_claude_code,
         candidate.show_codex != current.show_codex,
         candidate.show_antigravity != current.show_antigravity,
+        candidate.show_opencode != current.show_opencode,
+        candidate.show_cursor != current.show_cursor,
+        candidate.show_grok != current.show_grok,
+        candidate.show_copilot != current.show_copilot,
     ]
     .into_iter()
     .any(|changed| changed);
@@ -6031,6 +6035,10 @@ fn apply_settings_batch(
         app_state.show_claude_code = candidate.show_claude_code;
         app_state.show_codex = candidate.show_codex;
         app_state.show_antigravity = candidate.show_antigravity;
+        app_state.show_opencode = candidate.show_opencode;
+        app_state.show_cursor = candidate.show_cursor;
+        app_state.show_grok = candidate.show_grok;
+        app_state.show_copilot = candidate.show_copilot;
         app_state.show_session_window = candidate.show_session_window;
         app_state.show_weekly_window = candidate.show_weekly_window;
         app_state.poll_interval_ms = candidate.poll_interval_ms;
@@ -6056,6 +6064,14 @@ fn apply_settings_batch(
             app_state.codex_weekly_text = "...".to_string();
             app_state.antigravity_session_text = "...".to_string();
             app_state.antigravity_weekly_text = "...".to_string();
+            app_state.opencode_session_text = "...".to_string();
+            app_state.opencode_weekly_text = "...".to_string();
+            app_state.cursor_session_text = "...".to_string();
+            app_state.cursor_weekly_text = "...".to_string();
+            app_state.grok_session_text = "...".to_string();
+            app_state.grok_weekly_text = "...".to_string();
+            app_state.copilot_session_text = "...".to_string();
+            app_state.copilot_weekly_text = "...".to_string();
         }
         if language_changed {
             apply_language_to_state(app_state, candidate.language_override);

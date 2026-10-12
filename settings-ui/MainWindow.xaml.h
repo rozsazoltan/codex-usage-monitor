@@ -27,7 +27,10 @@ namespace winrt::SettingsUI::implementation
         void FlushPending();
         void SendNextMutation();
         void UpdateSaveBar();
+        void UpdateToastPosition();
         void DiscardPendingChanges();
+        void UpdateStickyPreview();
+        void ClearStickyPreview();
         void ContinueDeferredWork();
         void ShowCloseSaveFailureDialog();
         void CompleteCloseSaveDecision(Microsoft::UI::Xaml::Controls::ContentDialogResult result, bool completed);
@@ -77,6 +80,11 @@ namespace winrt::SettingsUI::implementation
         winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch claudeToggle_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Image widgetPreviewImage_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock widgetPreviewStatus_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::Border appearancePreviewCard_{ nullptr };
+        bool appearancePreviewFloating_{};
+        double appearancePreviewFloatOffset_{};
+        winrt::Microsoft::UI::Xaml::Controls::ScrollViewer pageScroll_{ nullptr };
+        winrt::event_token pageScrollViewToken_{};
         winrt::Microsoft::UI::Xaml::Controls::TextBlock versionText_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock updateStatusText_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock uninstallDescription_{ nullptr };

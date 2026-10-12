@@ -288,6 +288,11 @@ namespace winrt::SettingsUI::implementation
         });
         SaveChangesButton().Click([this](auto const&, auto const&) { FlushPending(); });
         DiscardChangesButton().Click([this](auto const&, auto const&) { DiscardPendingChanges(); });
+        pageScroll_ = PageScroll();
+        pageScrollViewToken_ = pageScroll_.ViewChanged([weak](auto const&, auto const&)
+        {
+            if (auto self = weak.get(); self && !self->closed_) self->UpdateStickyPreview();
+        });
         check_hresult(m_inner.as<::IWindowNative>()->get_WindowHandle(&hwnd_));
         windowIcon_ = LoadResourceIcon();
         ApplyWindowIcon(*this, windowIcon_);
@@ -390,6 +395,8 @@ namespace winrt::SettingsUI::implementation
         closingToken_ = {};
         if (navigationView_ && navigationLoadedToken_) navigationView_.Loaded(navigationLoadedToken_);
         navigationLoadedToken_ = {};
+        if (pageScroll_ && pageScrollViewToken_) pageScroll_.ViewChanged(pageScrollViewToken_);
+        pageScrollViewToken_ = {};
         if (xamlRoot_ && xamlRootChangedToken_) xamlRoot_.Changed(xamlRootChangedToken_);
         xamlRootChangedToken_ = {};
         xamlRoot_ = nullptr;
@@ -607,6 +614,14 @@ namespace winrt::SettingsUI::implementation
     {
         const bool dirty = !closed_ && (HasPendingChanges() || HasUnappliedColorDraft());
         SaveBar().Visibility(dirty ? Visibility::Visible : Visibility::Collapsed);
+        UpdateToastPosition();
+    }
+
+    void MainWindow::UpdateToastPosition()
+    {
+        if (!MessageBar() || !SaveBar()) return;
+        const bool saveVisible = SaveBar().Visibility() == Visibility::Visible;
+        MessageBar().Margin(Thickness{ 24.0, 0.0, 24.0, saveVisible ? 76.0 : 18.0 });
     }
 
     void MainWindow::DiscardPendingChanges()
@@ -1108,6 +1123,7 @@ namespace winrt::SettingsUI::implementation
         MessageBar().Message(text);
         MessageBar().Severity(error ? InfoBarSeverity::Error : InfoBarSeverity::Informational);
         MessageBar().IsOpen(true);
+        UpdateToastPosition();
         if (messageTimer_) { messageTimer_.Stop(); messageTimer_.Start(); }
     }
     void MainWindow::ScheduleWidgetPreview()
@@ -1444,7 +1460,9 @@ namespace winrt::SettingsUI::implementation
         auto item = args.SelectedItem().try_as<NavigationViewItem>(); if (!item) return;
         const auto nextPage = std::wstring(unbox_value<hstring>(item.Tag()).c_str());
         if (nextPage == page_) return;
-        page_ = nextPage; RenderPage(page_);
+        page_ = nextPage;
+        if (pageScroll_) pageScroll_.ScrollToVerticalOffset(0);
+        RenderPage(page_);
     }
     void MainWindow::RenderPage(std::wstring const& page)
     {
@@ -1460,6 +1478,7 @@ namespace winrt::SettingsUI::implementation
         claudeToggle_ = nullptr;
         widgetPreviewImage_ = nullptr;
         widgetPreviewStatus_ = nullptr;
+        ClearStickyPreview();
         versionText_ = nullptr;
         updateStatusText_ = nullptr;
         uninstallDescription_ = nullptr;
@@ -1587,6 +1606,31 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::BuildAppearance()
     {
+        auto previewCard = Card();
+        auto previewStack = StackPanel(); previewStack.Spacing(10);
+        auto previewHeading = Label(L"Live widget preview · sample values", 17);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(previewHeading, L"AppearancePreview");
+        previewStack.Children().Append(previewHeading);
+        auto previewNote = Label(L"This image is rendered by the widget using sample usage data.", 12);
+        previewNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(previewNote, L"AppearancePreviewSummary");
+        previewStack.Children().Append(previewNote);
+        widgetPreviewImage_ = Image();
+        widgetPreviewImage_.Stretch(Media::Stretch::None);
+        widgetPreviewImage_.HorizontalAlignment(HorizontalAlignment::Left);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(widgetPreviewImage_, L"Widget appearance preview with sample usage values");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(widgetPreviewImage_, L"WidgetPreviewImage");
+        widgetPreviewImage_.Visibility(Visibility::Collapsed);
+        previewStack.Children().Append(widgetPreviewImage_);
+        widgetPreviewStatus_ = Label(L"Waiting for the widget’s sample preview…", 12);
+        widgetPreviewStatus_.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(widgetPreviewStatus_, L"WidgetPreviewStatus");
+        previewStack.Children().Append(widgetPreviewStatus_);
+        previewCard.Child(previewStack); PageHost().Children().Append(previewCard);
+        appearancePreviewCard_ = previewCard;
+        ScheduleWidgetPreview();
+        UpdateWidgetPreview(state_);
+
         auto styleCard = Card();
         auto style = StackPanel(); style.Spacing(16);
         style.Children().Append(Label(L"Widget style", 19));
@@ -1643,29 +1687,7 @@ namespace winrt::SettingsUI::implementation
         });
         labelSizeGroup.Children().Append(labelSize); style.Children().Append(labelSizeGroup);
 
-        auto previewCard = Card();
-        auto previewStack = StackPanel(); previewStack.Spacing(10);
-        auto previewHeading = Label(L"Live widget preview · sample values", 17);
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(previewHeading, L"AppearancePreview");
-        previewStack.Children().Append(previewHeading);
-        auto previewNote = Label(L"This image is rendered by the widget using sample usage data.", 12);
-        previewNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(previewNote, L"AppearancePreviewSummary");
-        previewStack.Children().Append(previewNote);
-        widgetPreviewImage_ = Image();
-        widgetPreviewImage_.Stretch(Media::Stretch::None);
-        widgetPreviewImage_.HorizontalAlignment(HorizontalAlignment::Left);
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(widgetPreviewImage_, L"Widget appearance preview with sample usage values");
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(widgetPreviewImage_, L"WidgetPreviewImage");
-        widgetPreviewImage_.Visibility(Visibility::Collapsed);
-        previewStack.Children().Append(widgetPreviewImage_);
-        widgetPreviewStatus_ = Label(L"Waiting for the widget’s sample preview…", 12);
-        widgetPreviewStatus_.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(widgetPreviewStatus_, L"WidgetPreviewStatus");
-        previewStack.Children().Append(widgetPreviewStatus_);
-        previewCard.Child(previewStack); style.Children().Append(previewCard);
-        ScheduleWidgetPreview();
-        UpdateWidgetPreview(state_);
+        // The live preview now leads the page; see the top of BuildAppearance.
 
         auto refreshPreview = [this]() { ScheduleWidgetPreview(); };
         auto buttons = StackPanel(); buttons.Orientation(Orientation::Horizontal); buttons.Spacing(8);
@@ -1788,6 +1810,63 @@ namespace winrt::SettingsUI::implementation
             group.Children().Append(row); colors.Children().Append(group);
         }
         colorsCard.Child(colors); PageHost().Children().Append(colorsCard);
+        if (pageScroll_ && pageScroll_.VerticalOffset() > 8)
+        {
+            auto weak = get_weak();
+            dispatcher_.TryEnqueue([weak]()
+            {
+                if (auto self = weak.get()) self->UpdateStickyPreview();
+            });
+        }
+    }
+
+    void MainWindow::ClearStickyPreview()
+    {
+        appearancePreviewFloating_ = false;
+        appearancePreviewFloatOffset_ = 0;
+        if (appearancePreviewCard_)
+        {
+            uint32_t index{};
+            if (StickyPreviewHost().Children().IndexOf(appearancePreviewCard_, index))
+                StickyPreviewHost().Children().RemoveAt(index);
+            appearancePreviewCard_ = nullptr;
+        }
+        StickyPreviewHost().Visibility(Visibility::Collapsed);
+    }
+
+    void MainWindow::UpdateStickyPreview()
+    {
+        if (closed_ || page_ != L"Appearance" || !appearancePreviewCard_ || !pageScroll_) return;
+        try
+        {
+            if (!appearancePreviewFloating_)
+            {
+                if (pageScroll_.VerticalOffset() <= 8) return;
+                Windows::Foundation::Point origin{ 0, 0 };
+                const auto top = appearancePreviewCard_.TransformToVisual(pageScroll_).TransformPoint(origin).Y;
+                if (top > 0) return;
+                uint32_t index{};
+                if (!PageHost().Children().IndexOf(appearancePreviewCard_, index)) return;
+                PageHost().Children().RemoveAt(index);
+                StickyPreviewHost().Children().Append(appearancePreviewCard_);
+                StickyPreviewHost().Visibility(Visibility::Visible);
+                appearancePreviewCard_.Background(Application::Current().Resources().Lookup(box_value(L"SolidBackgroundFillColorBaseBrush")).as<Media::Brush>());
+                appearancePreviewFloating_ = true;
+                appearancePreviewFloatOffset_ = pageScroll_.VerticalOffset();
+            }
+            else if (pageScroll_.VerticalOffset() <= appearancePreviewFloatOffset_ - 32)
+            {
+                uint32_t index{};
+                if (StickyPreviewHost().Children().IndexOf(appearancePreviewCard_, index))
+                    StickyPreviewHost().Children().RemoveAt(index);
+                PageHost().Children().InsertAt(0, appearancePreviewCard_);
+                appearancePreviewCard_.Background(Application::Current().Resources().Lookup(box_value(L"CardBackgroundFillColorDefaultBrush")).as<Media::Brush>());
+                StickyPreviewHost().Visibility(Visibility::Collapsed);
+                appearancePreviewFloating_ = false;
+                appearancePreviewFloatOffset_ = 0;
+            }
+        }
+        catch (...) {}
     }
 
     void MainWindow::BuildPlacement()

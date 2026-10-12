@@ -360,9 +360,10 @@ function Wait-PreviewColor([Windows.Automation.AutomationElement]$Window,
         $status = Find-Control $Window 'WidgetPreviewStatus'
         if ($firstPoll) {
             $firstPoll = $false
+            $script:firstPreviewRequests = $script:smokeBackend.Previews.Count
             $statusName = if ($null -ne $status) { $status.Current.Name } else { '<missing>' }
             $script:lastPreviewStatus = $statusName
-            Write-Host "Preview first poll: imageFound=$($null -ne $image) statusFound=$($null -ne $status) status='$statusName'"
+            Write-Host "Preview first poll: color=$Hex present=$Present reqCount=$($script:smokeBackend.Previews.Count) imageFound=$($null -ne $image) statusFound=$($null -ne $status) status='$statusName'"
         }
         if ($null -eq $image) { $script:lastPreviewGate = 'image-missing'; Start-Sleep -Milliseconds 50; continue }
         if ($null -eq $status) { $script:lastPreviewGate = 'status-missing'; Start-Sleep -Milliseconds 50; continue }
@@ -400,7 +401,7 @@ function Wait-PreviewColor([Windows.Automation.AutomationElement]$Window,
             if ($treeIds.Count -ge 150) { break }
         }
     } catch { $treeIds = @("tree-dump-failed:$($_.Exception.Message)") }
-    throw "The widget bitmap preview did not reach color $Hex presence=$Present (last matches=$($script:lastPreviewMatches) bounds=$($script:lastPreviewBounds) gate=$($script:lastPreviewGate) firstStatus='$($script:lastPreviewStatus)'). Keep the interactive smoke window unobscured. TreeIds=$($treeIds -join ',')"
+    throw "The widget bitmap preview did not reach color $Hex presence=$Present (last matches=$($script:lastPreviewMatches) bounds=$($script:lastPreviewBounds) gate=$($script:lastPreviewGate) firstStatus='$($script:lastPreviewStatus)' previewRequests=$($script:firstPreviewRequests)->$($script:smokeBackend.Previews.Count) heldPreview=$($null -ne $script:smokeBackend.HeldPreview) holdNext=$($script:smokeBackend.HoldNextPreview)). Keep the interactive smoke window unobscured. TreeIds=$($treeIds -join ',')"
 }
 
 function Find-PickerRoot([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process,

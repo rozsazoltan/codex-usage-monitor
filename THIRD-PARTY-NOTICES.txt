@@ -17,8 +17,10 @@ UPSTREAM-RAY/CODEX-USAGE-MONITOR
 
 Project URL: https://github.com/upstream-ray/codex-usage-monitor
 License: MIT
-Attribution: Idea source. This repository was forked from version v1.10 and is
-now independently developed.
+Attribution: Primary inspiration and source base for this independently
+maintained fork, originally based on version v1.10. Thanks to Craig Constable
+and the upstream contributors. This project is not affiliated with or endorsed
+by the upstream maintainers or OpenAI.
 
 MIT License
 
@@ -46,7 +48,9 @@ LOBEHUB/LOBE-ICONS
 
 Project URL: https://github.com/lobehub/lobe-icons
 License: MIT
-Attribution: Provides icons used by Codex Usage.
+Attribution: The Claude and Codex/OpenAI provider logo paths used by Codex Usage
+come from Lobe Icons; see src/icons/providers. The MIT license applies to the
+icon source, not to the brand names or marks, which belong to their owners.
 
 MIT License
 
@@ -75,7 +79,10 @@ CODEZENO/CLAUDE-CODE-USAGE-MONITOR
 Project URL: https://github.com/CodeZeno/Claude-Code-Usage-Monitor
 License: MIT
 
-Codex Usage is a maintained derivative of CodeZeno/Claude-Code-Usage-Monitor. Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.
+Codex Usage is a maintained derivative of CodeZeno/Claude-Code-Usage-Monitor.
+Thanks to Craig Constable and the upstream contributors for the original
+project. Changes in this repository are not affiliated with or endorsed by the
+upstream maintainers or OpenAI.
 
 MIT License
 

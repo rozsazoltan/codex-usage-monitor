@@ -43,9 +43,25 @@ Use **Appearance** to choose **System**, **Dark**, or **Light** and customize pr
 
 To print the app version in a terminal, run `.\codex-usage.exe --version` or `.\codex-usage.exe -v` from the folder containing the executable.
 
+## Privacy and security
+
+Codex Usage is open source and runs locally. It reads existing provider credentials to retrieve quotas and check Claude Code availability:
+
+- **Claude Code:** OAuth credentials from `~/.claude/.credentials.json`, or from the same credentials file in `CLAUDE_CONFIG_DIR` when set on Windows. If needed, `~/.claude/.credentials.json` can be read from an installed WSL distribution. An expired token may trigger a local Claude CLI refresh in the background. Claude Desktop authentication is not read or reused.
+- **Codex:** credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json` when Codex is enabled. An expired token may trigger a local Codex CLI refresh; the monitor does not write `auth.json`, and the Codex CLI handles updates.
+- **Antigravity:** the OAuth token in Windows Credential Manager under `gemini:antigravity` when Antigravity is enabled. An expired token requires you to open Antigravity and sign in; the monitor does not write to Credential Manager.
+
+Quota requests target Anthropic Claude endpoints when Claude Code is enabled, the ChatGPT Codex usage endpoint when Codex is enabled, and Google's Cloud Code/Antigravity endpoints when Antigravity is enabled. Update checks and portable update downloads contact GitHub. Requests may use an environment-configured proxy. When you choose to install an update, the portable app downloads the latest release from this repository. Usage requests include an OAuth bearer token over HTTPS; use only proxies and certificate authorities you trust.
+
+The app stores preferences and state locally, including provider selection, widget placement and visibility, appearance, language, polling options, and the last update-check time. It also saves quota-row visibility, the low-quota alert threshold, and notification keys used to prevent duplicate alerts.
+
+Quota requests do not pass through a Codex Usage backend. The app has no analytics, telemetry, or project-file upload. The monitor does not directly edit Codex credentials.
+
 ## Update and remove
 
-To check for updates, right-click the widget or tray icon, choose **About**, then select **Check for updates**. Confirm the prompt to apply an available update.
+The app silently checks for updates once per normal startup. To check manually, right-click the widget or tray icon, choose **About**, then select **Check for updates**.
+
+When an update is available, **Update** appears above **About** in the Settings navigation with a blue dot. Select it to open the update panel, then choose **Install update**. You can also install an available update from **About**.
 
 To uninstall the app, choose **About** from the context menu and select **Uninstall Codex Usage**. Settings are kept by default; choose whether to remove them in the second confirmation prompt. A portable copy removes only its executable and matching startup entries, not its containing folder. A managed installation also removes its shortcuts, startup entries, and uninstall registration.
 

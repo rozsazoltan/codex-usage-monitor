@@ -44,7 +44,7 @@
 //! `settings.monitor_device` may be null before explicit selection.
 //! Supported languages are supplied as `languages:[{code:string,name:string}]`.
 //! Additional state: `effective_appearance:{dark:bool,claude_accent:[u8,u8,u8],
-//! codex_accent:[u8,u8,u8]}`, and `update_busy:bool`.
+//! codex_accent:[u8,u8,u8]}`, `update_busy:bool`, and `update_available:bool`.
 //! Malformed JSON, invalid framing/version/operation/key or unexpected fields
 //! close the connection; valid requests with invalid values return ok=false.
 //! The child is assigned to a kill-on-close job, including abrupt parent exits.

@@ -45,6 +45,7 @@ namespace winrt::SettingsUI::implementation
         void ShowMessage(std::wstring const& text, bool error = false);
         void UpdateClaudeAvailability();
         void UpdateAboutControls();
+        void UpdateUpdateIndicator();
         void UpdateTitleBarLayout();
         void OpenThirdPartyNotices();
         void Hydrate();
@@ -54,6 +55,7 @@ namespace winrt::SettingsUI::implementation
         void BuildAppearance();
         void BuildPlacement();
         void BuildAbout();
+        void BuildUpdate();
         winrt::Windows::Data::Json::JsonObject Setting(std::wstring const& key);
         bool Bool(std::wstring const& key);
         std::wstring Text(std::wstring const& key);
@@ -71,6 +73,7 @@ namespace winrt::SettingsUI::implementation
         winrt::Microsoft::UI::Xaml::Controls::TextBlock updateStatusText_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock uninstallDescription_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Button checkForUpdatesButton_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::Border updateIndicator_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::ContentDialog closeSaveFailureDialog_{ nullptr };
         winrt::Microsoft::UI::Dispatching::DispatcherQueue dispatcher_{ nullptr };
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer debounceTimer_{ nullptr };

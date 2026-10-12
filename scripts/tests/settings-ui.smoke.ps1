@@ -90,15 +90,15 @@ $snapshot = @{
     }
     effective_language = 'en'; claude_code_available = $false
     effective_appearance = @{ dark = $false; claude_accent = @(217, 119, 87); codex_accent = @(16, 163, 127) }
-    update_busy = $false; update_status = 'Synthetic smoke-test backend'; install_channel = 'portable'
+    update_busy = $false; update_available = $true; update_status = 'Synthetic update available'; install_channel = 'portable'
     version = 'smoke-test'; languages = @(@{ code = 'en'; name = 'English' })
     monitors = @(@{ device = 'smoke-display'; primary = $true })
 }
 $controls = @{
     General = 'LanguageSelector'; Monitoring = 'Setting_show_codex'; Appearance = 'Appearance_palette'
-    Placement = 'MonitorSelector'; About = 'CheckForUpdates'
+    Placement = 'MonitorSelector'; Update = 'CheckForUpdates'; About = 'ThirdPartyNotices'
 }
-$pages = @('General', 'Monitoring', 'Appearance', 'Placement', 'About')
+$pages = @('General', 'Monitoring', 'Appearance', 'Placement', 'Update', 'About')
 $timeoutMilliseconds = $TimeoutSeconds * 1000
 $results = [Collections.Generic.List[object]]::new()
 
@@ -171,6 +171,7 @@ function Wait-Page([Windows.Automation.AutomationElement]$Window, [Diagnostics.P
                 Monitoring { $control.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq [Windows.Automation.ToggleState]::On }
                 Appearance { Test-Selection $control 'Follow Windows' }
                 Placement { Test-Selection $control 'Primary display · smoke-display' }
+                Update { $control.Current.Name -ceq 'Install available update' }
                 About {
                     $condition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Version smoke-test')
                     $null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
@@ -245,7 +246,7 @@ function Test-DraftCloseCancellation([Windows.Automation.AutomationElement]$Wind
     $input = Find-Control $Window 'Color_codex_accent'
     Assert ($null -ne $input -and $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '') 'Discarded draft returned after navigation.'
     Assert-NoUnexpectedRequests $Pipe
-    Write-Host 'Canceled draft close verified: draft discarded, same pipe reactivated General, all five pages navigated, window still usable.'
+    Write-Host 'Canceled draft close verified: draft discarded, same pipe reactivated General, all six pages navigated, window still usable.'
 }
 
 function Open-Notices([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process) {
@@ -261,12 +262,32 @@ function Open-Notices([Windows.Automation.AutomationElement]$Window, [Diagnostic
         Start-Sleep -Milliseconds 50
     }
     Assert ($handle -ne [IntPtr]::Zero) 'Third-party notices did not create a visible owned window.'
+    $noticesWindow = [Windows.Automation.AutomationElement]::FromHandle($handle)
+    $textCondition = [Windows.Automation.PropertyCondition]::new(
+        [Windows.Automation.AutomationElement]::NameProperty, 'Third-party license and notice text')
+    $clock.Restart()
+    $noticesText = $null
+    $noticesReady = $false
+    while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds) {
+        Assert-Running $Process 'loading third-party notices text'
+        $textBox = $noticesWindow.FindFirst([Windows.Automation.TreeScope]::Descendants, $textCondition)
+        if ($null -ne $textBox) {
+            $noticesText = $textBox.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
+            if ($noticesText.Contains('https://github.com/upstream-ray/codex-usage-monitor') -and
+                $noticesText.Contains('Copyright (c) 2025 Craig Constable')) {
+                $noticesReady = $true
+                break
+            }
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    Assert $noticesReady "Third-party notices did not expose the upstream project attribution in their text (UIA length $($noticesText.Length))."
     Write-Host ('Third-party notices opened: owned HWND 0x{0:X}; left open for shutdown cleanup.' -f $handle.ToInt64())
     $handle
 }
 
 function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll = $false,
-    [bool]$DraftCloseCancellation = $false, [bool]$Notices = $false) {
+    [bool]$DraftCloseCancellation = $false, [bool]$Notices = $false, [bool]$UpdateAvailable = $true) {
     $process = $null
     $pipe = $null
     $result = [pscustomobject]@{
@@ -305,7 +326,9 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
         Assert ($request.v -eq 1 -and $request.op -ceq 'get' -and $request.id -is [long] -and
             $request.id -ge 0 -and $request.id -le [uint32]::MaxValue) 'The first request was not a valid protocol-v1 get.'
         $result.InitialGet = $true
-        Write-Frame $pipe $process @{ v = 1; id = $request.id; ok = $true; revision = 1; state = $snapshot }
+        $caseSnapshot = $snapshot.Clone()
+        $caseSnapshot.update_available = $UpdateAvailable
+        Write-Frame $pipe $process @{ v = 1; id = $request.id; ok = $true; revision = 1; state = $caseSnapshot }
 
         $windowClock = [Diagnostics.Stopwatch]::StartNew()
         do {
@@ -322,6 +345,12 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
         $result.HWND = '0x{0:X}' -f $hwnd.ToInt64()
         $window = [Windows.Automation.AutomationElement]::FromHandle($hwnd)
         Wait-Page $window $process $Page
+        if (-not $UpdateAvailable) {
+            $updateNavigation = Find-Control $window 'NavigationUpdate'
+            Assert ($null -eq $updateNavigation -or $updateNavigation.Current.IsOffscreen) 'Update navigation appeared without an available update.'
+            $manualCheck = Find-Control $window 'CheckForUpdates'
+            Assert ($null -ne $manualCheck -and $manualCheck.Current.Name -ceq 'Check for updates') 'About did not offer a manual update check.'
+        }
         Write-Host "$Page startup: PID $($process.Id), get received, HWND $($result.HWND), hydrated page ready after $($clock.ElapsedMilliseconds) ms."
         if ($NavigateAll) {
             foreach ($next in $pages) { Select-Page $window $process $next }
@@ -355,7 +384,24 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
             }
             default { throw "Unknown smoke close mode: $CloseMode" }
         }
-        Assert ($process.WaitForExit($timeoutMilliseconds)) "$CloseMode did not exit within $TimeoutSeconds seconds."
+        if (-not $process.WaitForExit($timeoutMilliseconds)) {
+            $diagnostic = ''
+            if ($DraftCloseCancellation) {
+                try {
+                    $draftInput = Find-Control $window 'Color_codex_accent'
+                    $draftValue = if ($null -ne $draftInput) {
+                        $draftInput.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
+                    } else { '<not found>' }
+                    $closeMessage = $Window.FindFirst([Windows.Automation.TreeScope]::Descendants,
+                        [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,
+                            'Apply or discard each color draft before closing. Your draft text is still available on the Appearance page.'))
+                    [uint32]$unread = 0
+                    [SettingsUISmokeNative]::PeekNamedPipe($pipe.SafePipeHandle, [IntPtr]::Zero, 0, [IntPtr]::Zero, [ref]$unread, [IntPtr]::Zero) | Out-Null
+                    $diagnostic = "; color input value='$draftValue'; draft-close warning visible=$($null -ne $closeMessage -and -not $closeMessage.Current.IsOffscreen); window exists=$([SettingsUISmokeNative]::IsWindow($hwnd)); window visible=$([SettingsUISmokeNative]::IsWindowVisible($hwnd)); pipe unread=$unread"
+                } catch { $diagnostic = "; close diagnostics unavailable: $($_.Exception.Message)" }
+            }
+            throw "$CloseMode did not exit within $TimeoutSeconds seconds$diagnostic."
+        }
         $result.ExitCode = Get-ExitDescription $process
         Assert ($process.ExitCode -eq 0) "$CloseMode ended with Windows exit code $($result.ExitCode)."
         if ($Notices) { Assert (-not [SettingsUISmokeNative]::IsWindow($noticesHandle)) 'The notices window survived companion shutdown.' }
@@ -403,7 +449,8 @@ try {
         @{ Page = 'About'; CloseMode = 'WindowClose' },
         @{ Page = 'General'; CloseMode = 'ShutdownDisconnect' },
         @{ Page = 'About'; CloseMode = 'WindowCloseDisconnect' },
-        @{ Page = 'About'; CloseMode = 'Shutdown'; Notices = $true }
+        @{ Page = 'About'; CloseMode = 'Shutdown'; Notices = $true },
+        @{ Page = 'About'; CloseMode = 'Shutdown'; UpdateAvailable = $false }
     )) { $results.Add((Invoke-SmokeCase @case)) }
     foreach ($name in $names) {
         Assert ((Get-FileHash -LiteralPath (Join-Path $companion $name) -Algorithm SHA256).Hash -ceq $hashes[$name]) "Payload changed during smoke testing: $name. Re-run against a stable published copy."
@@ -414,7 +461,7 @@ try {
         $failed | Format-List Page, Close, PID, Error
         throw "$($failed.Count) Settings UI smoke test(s) failed."
     }
-    Write-Host 'Passed: all five startup routes and page navigation; shutdown/disconnect/window close and immediate EOF races with exit code 0; canceled draft close followed by discard/reuse/close; open notices cleaned up on shutdown.'
+    Write-Host 'Passed: all six startup routes and page navigation; shutdown/disconnect/window close and immediate EOF races with exit code 0; canceled draft close followed by discard/reuse/close; open notices cleaned up on shutdown.'
 } finally {
     # Only this invocation's random test root and owned child processes are cleaned up.
     Remove-Item -LiteralPath $root -Recurse -Force

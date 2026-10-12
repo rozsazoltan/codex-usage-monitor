@@ -1625,11 +1625,15 @@ fn update_check_interval() -> Duration {
 }
 
 fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
+    auto_update_check_due_at(last_update_check_unix, now_unix_secs())
+}
+
+fn auto_update_check_due_at(last_update_check_unix: Option<u64>, now_unix: u64) -> bool {
     let Some(last_update_check_unix) = last_update_check_unix else {
         return true;
     };
 
-    now_unix_secs().saturating_sub(last_update_check_unix) >= update_check_interval().as_secs()
+    now_unix.saturating_sub(last_update_check_unix) >= update_check_interval().as_secs()
 }
 
 fn schedule_auto_update_check(hwnd: HWND) {
@@ -1967,6 +1971,10 @@ fn version_action_label(
             ),
         },
     }
+}
+
+fn update_available(status: &UpdateStatus) -> bool {
+    matches!(status, UpdateStatus::Available(_))
 }
 
 fn begin_update_check(hwnd: HWND, interactive: bool) {
@@ -2868,16 +2876,7 @@ pub fn run() {
         request_poll(send_hwnd, false);
 
         schedule_auto_update_check(hwnd);
-        let should_check_updates = {
-            let state = lock_state();
-            state
-                .as_ref()
-                .map(|s| auto_update_check_due(s.last_update_check_unix))
-                .unwrap_or(false)
-        };
-        if should_check_updates {
-            begin_update_check(hwnd, false);
-        }
+        begin_update_check(hwnd, false);
 
         // Initial theme check
         check_theme_change();
@@ -4506,6 +4505,7 @@ fn settings_snapshot() -> serde_json::Value {
         "effective_language":s.language.code(),"claude_code_available":s.claude_code_available,
         "effective_appearance":{"dark":dark,"claude_accent":[claude.r,claude.g,claude.b],"codex_accent":[codex.r,codex.g,codex.b]},
         "update_busy":matches!(s.update_status, UpdateStatus::Checking | UpdateStatus::Applying),
+        "update_available":update_available(&s.update_status),
         "monitors":monitors,"version":env!("CARGO_PKG_VERSION"),
         "languages":LanguageId::ALL.iter().map(|l| json!({"code":l.code(),"name":l.native_name()})).collect::<Vec<_>>(),
         "update_status":version_action_label(s.language.strings(),s.language,s.install_channel,&s.update_status),
@@ -5520,6 +5520,23 @@ fn draw_rounded_shape(hdc: HDC, rect: &RECT, color: &Color, radius: i32, fractio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_update_check_remains_due_every_24_hours() {
+        let interval = update_check_interval().as_secs();
+        let last_check = 1_000;
+
+        assert!(auto_update_check_due_at(None, last_check));
+        assert!(!auto_update_check_due_at(
+            Some(last_check),
+            last_check + interval - 1
+        ));
+        assert!(auto_update_check_due_at(
+            Some(last_check),
+            last_check + interval
+        ));
+        assert!(!auto_update_check_due_at(Some(last_check + 1), last_check));
+    }
 
     fn display_monitor(device: &str, primary: bool, rect: RECT) -> native_interop::DisplayMonitor {
         native_interop::DisplayMonitor {

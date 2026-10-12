@@ -221,6 +221,25 @@ namespace winrt::SettingsUI::implementation
         dispatcher_ = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
         appWindow_ = AppWindow();
         navigationView_ = Navigation();
+        auto updateContent = Grid();
+        auto updateColumns = updateContent.ColumnDefinitions();
+        updateColumns.Append(ColumnDefinition());
+        updateColumns.Append(ColumnDefinition());
+        updateColumns.GetAt(0).Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
+        updateColumns.GetAt(1).Width(GridLengthHelper::Auto());
+        auto updateLabel = TextBlock(); updateLabel.Text(L"Update");
+        updateContent.Children().Append(updateLabel);
+        updateIndicator_ = Border();
+        updateIndicator_.Width(7); updateIndicator_.Height(7);
+        updateIndicator_.CornerRadius(CornerRadiusHelper::FromUniformRadius(4));
+        updateIndicator_.Background(Media::SolidColorBrush(Windows::UI::Color{ 255, 0, 120, 212 }));
+        updateIndicator_.Margin(Thickness{ 10, 0, 12, 0 });
+        updateIndicator_.VerticalAlignment(VerticalAlignment::Center);
+        updateIndicator_.Visibility(Visibility::Collapsed);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(updateIndicator_, L"Update available");
+        Grid::SetColumn(updateIndicator_, 1); updateContent.Children().Append(updateIndicator_);
+        NavigationUpdate().Content(updateContent);
+        NavigationUpdate().Visibility(Visibility::Collapsed);
         auto weak = get_weak();
         debounceTimer_ = dispatcher_.CreateTimer();
         debounceTimer_.Interval(std::chrono::seconds(4));
@@ -1021,14 +1040,40 @@ namespace winrt::SettingsUI::implementation
             versionText_.Text(state_ ? std::wstring(L"Version ") + state_.GetNamedString(L"version", L"unknown").c_str() : L"Connecting to the widget…");
         if (updateStatusText_)
             updateStatusText_.Text(state_ ? state_.GetNamedString(L"update_status", L"Update status unavailable") : L"Checking update status…");
+        UpdateUpdateIndicator();
         if (checkForUpdatesButton_)
-            checkForUpdatesButton_.IsEnabled(!(state_ && state_.GetNamedBoolean(L"update_busy", false)));
+        {
+            const bool busy = state_ && state_.GetNamedBoolean(L"update_busy", false);
+            const bool available = state_ && state_.GetNamedBoolean(L"update_available", false);
+            checkForUpdatesButton_.IsEnabled(!busy);
+            checkForUpdatesButton_.Content(box_value(busy ? L"Working…" : available ? L"Install update" : L"Check for updates"));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(checkForUpdatesButton_,
+                busy ? L"Update in progress" : available ? L"Install available update" : L"Check for updates");
+        }
         if (uninstallDescription_)
         {
             const auto channel = state_ ? state_.GetNamedString(L"install_channel", L"portable") : hstring(L"portable");
             uninstallDescription_.Text(channel == L"winget"
                 ? L"WinGet will open its uninstall flow and ask you to confirm."
                 : L"The built-in flow will ask you to confirm before removing anything.");
+        }
+    }
+    void MainWindow::UpdateUpdateIndicator()
+    {
+        const bool available = state_ && state_.GetNamedBoolean(L"update_available", false);
+        if (updateIndicator_) updateIndicator_.Visibility(available ? Visibility::Visible : Visibility::Collapsed);
+        NavigationUpdate().Visibility(available ? Visibility::Visible : Visibility::Collapsed);
+        if (!available && page_ == L"Update")
+        {
+            for (auto const& item : Navigation().FooterMenuItems())
+            {
+                auto navigationItem = item.try_as<NavigationViewItem>();
+                if (navigationItem && std::wstring(unbox_value<hstring>(navigationItem.Tag()).c_str()) == L"About")
+                {
+                    Navigation().SelectedItem(item);
+                    break;
+                }
+            }
         }
     }
     void MainWindow::UpdateTitleBarLayout()
@@ -1067,15 +1112,23 @@ namespace winrt::SettingsUI::implementation
         rows.Append(RowDefinition());
         rows.GetAt(0).Height(GridLengthHelper::Auto());
         rows.GetAt(1).Height(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
-        auto heading = Label(L"Third-party licenses and notices", 21);
-        heading.Margin(Thickness{ 0, 0, 0, 16 });
+        auto heading = StackPanel(); heading.Spacing(5);
+        heading.Children().Append(Label(L"Third-party licenses and notices", 22));
+        auto intro = Label(L"Notices for components included with Codex Usage. The text below is provided as published.", 13);
+        intro.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        intro.Margin(Thickness{ 0, 0, 0, 18 }); heading.Children().Append(intro);
         layout.Children().Append(heading);
         auto text = TextBox();
-        text.Text(ResourceText(IDR_THIRD_PARTY_NOTICES));
         text.IsReadOnly(true);
         text.AcceptsReturn(true);
+        text.Text(ResourceText(IDR_THIRD_PARTY_NOTICES));
         text.TextWrapping(TextWrapping::Wrap);
-        text.FontFamily(Media::FontFamily(L"Consolas"));
+        text.FontFamily(Media::FontFamily(L"Segoe UI"));
+        text.FontSize(13);
+        text.Padding(Thickness{ 18, 16, 18, 16 });
+        text.Background(Application::Current().Resources().Lookup(box_value(L"CardBackgroundFillColorDefaultBrush")).as<Media::Brush>());
+        text.BorderBrush(Application::Current().Resources().Lookup(box_value(L"CardStrokeColorDefaultBrush")).as<Media::Brush>());
+        text.BorderThickness(Thickness{ 1, 1, 1, 1 });
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(text, L"Third-party license and notice text");
         Grid::SetRow(text, 1);
         layout.Children().Append(text);
@@ -1188,14 +1241,16 @@ namespace winrt::SettingsUI::implementation
         updateStatusText_ = nullptr;
         uninstallDescription_ = nullptr;
         checkForUpdatesButton_ = nullptr;
-        PageTitle().Text(page); PageEyebrow().Text(page == L"About" ? L"YOUR APP" : L"PREFERENCES");
+        PageTitle().Text(page == L"Update" ? L"Software update" : page);
+        PageEyebrow().Text(page == L"About" ? L"ABOUT CODEX USAGE" : page == L"Update" ? L"KEEPING CURRENT" : L"PREFERENCES");
         const std::map<std::wstring, std::wstring> summaries{
             {L"General",L"Manage startup, taskbar visibility, and language."}, {L"Monitoring",L"Choose providers and refresh options."},
             {L"Appearance",L"Choose the widget’s theme and visual settings."}, {L"Placement",L"Choose the display and taskbar position."},
-            {L"About",L"Application details, updates, and licenses."}};
+            {L"About",L"A closer look at the app, how it works, and its project details."},
+            {L"Update",L"See the current update status and install the latest available version."}};
         PageSummary().Text(summaries.at(page));
         hydrating_ = true;
-        if (page == L"General") BuildGeneral(); else if (page == L"Monitoring") BuildMonitoring(); else if (page == L"Appearance") BuildAppearance(); else if (page == L"Placement") BuildPlacement(); else BuildAbout();
+        if (page == L"General") BuildGeneral(); else if (page == L"Monitoring") BuildMonitoring(); else if (page == L"Appearance") BuildAppearance(); else if (page == L"Placement") BuildPlacement(); else if (page == L"Update") BuildUpdate(); else BuildAbout();
         hydrating_ = false;
     }
 
@@ -1282,7 +1337,7 @@ namespace winrt::SettingsUI::implementation
              const auto savedText = StoredColorText(State(), key);
              const auto& draft = key == L"claude_accent" ? claudeColorDraft_ : codexColorDraft_;
              input.Text(draft ? hstring(*draft) : hstring(savedText));
-             input.TextChanged([this, key](auto const& sender, auto const&)
+             input.TextChanging([this, key](auto const& sender, auto const&)
              {
                  if (hydrating_) return;
                  const auto text = std::wstring(sender.as<TextBox>().Text().c_str());
@@ -1349,38 +1404,42 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::BuildAbout()
     {
         auto hero = Card();
-        auto h = StackPanel(); h.Spacing(10);
-        auto nameRow = StackPanel(); nameRow.Orientation(Orientation::Horizontal); nameRow.Spacing(12); nameRow.VerticalAlignment(VerticalAlignment::Center);
-        auto appIcon = Image(); appIcon.Width(44); appIcon.Height(44); appIcon.Stretch(Media::Stretch::Uniform); appIcon.VerticalAlignment(VerticalAlignment::Center);
+        auto h = StackPanel(); h.Spacing(15);
+        auto nameRow = StackPanel(); nameRow.Orientation(Orientation::Horizontal); nameRow.Spacing(16); nameRow.VerticalAlignment(VerticalAlignment::Center);
+        auto appIcon = Image(); appIcon.Width(64); appIcon.Height(64); appIcon.Stretch(Media::Stretch::Uniform); appIcon.VerticalAlignment(VerticalAlignment::Center);
         SetImageFromResource(appIcon, IDR_ABOUT_ICON);
-        auto appName = Label(L"Codex Usage", 25); appName.VerticalAlignment(VerticalAlignment::Center);
+        auto appName = Label(L"Codex Usage", 28); appName.VerticalAlignment(VerticalAlignment::Center);
+        appName.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
         nameRow.Children().Append(appIcon); nameRow.Children().Append(appName);
         h.Children().Append(nameRow);
-        h.Children().Append(Label(L"A lightweight, portable Windows quota monitor for Codex and Claude Code.", 14));
-        h.Children().Append(Label(L"Developed by Zoltán Rózsa", 13));
+        h.Children().Append(Label(L"A lightweight, portable way to keep an eye on Codex and Claude Code usage from your taskbar.", 15));
         auto roseLogo = Image(); roseLogo.Width(128); roseLogo.Height(40); roseLogo.Stretch(Media::Stretch::Uniform); roseLogo.HorizontalAlignment(HorizontalAlignment::Left);
         SetImageFromResource(roseLogo, IDR_DATAROSE_LOGO);
         auto developerLink = HyperlinkButton(); developerLink.Content(roseLogo); developerLink.NavigateUri(Windows::Foundation::Uri(L"https://datarose.net"));
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(developerLink, L"Visit Datarose website");
-        developerLink.HorizontalAlignment(HorizontalAlignment::Left); h.Children().Append(developerLink);
-        versionText_ = Label(state_ ? std::wstring(std::wstring(L"Version ") + state_.GetNamedString(L"version", L"unknown").c_str()) : std::wstring(L"Connecting to the widget…"), 12);
-        h.Children().Append(versionText_);
+        developerLink.HorizontalAlignment(HorizontalAlignment::Left);
+        auto footer = StackPanel(); footer.Orientation(Orientation::Horizontal); footer.Spacing(18); footer.VerticalAlignment(VerticalAlignment::Center);
+        footer.Children().Append(developerLink);
+        versionText_ = Label(state_ ? std::wstring(std::wstring(L"Version ") + state_.GetNamedString(L"version", L"unknown").c_str()) : std::wstring(L"Connecting to the widget…"), 13);
+        versionText_.VerticalAlignment(VerticalAlignment::Center);
+        versionText_.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        footer.Children().Append(versionText_); h.Children().Append(footer);
         hero.Child(h); PageHost().Children().Append(hero);
 
         auto how = Card(); auto howStack = StackPanel(); howStack.Spacing(10);
-        howStack.Children().Append(Label(L"How it works", 19));
-        howStack.Children().Append(Label(L"Codex Usage runs locally and reuses sign-ins from the Codex CLI and Claude Code CLI already installed on your PC. There is no separate Codex Usage account, login, or API-key setup.", 13));
-        howStack.Children().Append(Label(L"It reads quota and reset information from provider services and shows the available usage windows in your taskbar. Quota requests go directly from this app to those services; they do not pass through a Codex Usage server.", 13));
+        howStack.Children().Append(Label(L"Designed to stay local", 19));
+        howStack.Children().Append(Label(L"Codex Usage runs locally and reuses sign-ins from the Codex CLI and Claude Code CLI already installed on your PC. There is no separate Codex Usage account, login, or API-key setup.", 14));
+        howStack.Children().Append(Label(L"It reads quota and reset information from provider services and shows the available usage windows in your taskbar. Quota requests go directly from this app to those services; they do not pass through a Codex Usage server.", 14));
         how.Child(howStack); PageHost().Children().Append(how);
 
         auto info = Card(); auto s = StackPanel(); s.Spacing(12);
-        s.Children().Append(Label(L"Project", 19));
+        s.Children().Append(Label(L"Project & licensing", 19));
         auto projectRow = StackPanel(); projectRow.Orientation(Orientation::Horizontal); projectRow.Spacing(12); projectRow.VerticalAlignment(VerticalAlignment::Center);
         auto repo = Button(); repo.Content(box_value(L"View project")); Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(repo, L"ViewProject"); repo.HorizontalAlignment(HorizontalAlignment::Left); repo.Click([this](auto const&, auto const&) { Action(L"repository"); });
-        auto license = Label(L"Licensed under AGPL-3.0-or-later", 13);
+        auto license = Label(L"Licensed under AGPL-3.0-or-later", 14);
         license.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
         projectRow.Children().Append(repo); projectRow.Children().Append(license); s.Children().Append(projectRow);
-        s.Children().Append(Label(L"Third-party license terms and required notices are included with this application.", 13));
+        s.Children().Append(Label(L"Third-party license terms and required notices are included with this application.", 14));
         auto noticesButton = Button(); noticesButton.Content(box_value(L"Third-party licenses and notices"));
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(noticesButton, L"ThirdPartyNotices");
         noticesButton.HorizontalAlignment(HorizontalAlignment::Left);
@@ -1388,15 +1447,75 @@ namespace winrt::SettingsUI::implementation
         s.Children().Append(noticesButton);
         info.Child(s); PageHost().Children().Append(info);
 
-         auto update=Card();auto u=StackPanel();u.Spacing(10);u.Children().Append(Label(L"Updates",19));updateStatusText_=Label(state_?std::wstring(state_.GetNamedString(L"update_status",L"Update status unavailable").c_str()):std::wstring(L"Checking update status…"),13);u.Children().Append(updateStatusText_);checkForUpdatesButton_=Button();checkForUpdatesButton_.Content(box_value(L"Check for updates"));Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(checkForUpdatesButton_,L"CheckForUpdates");checkForUpdatesButton_.Style(Application::Current().Resources().Lookup(box_value(L"AccentButtonStyle")).as<Style>());checkForUpdatesButton_.IsEnabled(!(state_&&state_.GetNamedBoolean(L"update_busy",false)));checkForUpdatesButton_.HorizontalAlignment(HorizontalAlignment::Left);checkForUpdatesButton_.Click([this](auto const&,auto const&){Action(L"update");});u.Children().Append(checkForUpdatesButton_);update.Child(u);PageHost().Children().Append(update);
-        const auto channel = state_ ? state_.GetNamedString(L"install_channel", L"portable") : hstring(L"portable");
+        auto updates = Card(); auto updatesStack = StackPanel(); updatesStack.Spacing(10);
+        updatesStack.Children().Append(Label(L"Software updates", 19));
+        updateStatusText_ = Label(state_ ? std::wstring(state_.GetNamedString(L"update_status", L"Update status unavailable").c_str()) : std::wstring(L"Checking update status…"), 14);
+        updateStatusText_.TextWrapping(TextWrapping::Wrap);
+        updatesStack.Children().Append(updateStatusText_);
+        checkForUpdatesButton_ = Button();
+        const bool updateAvailable = state_ && state_.GetNamedBoolean(L"update_available", false);
+        const bool updateBusy = state_ && state_.GetNamedBoolean(L"update_busy", false);
+        checkForUpdatesButton_.Content(box_value(updateBusy ? L"Working…" : updateAvailable ? L"Install update" : L"Check for updates"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(checkForUpdatesButton_, L"CheckForUpdates");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(checkForUpdatesButton_,
+            updateBusy ? L"Update in progress" : updateAvailable ? L"Install available update" : L"Check for updates");
+        checkForUpdatesButton_.Style(Application::Current().Resources().Lookup(box_value(L"AccentButtonStyle")).as<Style>());
+        checkForUpdatesButton_.IsEnabled(!updateBusy);
+        checkForUpdatesButton_.HorizontalAlignment(HorizontalAlignment::Left);
+        checkForUpdatesButton_.Click([this](auto const&, auto const&) { Action(L"update"); });
+        updatesStack.Children().Append(checkForUpdatesButton_);
+        updates.Child(updatesStack); PageHost().Children().Append(updates);
+
+        auto privacy = Card();
+        auto privacyStack = StackPanel(); privacyStack.Spacing(14);
+        privacyStack.Children().Append(Label(L"Privacy and Security", 19));
+        privacyStack.Children().Append(Label(L"A brief overview of the data Codex Usage uses to display provider quotas and maintain your settings.", 13));
+
+        auto addPrivacySection = [&privacyStack](std::wstring const& title, std::vector<std::wstring> const& items)
+        {
+            auto section = StackPanel(); section.Spacing(5);
+            auto heading = Label(title, 14);
+            heading.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+            section.Children().Append(heading);
+            for (auto const& item : items) section.Children().Append(Label(std::wstring(L"•  ") + item, 13));
+            privacyStack.Children().Append(section);
+        };
+
+        addPrivacySection(L"Sign-in data", {
+            L"The app uses existing sign-ins for Claude Code, Codex, and Antigravity to retrieve quota information.",
+            L"Claude Code credentials may be read from Windows or WSL; Antigravity credentials are read from Windows Credential Manager."
+        });
+        addPrivacySection(L"Network requests", {
+            L"Quota requests go directly to the enabled providers; they do not pass through a Codex Usage service.",
+            L"Update checks and portable update downloads contact GitHub."
+        });
+        addPrivacySection(L"Local settings", {
+            L"Provider selection, widget placement, appearance, polling options, and the last update-check time are stored locally."
+        });
+        addPrivacySection(L"Account setup", {
+            L"No Codex Usage account or separate API-key setup is required."
+        });
+        addPrivacySection(L"Credential refresh notes", {
+            L"If a Claude Code or Codex token expires, the app may use the corresponding local CLI to refresh the sign-in.",
+            L"To refresh an Antigravity sign-in, sign in again through Antigravity."
+        });
+        privacy.Child(privacyStack); PageHost().Children().Append(privacy);
+
+         const auto channel = state_ ? state_.GetNamedString(L"install_channel", L"portable") : hstring(L"portable");
         auto uninstallCard = Card();
+         uninstallCard.Background(Application::Current().Resources().Lookup(box_value(L"SystemFillColorCriticalBackgroundBrush")).as<Media::Brush>());
+         uninstallCard.BorderBrush(Application::Current().Resources().Lookup(box_value(L"SystemFillColorCriticalBrush")).as<Media::Brush>());
         auto uninstallStack = StackPanel(); uninstallStack.Spacing(10);
+        auto dangerHeading = Label(L"DANGER ZONE", 11);
+        dangerHeading.FontWeight(Windows::UI::Text::FontWeights::SemiBold()); dangerHeading.CharacterSpacing(110);
+         dangerHeading.Foreground(Application::Current().Resources().Lookup(box_value(L"SystemFillColorCriticalBrush")).as<Media::Brush>());
+        uninstallStack.Children().Append(dangerHeading);
         uninstallStack.Children().Append(Label(L"Uninstall Codex Usage", 19));
-        uninstallStack.Children().Append(Label(L"This removes the app and its local files.", 13));
+        uninstallStack.Children().Append(Label(L"This removes the app and its local files. This action cannot be undone.", 14));
         uninstallDescription_ = Label(channel == L"winget"
             ? L"WinGet will open its uninstall flow and ask you to confirm."
             : L"The built-in flow will ask you to confirm before removing anything.", 13);
+        uninstallDescription_.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
         uninstallStack.Children().Append(uninstallDescription_);
 
         auto uninstall = Button();
@@ -1414,5 +1533,39 @@ namespace winrt::SettingsUI::implementation
         uninstallStack.Children().Append(uninstall);
         uninstallCard.Child(uninstallStack);
         PageHost().Children().Append(uninstallCard);
+    }
+
+    void MainWindow::BuildUpdate()
+    {
+        auto card = Card();
+        auto stack = StackPanel(); stack.Spacing(14);
+        const bool available = state_ && state_.GetNamedBoolean(L"update_available", false);
+        if (available)
+        {
+            auto badge = Border(); badge.Padding(Thickness{ 11, 5, 11, 5 });
+            badge.CornerRadius(CornerRadiusHelper::FromUniformRadius(12));
+            badge.Background(Application::Current().Resources().Lookup(box_value(L"AccentFillColorDefaultBrush")).as<Media::Brush>());
+            auto badgeText = Label(L"UPDATE AVAILABLE", 11);
+            badgeText.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+            badgeText.Foreground(Application::Current().Resources().Lookup(box_value(L"TextOnAccentFillColorPrimaryBrush")).as<Media::Brush>());
+            badge.Child(badgeText); stack.Children().Append(badge);
+        }
+        stack.Children().Append(Label(available ? L"A newer version is ready" : L"Check for an update", 21));
+        updateStatusText_ = Label(state_ ? std::wstring(state_.GetNamedString(L"update_status", L"Update status unavailable").c_str()) : std::wstring(L"Checking update status…"), 14);
+        updateStatusText_.TextWrapping(TextWrapping::Wrap);
+        stack.Children().Append(updateStatusText_);
+        auto version = Label(state_ ? std::wstring(L"Installed version  ·  ") + state_.GetNamedString(L"version", L"unknown").c_str() : L"Installed version is being checked…", 13);
+        version.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        stack.Children().Append(version);
+        checkForUpdatesButton_ = Button();
+        checkForUpdatesButton_.Content(box_value(available ? L"Install update" : L"Check for updates"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(checkForUpdatesButton_, L"CheckForUpdates");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(checkForUpdatesButton_, available ? L"Install available update" : L"Check for updates");
+        checkForUpdatesButton_.Style(Application::Current().Resources().Lookup(box_value(L"AccentButtonStyle")).as<Style>());
+        checkForUpdatesButton_.IsEnabled(!(state_ && state_.GetNamedBoolean(L"update_busy", false)));
+        checkForUpdatesButton_.HorizontalAlignment(HorizontalAlignment::Left);
+        checkForUpdatesButton_.Click([this](auto const&, auto const&) { Action(L"update"); });
+        stack.Children().Append(checkForUpdatesButton_);
+        card.Child(stack); PageHost().Children().Append(card);
     }
 }

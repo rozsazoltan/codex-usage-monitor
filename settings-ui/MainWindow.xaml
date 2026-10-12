@@ -15,9 +15,9 @@
         Background="Transparent" IsPaneToggleButtonVisible="True">
         <NavigationView.Resources>
             <Style x:Key="UninstallButtonStyle" TargetType="Button">
-                <Setter Property="Foreground" Value="{ThemeResource SystemFillColorCautionBrush}" />
-                <Setter Property="Background" Value="{ThemeResource SystemFillColorCautionBackgroundBrush}" />
-                <Setter Property="BorderBrush" Value="{ThemeResource SystemFillColorCautionBrush}" />
+                <Setter Property="Foreground" Value="{ThemeResource SystemFillColorCriticalBrush}" />
+                <Setter Property="Background" Value="{ThemeResource SystemFillColorCriticalBackgroundBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource SystemFillColorCriticalBrush}" />
                 <Setter Property="BorderThickness" Value="1" />
             </Style>
         </NavigationView.Resources>
@@ -34,11 +34,12 @@
             <NavigationViewItem Content="Placement" Tag="Placement" Icon="MapPin" AutomationProperties.AutomationId="NavigationPlacement" />
         </NavigationView.MenuItems>
         <NavigationView.FooterMenuItems>
+            <NavigationViewItem x:Name="NavigationUpdate" Content="Update" Tag="Update" Icon="Download" AutomationProperties.AutomationId="NavigationUpdate" />
             <NavigationViewItem Content="About" Tag="About" Icon="Help" AutomationProperties.AutomationId="NavigationAbout" />
         </NavigationView.FooterMenuItems>
         <Grid x:Name="PageContent">
             <ScrollViewer x:Name="PageScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel MaxWidth="1040" HorizontalAlignment="Left" Padding="40,30,40,40" Spacing="22">
+                <StackPanel MaxWidth="1040" HorizontalAlignment="Center" Padding="40,30,40,40" Spacing="22">
                     <StackPanel Spacing="5">
                         <TextBlock x:Name="PageEyebrow" Text="PREFERENCES" FontSize="11" FontWeight="SemiBold" CharacterSpacing="130" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
                         <TextBlock x:Name="PageTitle" Text="General" FontSize="32" FontWeight="SemiBold" />

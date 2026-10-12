@@ -6,6 +6,7 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.UI.h>
+#include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.Graphics.h>
 #include <winrt/Microsoft.UI.h>
 #include <winrt/Microsoft.UI.Windowing.h>

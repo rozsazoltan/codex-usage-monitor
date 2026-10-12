@@ -204,6 +204,7 @@ pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
         0 => poll_claude_code(),
         1 => poll_codex(),
         2 => poll_antigravity(),
+        3 => poll_opencode(),
         _ => Err(PollError::RequestFailed),
     }
 }
@@ -1196,6 +1197,310 @@ fn is_antigravity_display_model(model: &str) -> bool {
         || model.starts_with("imagen")
 }
 
+const OPENCODE_GO_STATUS_URL: &str = "https://opencode.ai/console/api/go/status";
+const OPENCODE_GO_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+const OPENCODE_GO_WORKSPACE_ID_ENV: &str = "OPENCODE_GO_WORKSPACE_ID";
+const OPENCODE_GO_AUTH_COOKIE_ENV: &str = "OPENCODE_GO_AUTH_COOKIE";
+const OPENCODE_GO_CONFIG_FILE_ENV: &str = "OPENCODE_GO_CONFIG_FILE";
+
+#[derive(Deserialize)]
+struct OpenCodeDashboardConfig {
+    #[serde(alias = "workspaceId", alias = "workspaceID")]
+    workspace_id: String,
+    #[serde(alias = "authCookie", alias = "cookie")]
+    auth_cookie: String,
+}
+
+struct OpenCodeCredentials {
+    workspace_id: String,
+    auth_cookie: String,
+    source: String,
+}
+
+#[derive(Deserialize)]
+struct OpenCodeGoStatus {
+    access: Option<OpenCodeGoAccess>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenCodeGoAccess {
+    ends_at: String,
+    meters: OpenCodeGoMeters,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenCodeGoMeters {
+    five_hour: OpenCodeGoTimedMeter,
+    week: OpenCodeGoTimedMeter,
+    month: OpenCodeGoMeter,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenCodeGoTimedMeter {
+    #[serde(flatten)]
+    meter: OpenCodeGoMeter,
+    // An unused rolling window has no reset time until the first request.
+    resets_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenCodeGoMeter {
+    limit_micro_cents: String,
+    used_micro_cents: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct OpenCodeUsageWindow {
+    usage_percent: f64,
+    resets_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct OpenCodeDashboardUsage {
+    rolling: Option<OpenCodeUsageWindow>,
+    weekly: Option<OpenCodeUsageWindow>,
+    monthly: Option<OpenCodeUsageWindow>,
+}
+
+fn poll_opencode() -> Result<UsageData, PollError> {
+    let credentials = read_opencode_credentials().ok_or_else(|| {
+        diagnose::log("OpenCode usage poll failed: no dashboard credentials found".to_string());
+        PollError::NoCredentials
+    })?;
+    let usage =
+        fetch_opencode_status(&credentials, OPENCODE_GO_STATUS_URL).inspect_err(|error| {
+            diagnose::log(format!(
+                "OpenCode dashboard poll failed via {}: {error:?}",
+                credentials.source
+            ));
+        })?;
+
+    if usage.rolling.is_none() && usage.weekly.is_none() && usage.monthly.is_none() {
+        diagnose::log(format!(
+            "OpenCode dashboard returned no usage windows from {}",
+            credentials.source
+        ));
+        return Err(PollError::RequestFailed);
+    }
+
+    let session = usage
+        .rolling
+        .as_ref()
+        .map(opencode_section_from_window)
+        .unwrap_or_default();
+    // The long-window label ("7d"/"30d") is selected alongside the section but
+    // only surfaces in the settings protocol and widget once P5 extends the
+    // model; until then the weekly slot carries the selected window.
+    let (weekly, _) = select_opencode_long_window(&usage);
+
+    Ok(UsageData { session, weekly })
+}
+
+fn select_opencode_long_window(usage: &OpenCodeDashboardUsage) -> (UsageSection, Option<String>) {
+    match (&usage.weekly, &usage.monthly) {
+        (Some(weekly), Some(monthly)) if monthly.usage_percent > weekly.usage_percent => (
+            opencode_section_from_window(monthly),
+            Some("30d".to_string()),
+        ),
+        (Some(weekly), _) => (opencode_section_from_window(weekly), Some("7d".to_string())),
+        (None, Some(monthly)) => (
+            opencode_section_from_window(monthly),
+            Some("30d".to_string()),
+        ),
+        (None, None) => (UsageSection::default(), None),
+    }
+}
+
+fn opencode_section_from_window(window: &OpenCodeUsageWindow) -> UsageSection {
+    UsageSection {
+        percentage: window.usage_percent.clamp(0.0, 100.0),
+        resets_at: window.resets_at,
+    }
+}
+
+fn read_opencode_credentials() -> Option<OpenCodeCredentials> {
+    if let (Some(workspace_id), Some(auth_cookie)) = (
+        opencode_non_empty_env(OPENCODE_GO_WORKSPACE_ID_ENV),
+        opencode_non_empty_env(OPENCODE_GO_AUTH_COOKIE_ENV),
+    ) {
+        if valid_opencode_workspace_id(&workspace_id) && valid_opencode_cookie(&auth_cookie) {
+            return Some(OpenCodeCredentials {
+                workspace_id,
+                auth_cookie,
+                source: "environment".to_string(),
+            });
+        }
+    }
+
+    opencode_config_paths()
+        .into_iter()
+        .find_map(|path| read_opencode_config(&path))
+}
+
+fn read_opencode_config(path: &PathBuf) -> Option<OpenCodeCredentials> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let config: OpenCodeDashboardConfig = serde_json::from_str(&content).ok()?;
+    let workspace_id = config.workspace_id.trim().to_string();
+    let auth_cookie = config.auth_cookie.trim().to_string();
+    if !valid_opencode_workspace_id(&workspace_id) || !valid_opencode_cookie(&auth_cookie) {
+        return None;
+    }
+    Some(OpenCodeCredentials {
+        workspace_id,
+        auth_cookie,
+        source: path.display().to_string(),
+    })
+}
+
+fn fetch_opencode_status(
+    credentials: &OpenCodeCredentials,
+    url: &str,
+) -> Result<OpenCodeDashboardUsage, PollError> {
+    let agent = build_agent()?;
+    let cookie = if credentials.auth_cookie.split(';').any(|part| {
+        let part = part.trim_start();
+        part.starts_with("auth=") || part.starts_with("__Host-console_session=")
+    }) {
+        credentials.auth_cookie.clone()
+    } else {
+        // Bare legacy auth values may contain '=' padding; that alone does
+        // not identify a complete Cookie header.
+        format!("auth={}", credentials.auth_cookie)
+    };
+
+    let resp = match agent
+        .get(url)
+        .set("Accept", "application/json")
+        .set("x-org-id", &credentials.workspace_id)
+        .set("Cookie", &cookie)
+        .set("User-Agent", OPENCODE_GO_USER_AGENT)
+        .call()
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            return Err(PollError::AuthRequired)
+        }
+        Err(error) => {
+            diagnose::log(format!("OpenCode Go status request failed: {error:?}"));
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    let status = resp
+        .into_json::<Option<OpenCodeGoStatus>>()
+        .map_err(|error| {
+            diagnose::log(format!(
+                "OpenCode Go status response is not valid JSON: {error:?}"
+            ));
+            PollError::RequestFailed
+        })?;
+    usage_from_opencode_status(status)
+}
+
+fn usage_from_opencode_status(
+    status: Option<OpenCodeGoStatus>,
+) -> Result<OpenCodeDashboardUsage, PollError> {
+    let access = status.and_then(|status| status.access).ok_or_else(|| {
+        diagnose::log("OpenCode Go status returned no active subscription access".to_string());
+        PollError::RequestFailed
+    })?;
+    Ok(OpenCodeDashboardUsage {
+        rolling: Some(window_from_opencode_meter(
+            &access.meters.five_hour.meter,
+            access.meters.five_hour.resets_at.as_deref(),
+        )?),
+        weekly: Some(window_from_opencode_meter(
+            &access.meters.week.meter,
+            access.meters.week.resets_at.as_deref(),
+        )?),
+        monthly: Some(window_from_opencode_meter(
+            &access.meters.month,
+            Some(access.ends_at.as_str()),
+        )?),
+    })
+}
+
+fn window_from_opencode_meter(
+    meter: &OpenCodeGoMeter,
+    resets_at: Option<&str>,
+) -> Result<OpenCodeUsageWindow, PollError> {
+    let limit = meter.limit_micro_cents.parse::<u128>().map_err(|_| {
+        diagnose::log("OpenCode Go status contains an invalid usage limit".to_string());
+        PollError::RequestFailed
+    })?;
+    let used = meter.used_micro_cents.parse::<u128>().map_err(|_| {
+        diagnose::log("OpenCode Go status contains an invalid usage amount".to_string());
+        PollError::RequestFailed
+    })?;
+    let resets_at = resets_at
+        .map(|value| {
+            parse_iso8601(Some(value)).ok_or_else(|| {
+                diagnose::log("OpenCode Go status contains an invalid reset time".to_string());
+                PollError::RequestFailed
+            })
+        })
+        .transpose()?;
+    Ok(OpenCodeUsageWindow {
+        usage_percent: if limit == 0 {
+            0.0
+        } else {
+            used as f64 / limit as f64 * 100.0
+        },
+        resets_at,
+    })
+}
+
+fn opencode_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = opencode_non_empty_env(OPENCODE_GO_CONFIG_FILE_ENV).map(PathBuf::from) {
+        paths.push(path);
+    }
+    if let Some(app_data) = opencode_non_empty_env("APPDATA").map(PathBuf::from) {
+        paths.push(app_data.join("opencode-go").join("config.json"));
+    }
+    if let Some(config_home) = opencode_non_empty_env("XDG_CONFIG_HOME").map(PathBuf::from) {
+        paths.push(config_home.join("opencode-bar").join("opencode-go.json"));
+        paths.push(config_home.join("opencode-quota").join("opencode-go.json"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(
+            home.join(".config")
+                .join("opencode-bar")
+                .join("opencode-go.json"),
+        );
+        paths.push(
+            home.join(".config")
+                .join("opencode-quota")
+                .join("opencode-go.json"),
+        );
+    }
+    paths
+}
+
+fn opencode_non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn valid_opencode_workspace_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_opencode_cookie(value: &str) -> bool {
+    !value.is_empty() && !value.bytes().any(|byte| matches!(byte, b'\r' | b'\n'))
+}
+
 fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
     response
         .header(name)
@@ -1695,6 +2000,267 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OPENCODE_GO_STATUS_FIXTURE: &str = r#"{
+        "subscriberUserID": "usr_example",
+        "useBalance": false,
+        "access": {
+            "startsAt": "2026-09-01T00:00:00.000Z",
+            "endsAt": "2026-10-01T00:00:00.000Z",
+            "meters": {
+                "fiveHour": {
+                    "limitMicroCents": "2000000000",
+                    "usedMicroCents": "250000000",
+                    "resetsAt": "2026-09-17T05:00:00.000Z"
+                },
+                "week": {
+                    "limitMicroCents": "10000000000",
+                    "usedMicroCents": "4500000000",
+                    "resetsAt": "2026-09-21T00:00:00.000Z"
+                },
+                "month": {
+                    "limitMicroCents": "20000000000",
+                    "usedMicroCents": "12000000000"
+                }
+            }
+        }
+    }"#;
+
+    fn mock_opencode_status_request(
+        status: u16,
+        body: &str,
+        cookie: &str,
+    ) -> (Result<OpenCodeDashboardUsage, PollError>, String) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/console/api/go/status",
+            listener.local_addr().unwrap()
+        );
+        let response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let result = fetch_opencode_status(
+            &OpenCodeCredentials {
+                workspace_id: "wrk_example".into(),
+                auth_cookie: cookie.into(),
+                source: "test".into(),
+            },
+            &url,
+        );
+        (result, server.join().unwrap())
+    }
+
+    #[test]
+    fn opencode_status_maps_meter_percentages_and_absolute_resets() {
+        let usage =
+            usage_from_opencode_status(serde_json::from_str(OPENCODE_GO_STATUS_FIXTURE).unwrap())
+                .unwrap();
+        let rolling = usage.rolling.as_ref().unwrap();
+        assert_eq!(rolling.usage_percent, 12.5);
+        assert_eq!(
+            rolling.resets_at,
+            parse_iso8601(Some("2026-09-17T05:00:00Z"))
+        );
+        let weekly = usage.weekly.as_ref().unwrap();
+        assert_eq!(weekly.usage_percent, 45.0);
+        assert_eq!(
+            weekly.resets_at,
+            parse_iso8601(Some("2026-09-21T00:00:00Z"))
+        );
+        let monthly = usage.monthly.as_ref().unwrap();
+        assert_eq!(monthly.usage_percent, 60.0);
+        // The monthly window inherits the subscription end as its reset.
+        assert_eq!(
+            monthly.resets_at,
+            parse_iso8601(Some("2026-10-01T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn opencode_status_preserves_idle_rolling_window_without_reset() {
+        let json = OPENCODE_GO_STATUS_FIXTURE
+            .replace("\"250000000\"", "\"0\"")
+            .replace("\"2026-09-17T05:00:00.000Z\"", "null");
+        let usage = usage_from_opencode_status(serde_json::from_str(&json).unwrap()).unwrap();
+        let section = opencode_section_from_window(usage.rolling.as_ref().unwrap());
+        assert_eq!(section.percentage, 0.0);
+        assert_eq!(section.resets_at, None);
+    }
+
+    #[test]
+    fn opencode_status_rejects_missing_access_and_invalid_meter_values() {
+        for json in ["null", r#"{"access":null}"#] {
+            assert_eq!(
+                usage_from_opencode_status(serde_json::from_str(json).unwrap()),
+                Err(PollError::RequestFailed)
+            );
+        }
+        for json in [
+            OPENCODE_GO_STATUS_FIXTURE.replace("250000000", "-1"),
+            OPENCODE_GO_STATUS_FIXTURE.replace("250000000", "NaN"),
+            OPENCODE_GO_STATUS_FIXTURE.replace("250000000", "1.5"),
+            OPENCODE_GO_STATUS_FIXTURE.replace("2026-09-17T05:00:00.000Z", "invalid-date"),
+        ] {
+            assert_eq!(
+                usage_from_opencode_status(serde_json::from_str(&json).unwrap()),
+                Err(PollError::RequestFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_meter_handles_zero_limits_and_clamps_overages() {
+        let meter = |used: &str, limit: &str| OpenCodeGoMeter {
+            used_micro_cents: used.into(),
+            limit_micro_cents: limit.into(),
+        };
+        assert_eq!(
+            window_from_opencode_meter(&meter("0", "0"), None)
+                .unwrap()
+                .usage_percent,
+            0.0
+        );
+        let window = window_from_opencode_meter(&meter("120", "100"), None).unwrap();
+        assert_eq!(opencode_section_from_window(&window).percentage, 100.0);
+    }
+
+    #[test]
+    fn opencode_selects_most_constrained_long_window_with_label() {
+        let usage = OpenCodeDashboardUsage {
+            weekly: Some(OpenCodeUsageWindow {
+                usage_percent: 40.0,
+                resets_at: None,
+            }),
+            monthly: Some(OpenCodeUsageWindow {
+                usage_percent: 70.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        };
+        let (section, label) = select_opencode_long_window(&usage);
+        assert_eq!(section.percentage, 70.0);
+        assert_eq!(label.as_deref(), Some("30d"));
+
+        let usage = OpenCodeDashboardUsage {
+            weekly: Some(OpenCodeUsageWindow {
+                usage_percent: 80.0,
+                resets_at: None,
+            }),
+            monthly: Some(OpenCodeUsageWindow {
+                usage_percent: 20.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        };
+        let (section, label) = select_opencode_long_window(&usage);
+        assert_eq!(section.percentage, 80.0);
+        assert_eq!(label.as_deref(), Some("7d"));
+
+        let (section, label) = select_opencode_long_window(&OpenCodeDashboardUsage::default());
+        assert_eq!(section.percentage, 0.0);
+        assert_eq!(label, None);
+    }
+
+    #[test]
+    fn opencode_request_sends_workspace_context_and_normalizes_auth_cookie() {
+        for (cookie, expected) in [
+            ("test-token", "auth=test-token"),
+            ("test-token==", "auth=test-token=="),
+            ("auth=test-token; theme=dark", "auth=test-token; theme=dark"),
+            (
+                "__Host-console_session=SessionToken==",
+                "__Host-console_session=SessionToken==",
+            ),
+            (
+                "theme=dark; __Host-console_session=SessionToken",
+                "theme=dark; __Host-console_session=SessionToken",
+            ),
+        ] {
+            let (result, request) =
+                mock_opencode_status_request(200, OPENCODE_GO_STATUS_FIXTURE, cookie);
+            assert_eq!(result.unwrap().rolling.unwrap().usage_percent, 12.5);
+            let sent_cookie = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("cookie")
+                        .then_some(value.trim_start())
+                })
+                .unwrap();
+            assert_eq!(sent_cookie, expected);
+            let request = request.to_ascii_lowercase();
+            assert!(request.starts_with("get /console/api/go/status http/1.1\r\n"));
+            assert!(request.contains("\r\nx-org-id: wrk_example\r\n"));
+            assert!(request.contains("\r\naccept: application/json\r\n"));
+        }
+    }
+
+    #[test]
+    fn opencode_request_distinguishes_auth_errors_from_bad_responses() {
+        for status in [401, 403] {
+            assert_eq!(
+                mock_opencode_status_request(status, "{}", "test-token").0,
+                Err(PollError::AuthRequired)
+            );
+        }
+        for (status, body) in [
+            (500, "{}"),
+            (200, "<html><div id=app></div></html>"),
+            (200, "{invalid"),
+            (200, "{}"),
+            (200, "null"),
+            (200, r#"{"access":{"meters":{}}}"#),
+        ] {
+            assert_eq!(
+                mock_opencode_status_request(status, body, "test-token").0,
+                Err(PollError::RequestFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_config_file_parses_aliases_and_rejects_invalid_values() {
+        let path =
+            std::env::temp_dir().join(format!("opencode-go-config-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"workspaceID": "wrk_01-test", "cookie": "auth=abc; theme=dark"}"#,
+        )
+        .unwrap();
+        let credentials = read_opencode_config(&path).unwrap();
+        assert_eq!(credentials.workspace_id, "wrk_01-test");
+        assert_eq!(credentials.auth_cookie, "auth=abc; theme=dark");
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(!valid_opencode_workspace_id("../other"));
+        assert!(!valid_opencode_workspace_id(""));
+        assert!(valid_opencode_workspace_id("wrk_01-test"));
+        assert!(!valid_opencode_cookie("auth=abc\r\nX-Test: injected"));
+        assert!(!valid_opencode_cookie(""));
+    }
 
     #[test]
     fn credential_signature_detects_same_length_rewrites_within_one_second() {

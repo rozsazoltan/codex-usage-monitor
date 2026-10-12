@@ -1,6 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
@@ -205,6 +205,7 @@ pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
         1 => poll_codex(),
         2 => poll_antigravity(),
         3 => poll_opencode(),
+        4 => poll_cursor(),
         _ => Err(PollError::RequestFailed),
     }
 }
@@ -1501,6 +1502,331 @@ fn valid_opencode_cookie(value: &str) -> bool {
     !value.is_empty() && !value.bytes().any(|byte| matches!(byte, b'\r' | b'\n'))
 }
 
+const CURSOR_USAGE_SUMMARY_URL: &str = "https://cursor.com/api/usage-summary";
+const CURSOR_SESSION_TOKEN_ENV: &str = "CURSOR_SESSION_TOKEN";
+const CURSOR_ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
+
+// Minimal read-only winsqlite3.dll binding (ships with Windows) — avoids a
+// bundled-SQLite dependency just to read Cursor's state database.
+const SQLITE_OK: c_int = 0;
+const SQLITE_ROW: c_int = 100;
+const SQLITE_DONE: c_int = 101;
+const SQLITE_OPEN_READONLY: c_int = 0x00000001;
+
+#[link(name = "winsqlite3")]
+extern "C" {
+    fn sqlite3_open_v2(
+        filename: *const c_char,
+        pp_db: *mut *mut c_void,
+        flags: c_int,
+        z_vfs: *const c_char,
+    ) -> c_int;
+    fn sqlite3_prepare_v2(
+        db: *mut c_void,
+        sql: *const c_char,
+        n_byte: c_int,
+        pp_stmt: *mut *mut c_void,
+        pz_tail: *mut *const c_char,
+    ) -> c_int;
+    fn sqlite3_bind_text(
+        stmt: *mut c_void,
+        index: c_int,
+        value: *const c_char,
+        n: c_int,
+        destructor: *const c_void,
+    ) -> c_int;
+    fn sqlite3_step(stmt: *mut c_void) -> c_int;
+    fn sqlite3_column_text(stmt: *mut c_void, col: c_int) -> *const c_uchar;
+    fn sqlite3_finalize(stmt: *mut c_void) -> c_int;
+    fn sqlite3_close_v2(db: *mut c_void) -> c_int;
+    fn sqlite3_errmsg(db: *mut c_void) -> *const c_char;
+}
+
+#[derive(Deserialize)]
+struct CursorUsageSummaryResponse {
+    #[serde(rename = "billingCycleEnd")]
+    billing_cycle_end: Option<String>,
+    #[serde(rename = "individualUsage")]
+    individual_usage: Option<CursorIndividualUsage>,
+}
+
+#[derive(Deserialize)]
+struct CursorIndividualUsage {
+    plan: Option<CursorPlanUsage>,
+}
+
+#[derive(Deserialize)]
+struct CursorPlanUsage {
+    #[serde(rename = "autoPercentUsed")]
+    auto_percent_used: Option<f64>,
+    #[serde(rename = "apiPercentUsed")]
+    api_percent_used: Option<f64>,
+    #[serde(rename = "totalPercentUsed")]
+    total_percent_used: Option<f64>,
+}
+
+fn poll_cursor() -> Result<UsageData, PollError> {
+    let cookie = read_cursor_session_cookie().ok_or_else(|| {
+        diagnose::log(
+            "Cursor usage poll failed: no Cursor session found (sign in to Cursor or set CURSOR_SESSION_TOKEN)"
+                .to_string(),
+        );
+        PollError::NoCredentials
+    })?;
+    fetch_cursor_usage(&cookie, CURSOR_USAGE_SUMMARY_URL)
+}
+
+/// Resolve a Cursor dashboard session cookie. An explicit environment value
+/// takes priority over the access token persisted by Cursor itself.
+fn read_cursor_session_cookie() -> Option<String> {
+    if let Some(token) = opencode_non_empty_env(CURSOR_SESSION_TOKEN_ENV) {
+        return normalize_cursor_session_cookie(&token);
+    }
+
+    let access_token = read_cursor_access_token_from_state_db()?;
+    cursor_cookie_from_access_token(&access_token)
+}
+
+fn normalize_cursor_session_cookie(token: &str) -> Option<String> {
+    if token.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        return None;
+    }
+    let token = token
+        .trim()
+        .strip_prefix("WorkosCursorSessionToken=")
+        .unwrap_or(token.trim())
+        .trim();
+    if token.is_empty() {
+        None
+    } else if token.contains("%3A%3A") {
+        Some(token.to_string())
+    } else if token.contains("::") {
+        Some(token.replace("::", "%3A%3A"))
+    } else {
+        cursor_cookie_from_access_token(token).or_else(|| Some(token.to_string()))
+    }
+}
+
+fn cursor_cookie_from_access_token(access_token: &str) -> Option<String> {
+    let user_id = extract_cursor_user_id(access_token)?;
+    Some(format!("{user_id}%3A%3A{access_token}"))
+}
+
+fn extract_cursor_user_id(jwt: &str) -> Option<String> {
+    let payload = jwt.split('.').nth(1)?;
+    let decoded = base64_url_decode(payload)?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let subject = json.get("sub")?.as_str()?;
+    Some(
+        subject
+            .rsplit_once('|')
+            .map(|(_, id)| id.to_string())
+            .unwrap_or_else(|| subject.to_string()),
+    )
+}
+
+fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 4 == 1 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    let padding_mask = (1u32 << bits).saturating_sub(1);
+    (buffer & padding_mask == 0).then_some(output)
+}
+
+fn cursor_state_db_path() -> Option<PathBuf> {
+    let path = PathBuf::from(opencode_non_empty_env("APPDATA")?)
+        .join("Cursor")
+        .join("User")
+        .join("globalStorage")
+        .join("state.vscdb");
+    path.is_file().then_some(path)
+}
+
+fn read_cursor_access_token_from_state_db() -> Option<String> {
+    let path = cursor_state_db_path()?;
+    match query_cursor_state_value(&path, CURSOR_ACCESS_TOKEN_KEY) {
+        Ok(token) => token,
+        Err(error) => {
+            diagnose::log(format!(
+                "Cursor state DB direct read failed ({error}); retrying via temp copy"
+            ));
+            query_cursor_state_value_from_copy(&path, CURSOR_ACCESS_TOKEN_KEY)
+        }
+    }
+}
+
+fn query_cursor_state_value_from_copy(path: &PathBuf, key: &str) -> Option<String> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = std::env::temp_dir().join(format!(
+        "codex-usage-cursor-state-{}-{unique}.vscdb",
+        std::process::id()
+    ));
+    if let Err(error) = std::fs::copy(path, &temporary) {
+        diagnose::log(format!("Cursor state DB temp copy failed: {error}"));
+        return None;
+    }
+    let result = query_cursor_state_value(&temporary, key);
+    let _ = std::fs::remove_file(&temporary);
+    match result {
+        Ok(token) => token,
+        Err(error) => {
+            diagnose::log(format!("Cursor state DB temp-copy read failed: {error}"));
+            None
+        }
+    }
+}
+
+fn query_cursor_state_value(path: &PathBuf, key: &str) -> Result<Option<String>, String> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "state DB path is not valid Unicode".to_string())?;
+    let path_c = CString::new(path_str).map_err(|error| error.to_string())?;
+    let sql_c =
+        CString::new("SELECT value FROM ItemTable WHERE key = ?1").map_err(|e| e.to_string())?;
+    let key_c = CString::new(key).map_err(|error| error.to_string())?;
+
+    unsafe {
+        let mut db: *mut c_void = std::ptr::null_mut();
+        let rc = sqlite3_open_v2(
+            path_c.as_ptr(),
+            &mut db,
+            SQLITE_OPEN_READONLY,
+            std::ptr::null(),
+        );
+        if rc != SQLITE_OK || db.is_null() {
+            if !db.is_null() {
+                sqlite3_close_v2(db);
+            }
+            return Err(format!("state DB open failed: {rc}"));
+        }
+
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        let rc = sqlite3_prepare_v2(db, sql_c.as_ptr(), -1, &mut stmt, std::ptr::null_mut());
+        if rc != SQLITE_OK || stmt.is_null() {
+            let detail = db_message(db);
+            sqlite3_close_v2(db);
+            return Err(format!("state DB prepare failed: {rc} ({detail})"));
+        }
+
+        // SQLITE_TRANSIENT (-1): SQLite copies the bound text immediately.
+        let rc = sqlite3_bind_text(stmt, 1, key_c.as_ptr(), -1, (-1isize) as *const c_void);
+        if rc != SQLITE_OK {
+            sqlite3_finalize(stmt);
+            sqlite3_close_v2(db);
+            return Err(format!("state DB bind failed: {rc}"));
+        }
+
+        let value = match sqlite3_step(stmt) {
+            SQLITE_ROW => {
+                let text = sqlite3_column_text(stmt, 0);
+                if text.is_null() {
+                    None
+                } else {
+                    Some(
+                        CStr::from_ptr(text as *const c_char)
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                }
+            }
+            SQLITE_DONE => None,
+            rc => {
+                let detail = db_message(db);
+                sqlite3_finalize(stmt);
+                sqlite3_close_v2(db);
+                return Err(format!("state DB step failed: {rc} ({detail})"));
+            }
+        };
+        sqlite3_finalize(stmt);
+        sqlite3_close_v2(db);
+        Ok(value.filter(|value| !value.is_empty()))
+    }
+}
+
+unsafe fn db_message(db: *mut c_void) -> String {
+    let message = sqlite3_errmsg(db);
+    if message.is_null() {
+        return String::new();
+    }
+    CStr::from_ptr(message).to_string_lossy().into_owned()
+}
+
+fn fetch_cursor_usage(cookie: &str, url: &str) -> Result<UsageData, PollError> {
+    let agent = build_agent()?;
+    let cookie_header = format!("WorkosCursorSessionToken={cookie}");
+
+    let resp = match agent
+        .get(url)
+        .set("Cookie", &cookie_header)
+        .set("User-Agent", "Mozilla/5.0")
+        .call()
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            return Err(PollError::AuthRequired)
+        }
+        Err(error) => {
+            diagnose::log(format!("Cursor usage-summary request failed: {error:?}"));
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    let response: CursorUsageSummaryResponse = match resp.into_json() {
+        Ok(response) => response,
+        Err(error) => {
+            diagnose::log(format!(
+                "unable to parse Cursor usage-summary response: {error:?}"
+            ));
+            return Err(PollError::RequestFailed);
+        }
+    };
+    cursor_usage_from_summary(response).ok_or_else(|| {
+        diagnose::log("Cursor usage-summary response missing plan usage".to_string());
+        PollError::RequestFailed
+    })
+}
+
+fn cursor_usage_from_summary(response: CursorUsageSummaryResponse) -> Option<UsageData> {
+    let plan = response.individual_usage?.plan?;
+    let reset = parse_iso8601(response.billing_cycle_end.as_deref());
+    let section = |percentage: Option<f64>| {
+        percentage
+            .map(|percentage| UsageSection {
+                percentage: percentage.clamp(0.0, 100.0),
+                resets_at: reset,
+            })
+            .unwrap_or_default()
+    };
+    // The API-slot label ("API") cannot be stored yet — UsageData gains
+    // per-provider labels in P5; until then the weekly slot carries it.
+    Some(UsageData {
+        session: section(plan.auto_percent_used.or(plan.total_percent_used)),
+        weekly: section(plan.api_percent_used),
+    })
+}
+
 fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
     response
         .header(name)
@@ -2260,6 +2586,309 @@ mod tests {
         assert!(valid_opencode_workspace_id("wrk_01-test"));
         assert!(!valid_opencode_cookie("auth=abc\r\nX-Test: injected"));
         assert!(!valid_opencode_cookie(""));
+    }
+
+    const CURSOR_USAGE_SUMMARY_FIXTURE: &str = r#"{
+        "billingCycleEnd": "2026-08-25T19:27:24.000Z",
+        "individualUsage": {
+            "plan": {
+                "autoPercentUsed": 12.5,
+                "apiPercentUsed": 3.0,
+                "totalPercentUsed": 10.0
+            }
+        }
+    }"#;
+    const CURSOR_TEST_JWT: &str = "header.eyJzdWIiOiJhdXRoMHx1c2VyXzEyMyJ9.signature";
+
+    fn mock_cursor_usage_request(
+        status: u16,
+        body: &str,
+        cookie: &str,
+    ) -> (Result<UsageData, PollError>, String) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/api/usage-summary",
+            listener.local_addr().unwrap()
+        );
+        let response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let result = fetch_cursor_usage(cookie, &url);
+        (result, server.join().unwrap())
+    }
+
+    fn create_cursor_state_fixture(token: &str) -> PathBuf {
+        extern "C" {
+            fn sqlite3_open_v2(
+                filename: *const c_char,
+                pp_db: *mut *mut c_void,
+                flags: c_int,
+                z_vfs: *const c_char,
+            ) -> c_int;
+            fn sqlite3_exec(
+                db: *mut c_void,
+                sql: *const c_char,
+                callback: *const c_void,
+                arg: *mut c_void,
+                errmsg: *mut *mut c_char,
+            ) -> c_int;
+            fn sqlite3_close_v2(db: *mut c_void) -> c_int;
+        }
+        const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
+        const SQLITE_OPEN_CREATE: c_int = 0x00000004;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cursor-state-{}-{nanos}.vscdb", std::process::id()));
+        let setup = format!(
+            "CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT); \
+             INSERT INTO ItemTable(key, value) VALUES ('{CURSOR_ACCESS_TOKEN_KEY}', '{token}');"
+        );
+        unsafe {
+            let path_c = CString::new(path.to_str().unwrap()).unwrap();
+            let setup_c = CString::new(setup).unwrap();
+            let mut db: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(
+                    path_c.as_ptr(),
+                    &mut db,
+                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    setup_c.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                0
+            );
+            sqlite3_close_v2(db);
+        }
+        path
+    }
+
+    #[test]
+    fn cursor_extracts_user_id_from_jwt_access_token() {
+        assert_eq!(
+            extract_cursor_user_id(CURSOR_TEST_JWT).as_deref(),
+            Some("user_123")
+        );
+        assert_eq!(
+            cursor_cookie_from_access_token(CURSOR_TEST_JWT).as_deref(),
+            Some("user_123%3A%3Aheader.eyJzdWIiOiJhdXRoMHx1c2VyXzEyMyJ9.signature")
+        );
+        assert!(extract_cursor_user_id("not-a-jwt").is_none());
+        assert!(extract_cursor_user_id("a.b").is_none());
+    }
+
+    #[test]
+    fn cursor_rejects_malformed_base64_and_cookie_header_injection() {
+        assert!(base64_url_decode("a").is_none());
+        assert!(base64_url_decode("***").is_none());
+        assert!(normalize_cursor_session_cookie("value\r\nInjected: yes").is_none());
+        assert!(normalize_cursor_session_cookie("   ").is_none());
+    }
+
+    #[test]
+    fn cursor_normalizes_explicit_session_cookie_forms() {
+        assert_eq!(
+            normalize_cursor_session_cookie("WorkosCursorSessionToken=abc::def").as_deref(),
+            Some("abc%3A%3Adef")
+        );
+        assert_eq!(
+            normalize_cursor_session_cookie("abc::def").as_deref(),
+            Some("abc%3A%3Adef")
+        );
+        assert_eq!(
+            normalize_cursor_session_cookie("abc%3A%3Adef").as_deref(),
+            Some("abc%3A%3Adef")
+        );
+        assert_eq!(
+            normalize_cursor_session_cookie("plain-token").as_deref(),
+            Some("plain-token")
+        );
+    }
+
+    #[test]
+    fn cursor_usage_maps_auto_and_api_percentages_with_shared_reset() {
+        let response: CursorUsageSummaryResponse =
+            serde_json::from_str(CURSOR_USAGE_SUMMARY_FIXTURE).unwrap();
+        let data = cursor_usage_from_summary(response).unwrap();
+        assert_eq!(data.session.percentage, 12.5);
+        assert_eq!(data.weekly.percentage, 3.0);
+        assert!(data.session.resets_at.is_some());
+        assert_eq!(data.session.resets_at, data.weekly.resets_at);
+    }
+
+    #[test]
+    fn cursor_missing_metrics_fall_back_to_total_or_empty_sections() {
+        // Our UsageSection has no `available` flag: a missing metric is the
+        // default section (renders as "--"), an idle metric is 0%.
+        let total_only: CursorUsageSummaryResponse =
+            serde_json::from_str(r#"{"individualUsage":{"plan":{"totalPercentUsed":0}}}"#).unwrap();
+        let data = cursor_usage_from_summary(total_only).unwrap();
+        assert_eq!(data.session.percentage, 0.0);
+        assert_eq!(data.weekly.percentage, 0.0);
+        assert!(data.weekly.resets_at.is_none());
+
+        let api_only: CursorUsageSummaryResponse =
+            serde_json::from_str(r#"{"individualUsage":{"plan":{"apiPercentUsed":42}}}"#).unwrap();
+        let data = cursor_usage_from_summary(api_only).unwrap();
+        assert_eq!(data.session.percentage, 0.0);
+        assert!(data.session.resets_at.is_none());
+        assert_eq!(data.weekly.percentage, 42.0);
+
+        let missing: CursorUsageSummaryResponse =
+            serde_json::from_str(r#"{"individualUsage":{}}"#).unwrap();
+        assert!(cursor_usage_from_summary(missing).is_none());
+    }
+
+    #[test]
+    fn cursor_request_sends_session_cookie_and_handles_statuses() {
+        let (result, request) =
+            mock_cursor_usage_request(200, CURSOR_USAGE_SUMMARY_FIXTURE, "abc%3A%3Adef");
+        let data = result.unwrap();
+        assert_eq!(data.session.percentage, 12.5);
+        let sent_cookie = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("cookie")
+                    .then_some(value.trim_start())
+            })
+            .unwrap();
+        assert_eq!(sent_cookie, "WorkosCursorSessionToken=abc%3A%3Adef");
+        assert!(request
+            .to_ascii_lowercase()
+            .starts_with("get /api/usage-summary http/1.1\r\n"));
+
+        for status in [401, 403] {
+            assert!(matches!(
+                mock_cursor_usage_request(status, "{}", "abc").0,
+                Err(PollError::AuthRequired)
+            ));
+        }
+        for (status, body) in [
+            (500, "{}"),
+            (200, "{invalid"),
+            (200, "{}"),
+            (200, r#"{"individualUsage":{}}"#),
+        ] {
+            assert!(matches!(
+                mock_cursor_usage_request(status, body, "abc").0,
+                Err(PollError::RequestFailed)
+            ));
+        }
+        // An empty plan object parses fine: both slots stay default sections.
+        let (result, _) =
+            mock_cursor_usage_request(200, r#"{"individualUsage":{"plan":{}}}"#, "abc");
+        let data = result.unwrap();
+        assert_eq!(data.session.percentage, 0.0);
+        assert!(data.session.resets_at.is_none());
+        assert_eq!(data.weekly.percentage, 0.0);
+        assert!(data.weekly.resets_at.is_none());
+    }
+
+    #[test]
+    fn cursor_state_db_round_trip_and_credential_resolution() {
+        let fixture = create_cursor_state_fixture(CURSOR_TEST_JWT);
+        assert_eq!(
+            query_cursor_state_value(&fixture, CURSOR_ACCESS_TOKEN_KEY).unwrap(),
+            Some(CURSOR_TEST_JWT.to_string())
+        );
+        assert_eq!(
+            query_cursor_state_value(&fixture, "missing/key").unwrap(),
+            None
+        );
+        assert!(query_cursor_state_value(
+            &fixture.with_extension("does-not-exist"),
+            CURSOR_ACCESS_TOKEN_KEY
+        )
+        .is_err());
+
+        let empty_fixture = create_cursor_state_fixture("");
+        assert_eq!(
+            query_cursor_state_value(&empty_fixture, CURSOR_ACCESS_TOKEN_KEY).unwrap(),
+            None
+        );
+
+        // Env token wins over the state DB; the DB is used when the env var
+        // is absent. A process-wide lock serializes the global env mutation
+        // below; both vars are restored before the guard drops.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let saved_token = std::env::var(CURSOR_SESSION_TOKEN_ENV).ok();
+        let saved_appdata = std::env::var("APPDATA").ok();
+        unsafe {
+            std::env::set_var(CURSOR_SESSION_TOKEN_ENV, "abc::def");
+        }
+        assert_eq!(
+            read_cursor_session_cookie().as_deref(),
+            Some("abc%3A%3Adef")
+        );
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let appdata =
+            std::env::temp_dir().join(format!("cursor-appdata-{}-{nanos}", std::process::id()));
+        let db_dir = appdata.join("Cursor").join("User").join("globalStorage");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::copy(&fixture, db_dir.join("state.vscdb")).unwrap();
+        unsafe {
+            std::env::remove_var(CURSOR_SESSION_TOKEN_ENV);
+            std::env::set_var("APPDATA", &appdata);
+        }
+        assert_eq!(
+            read_cursor_session_cookie().as_deref(),
+            Some("user_123%3A%3Aheader.eyJzdWIiOiJhdXRoMHx1c2VyXzEyMyJ9.signature")
+        );
+
+        unsafe {
+            match saved_token {
+                Some(value) => std::env::set_var(CURSOR_SESSION_TOKEN_ENV, value),
+                None => std::env::remove_var(CURSOR_SESSION_TOKEN_ENV),
+            }
+            match saved_appdata {
+                Some(value) => std::env::set_var("APPDATA", value),
+                None => std::env::remove_var("APPDATA"),
+            }
+        }
+        std::fs::remove_file(&fixture).unwrap();
+        std::fs::remove_file(&empty_fixture).unwrap();
+        std::fs::remove_dir_all(&appdata).unwrap();
     }
 
     #[test]

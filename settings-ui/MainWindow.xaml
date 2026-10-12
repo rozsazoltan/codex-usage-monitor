@@ -39,17 +39,30 @@
         </NavigationView.FooterMenuItems>
         <Grid x:Name="PageContent">
             <ScrollViewer x:Name="PageScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel MaxWidth="1040" HorizontalAlignment="Center" Padding="40,30,40,40" Spacing="22">
+                <StackPanel HorizontalAlignment="Stretch" Padding="40,30,40,40" Spacing="22">
                     <StackPanel Spacing="5">
                         <TextBlock x:Name="PageEyebrow" Text="PREFERENCES" FontSize="11" FontWeight="SemiBold" CharacterSpacing="130" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
                         <TextBlock x:Name="PageTitle" Text="General" FontSize="32" FontWeight="SemiBold" />
                         <TextBlock x:Name="PageSummary" Text="A few thoughtful choices make the widget feel like yours." FontSize="14" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
                     </StackPanel>
-                    <StackPanel x:Name="PageHost" Spacing="18" />
-                    <TextBlock Text="Changes are saved automatically." FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}" Margin="2,4,0,0" TextWrapping="Wrap" />
+                    <StackPanel x:Name="PageHost" HorizontalAlignment="Stretch" Spacing="18" />
+                    <TextBlock Text="Changes take effect after you save them." FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}" Margin="2,4,0,0" TextWrapping="Wrap" />
                 </StackPanel>
             </ScrollViewer>
-            <InfoBar x:Name="MessageBar" VerticalAlignment="Bottom" HorizontalAlignment="Right" MaxWidth="560" Margin="24,0,24,18" IsOpen="False" IsClosable="True" Severity="Informational" AutomationProperties.Name="Settings feedback" AutomationProperties.AutomationId="SettingsFeedback" AutomationProperties.LiveSetting="Polite" />
+            <InfoBar x:Name="MessageBar" VerticalAlignment="Bottom" HorizontalAlignment="Right" MaxWidth="560" Margin="24,0,24,76" IsOpen="False" IsClosable="True" Severity="Informational" Background="{ThemeResource SolidBackgroundFillColorBaseBrush}" Foreground="{ThemeResource TextFillColorPrimaryBrush}" AutomationProperties.Name="Settings feedback" AutomationProperties.AutomationId="SettingsFeedback" AutomationProperties.LiveSetting="Polite" />
+            <Border x:Name="SaveBar" VerticalAlignment="Bottom" HorizontalAlignment="Right" Margin="24,0,24,18" Visibility="Collapsed"
+                    Background="{ThemeResource SolidBackgroundFillColorBaseBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="16,8,8,8"
+                    AutomationProperties.Name="Unsaved changes" AutomationProperties.AutomationId="SaveBar">
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <TextBlock Text="Unsaved changes" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center" Margin="4,0,4,0" />
+                    <Button AutomationProperties.Name="Save changes" AutomationProperties.AutomationId="SavePendingChanges" ToolTipService.ToolTip="Save changes" x:Name="SaveChangesButton">
+                        <SymbolIcon Symbol="Accept" />
+                    </Button>
+                    <Button AutomationProperties.Name="Discard changes" AutomationProperties.AutomationId="DiscardPendingChanges" ToolTipService.ToolTip="Discard changes" x:Name="DiscardChangesButton">
+                        <SymbolIcon Symbol="Cancel" />
+                    </Button>
+                </StackPanel>
+            </Border>
         </Grid>
         </NavigationView>
     </Grid>

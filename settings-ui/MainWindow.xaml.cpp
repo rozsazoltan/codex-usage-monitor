@@ -103,6 +103,7 @@ namespace
     {
         auto border = Border(); border.Background(Application::Current().Resources().Lookup(box_value(L"CardBackgroundFillColorDefaultBrush")).as<Media::Brush>());
         border.BorderBrush(Application::Current().Resources().Lookup(box_value(L"CardStrokeColorDefaultBrush")).as<Media::Brush>());
+        border.HorizontalAlignment(HorizontalAlignment::Stretch);
         border.BorderThickness(ThicknessHelper::FromUniformLength(1)); border.CornerRadius(CornerRadiusHelper::FromUniformRadius(12)); border.Padding(Thickness{24,24,24,24}); return border;
     }
     Grid ToggleRow(StackPanel const& copy, ToggleSwitch const& toggle)
@@ -189,6 +190,22 @@ namespace
         }
         return FormatHexColor(color);
     }
+    std::wstring EffectiveColorText(JsonObject const& state, std::wstring const& key)
+    {
+        if (!state || !state.HasKey(L"effective_appearance")) return {};
+        const auto effective = state.GetNamedObject(L"effective_appearance", JsonObject());
+        if (!effective.HasKey(key) || effective.GetNamedValue(key).ValueType() != JsonValueType::Array) return {};
+        const auto array = effective.GetNamedArray(key);
+        if (array.Size() != 3) return {};
+        std::array<uint8_t, 3> color{};
+        for (uint32_t i = 0; i < color.size(); ++i)
+        {
+            const auto component = array.GetAt(i).GetNumber();
+            if (component < 0 || component > 255 || component != static_cast<int>(component)) return {};
+            color[i] = static_cast<uint8_t>(component);
+        }
+        return FormatHexColor(color);
+    }
     bool SettingsChangesAreLocalEcho(JsonObject const& previous, JsonObject const& updated, JsonObject const& localChanges)
     {
         const auto before = previous ? previous.GetNamedObject(L"settings", JsonObject()) : JsonObject();
@@ -241,15 +258,15 @@ namespace winrt::SettingsUI::implementation
         NavigationUpdate().Content(updateContent);
         NavigationUpdate().Visibility(Visibility::Collapsed);
         auto weak = get_weak();
-        debounceTimer_ = dispatcher_.CreateTimer();
-        debounceTimer_.Interval(std::chrono::seconds(4));
-        debounceTimer_.IsRepeating(false);
-        debounceTimer_.Tick([weak](auto const&, auto const&)
+        previewTimer_ = dispatcher_.CreateTimer();
+        previewTimer_.Interval(std::chrono::milliseconds(180));
+        previewTimer_.IsRepeating(false);
+        previewTimer_.Tick([weak](auto const&, auto const&)
         {
             if (auto self = weak.get(); self && !self->closed_)
             {
-                self->debounceElapsed_ = true;
-                self->SendNextMutation();
+                self->previewPending_ = true;
+                self->SendWidgetPreviewIfIdle();
             }
         });
         messageTimer_ = dispatcher_.CreateTimer();
@@ -269,6 +286,8 @@ namespace winrt::SettingsUI::implementation
             if (paneStateKnown_ && !hydrating_ && Bool(L"settings_pane_open"))
                 SetValue(L"settings_pane_open", JsonValue::CreateBooleanValue(false));
         });
+        SaveChangesButton().Click([this](auto const&, auto const&) { FlushPending(); });
+        DiscardChangesButton().Click([this](auto const&, auto const&) { DiscardPendingChanges(); });
         check_hresult(m_inner.as<::IWindowNative>()->get_WindowHandle(&hwnd_));
         windowIcon_ = LoadResourceIcon();
         ApplyWindowIcon(*this, windowIcon_);
@@ -355,7 +374,7 @@ namespace winrt::SettingsUI::implementation
             noticesWindow_ = nullptr;
         }
         if (messageTimer_) messageTimer_.Stop();
-        if (debounceTimer_) debounceTimer_.Stop();
+        if (previewTimer_) previewTimer_.Stop();
         stopping_.store(true); requestsChanged_.notify_all();
         if (pipeHandle_ != INVALID_HANDLE_VALUE) CancelIoEx(pipeHandle_, nullptr);
         if (ioThread_.joinable()) CancelSynchronousIo(ioThread_.native_handle());
@@ -390,7 +409,7 @@ namespace winrt::SettingsUI::implementation
         const auto pipe = pipeHandle_.load();
         if (pipe != INVALID_HANDLE_VALUE) CancelIoEx(pipe, nullptr);
         if (messageTimer_) messageTimer_.Stop();
-        if (debounceTimer_) debounceTimer_.Stop();
+        if (previewTimer_) previewTimer_.Stop();
         RevokeWindowEvents();
 
         if (closeSaveFailureDialog_)
@@ -541,7 +560,7 @@ namespace winrt::SettingsUI::implementation
                 uint8_t prefix[4]{};
                 if (!readExact(prefix, 4)) break;
                 const auto length = uint32_t(prefix[0]) | (uint32_t(prefix[1]) << 8) | (uint32_t(prefix[2]) << 16) | (uint32_t(prefix[3]) << 24);
-                if (length == 0 || length > 65536) break;
+                if (length == 0 || length > 2 * 1024 * 1024) break;
                 std::string body(length, '\0');
                 if (!readExact(body.data(), length)) break;
                 try
@@ -580,10 +599,36 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::FlushPending()
     {
-        if (debounceTimer_) debounceTimer_.Stop();
-        debounceElapsed_ = true;
         flushRequested_ = true;
         SendNextMutation();
+    }
+
+    void MainWindow::UpdateSaveBar()
+    {
+        const bool dirty = !closed_ && (HasPendingChanges() || HasUnappliedColorDraft());
+        SaveBar().Visibility(dirty ? Visibility::Visible : Visibility::Collapsed);
+    }
+
+    void MainWindow::DiscardPendingChanges()
+    {
+        if (mutationInFlight_ || persistInFlight_)
+        {
+            ShowMessage(L"A save is already in progress. Please wait a moment and try again.", true);
+            return;
+        }
+        pendingChanges_ = nullptr;
+        flushRequested_ = false;
+        persistNeeded_ = false;
+        SetColorDraft(L"claude_accent", std::nullopt);
+        SetColorDraft(L"codex_accent", std::nullopt);
+        SetColorDraft(L"usage_text_color", std::nullopt);
+        claudeColorApplyText_.reset();
+        codexColorApplyText_.reset();
+        usageTextColorApplyText_.reset();
+        Hydrate();
+        UpdateSaveBar();
+        ScheduleWidgetPreview();
+        ShowMessage(L"Unsaved changes were discarded.");
     }
 
     void MainWindow::SendNextMutation()
@@ -599,7 +644,8 @@ namespace winrt::SettingsUI::implementation
             {
                 const auto key = std::wstring(pair.Key().c_str());
                 const bool colorApplyPending = key == L"claude_accent" ? claudeColorApplyText_.has_value()
-                    : key == L"codex_accent" ? codexColorApplyText_.has_value() : false;
+                    : key == L"codex_accent" ? codexColorApplyText_.has_value()
+                    : key == L"usage_text_color" ? usageTextColorApplyText_.has_value() : false;
                 if ((!flightChanges_ || !flightChanges_.HasKey(key)) && !colorApplyPending &&
                     server.HasKey(key) && server.GetNamedValue(key).Stringify() == pair.Value().Stringify()) continue;
                 if (changes.Size() == 20) { remainder.Insert(key, pair.Value()); continue; }
@@ -613,8 +659,10 @@ namespace winrt::SettingsUI::implementation
                 flightChanges_ = snapshot;
                 flightClaudeColorApplyText_ = snapshot.HasKey(L"claude_accent") ? claudeColorApplyText_ : std::nullopt;
                 flightCodexColorApplyText_ = snapshot.HasKey(L"codex_accent") ? codexColorApplyText_ : std::nullopt;
+                flightUsageTextColorApplyText_ = snapshot.HasKey(L"usage_text_color") ? usageTextColorApplyText_ : std::nullopt;
                 if (flightClaudeColorApplyText_) claudeColorApplyText_.reset();
                 if (flightCodexColorApplyText_) codexColorApplyText_.reset();
+                if (flightUsageTextColorApplyText_) usageTextColorApplyText_.reset();
                 mutationInFlight_ = true;
                 ShowMessage(L"Applying changes…");
                 Send(request);
@@ -660,6 +708,7 @@ namespace winrt::SettingsUI::implementation
             {
                 resetColorsClaudeDraftRevision_ = claudeColorDraftRevision_;
                 resetColorsCodexDraftRevision_ = codexColorDraftRevision_;
+                resetColorsUsageTextDraftRevision_ = usageTextColorDraftRevision_;
             }
             auto request = Request(L"action"); request.Insert(L"action", JsonValue::CreateStringValue(action)); Send(request);
             return;
@@ -699,6 +748,7 @@ namespace winrt::SettingsUI::implementation
             {
                 resetColorsClaudeDraftRevision_ = claudeColorDraftRevision_;
                 resetColorsCodexDraftRevision_ = codexColorDraftRevision_;
+                resetColorsUsageTextDraftRevision_ = usageTextColorDraftRevision_;
             }
             auto request = Request(L"action"); request.Insert(L"action", JsonValue::CreateStringValue(action)); Send(request);
         }
@@ -846,6 +896,7 @@ namespace winrt::SettingsUI::implementation
                     localEcho = settingsChanged && SettingsChangesAreLocalEcho(state_, updated, localChanges);
                     state_ = updated;
                     revision_ = revision;
+                    UpdateWidgetPreview(updated);
                 }
                 UpdateClaudeAvailability();
                 UpdateAboutControls();
@@ -866,23 +917,40 @@ namespace winrt::SettingsUI::implementation
         }
         if (!message.HasKey(L"id") || message.GetNamedNumber(L"id", 0) != inFlight_) return;
         const bool isInitialGet = initialGetPending_;
+        const bool wasPreview = previewInFlight_;
+        const auto completedPreviewGeneration = widgetPreviewFlightGeneration_;
         const bool wasMutation = mutationInFlight_;
         const bool wasSettingsAction = settingsActionInFlight_;
         const auto completedSettingsAction = settingsActionInFlightName_;
         initialGetPending_ = false;
+        previewInFlight_ = false;
         settingsActionInFlight_ = false;
         settingsActionInFlightName_.reset();
         inFlight_ = 0;
+        const bool ok = message.GetNamedBoolean(L"ok", false);
+        if (wasPreview)
+        {
+            if (ok && completedPreviewGeneration == widgetPreviewGeneration_ &&
+                message.HasKey(L"state") && message.GetNamedValue(L"state").ValueType() == JsonValueType::Object)
+                UpdateWidgetPreview(message.GetNamedObject(L"state"));
+            else if (!ok && completedPreviewGeneration == widgetPreviewGeneration_ && widgetPreviewStatus_)
+                widgetPreviewStatus_.Text(L"The widget preview is temporarily unavailable.");
+
+            if (previewPending_) SendWidgetPreviewIfIdle();
+            else if (flushRequested_) SendNextMutation();
+            else ContinueDeferredWork();
+            RefreshSettingsControlsIfSafe();
+            return;
+        }
         const auto responseRevision = static_cast<uint64_t>(message.GetNamedNumber(L"revision", 0));
         if (message.HasKey(L"state") && message.GetNamedValue(L"state").ValueType() == JsonValueType::Object && responseRevision >= revision_)
-        { state_ = message.GetNamedObject(L"state"); revision_ = responseRevision; }
+        { state_ = message.GetNamedObject(L"state"); revision_ = responseRevision; UpdateWidgetPreview(state_); }
         if (isInitialGet)
         {
             SyncPaneState();
         }
         UpdateClaudeAvailability();
         UpdateAboutControls();
-        const bool ok = message.GetNamedBoolean(L"ok", false);
         const bool wasPersist = persistInFlight_;
         persistInFlight_ = false;
         if (mutationInFlight_)
@@ -893,13 +961,14 @@ namespace winrt::SettingsUI::implementation
                 persistNeeded_ = true;
                 if (flightClaudeColorApplyText_) persistClaudeColorApplyText_ = flightClaudeColorApplyText_;
                 if (flightCodexColorApplyText_) persistCodexColorApplyText_ = flightCodexColorApplyText_;
+                if (flightUsageTextColorApplyText_) persistUsageTextColorApplyText_ = flightUsageTextColorApplyText_;
                 ShowMessage(std::wstring(message.GetNamedString(L"error", L"Changes are active, but could not be saved.").c_str()), true);
             }
             else if (!ok)
             {
                 // A rejected batch was not applied. Do not retry it automatically;
                 // only edits made after it was sent remain eligible for a new batch.
-                flushRequested_ = false; debounceElapsed_ = false;
+                flushRequested_ = false;
                 const bool keepCloseForSettingsAction = closeRequested_ && IsSettingsChangingAction(deferredAction_);
                 if (!keepCloseForSettingsAction) deferredAction_.reset();
                 closeRequested_ = keepCloseForSettingsAction;
@@ -907,8 +976,8 @@ namespace winrt::SettingsUI::implementation
                 closeWithoutSavingApproved_ = false;
                 flightClaudeColorApplyText_.reset();
                 flightCodexColorApplyText_.reset();
+                flightUsageTextColorApplyText_.reset();
                 ShowMessage(std::wstring(message.GetNamedString(L"error", L"The setting could not be applied.").c_str()), true);
-                if (HasPendingChanges() && debounceTimer_) { debounceTimer_.Stop(); debounceTimer_.Start(); }
             }
             else
             {
@@ -916,12 +985,16 @@ namespace winrt::SettingsUI::implementation
                 closeSaveDecisionPending_ = false;
                 CompleteColorApply(L"claude_accent", flightClaudeColorApplyText_);
                 CompleteColorApply(L"codex_accent", flightCodexColorApplyText_);
+                CompleteColorApply(L"usage_text_color", flightUsageTextColorApplyText_);
                 CompleteColorApply(L"claude_accent", persistClaudeColorApplyText_);
                 CompleteColorApply(L"codex_accent", persistCodexColorApplyText_);
+                CompleteColorApply(L"usage_text_color", persistUsageTextColorApplyText_);
                 flightClaudeColorApplyText_.reset();
                 flightCodexColorApplyText_.reset();
+                flightUsageTextColorApplyText_.reset();
                 persistClaudeColorApplyText_.reset();
                 persistCodexColorApplyText_.reset();
+                persistUsageTextColorApplyText_.reset();
                 if (!isInitialGet) ShowMessage(L"Saved. Changes are now in effect.");
             }
             flightChanges_ = nullptr;
@@ -934,8 +1007,10 @@ namespace winrt::SettingsUI::implementation
                 closeSaveDecisionPending_ = false;
                 CompleteColorApply(L"claude_accent", persistClaudeColorApplyText_);
                 CompleteColorApply(L"codex_accent", persistCodexColorApplyText_);
+                CompleteColorApply(L"usage_text_color", persistUsageTextColorApplyText_);
                 persistClaudeColorApplyText_.reset();
                 persistCodexColorApplyText_.reset();
+                persistUsageTextColorApplyText_.reset();
                 ShowMessage(L"Changes saved.");
             }
             else
@@ -957,7 +1032,7 @@ namespace winrt::SettingsUI::implementation
             persistNeeded_ = true;
             settingsRefreshPending_ = true;
             if (completedSettingsAction == L"reset_colors")
-                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_);
+                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_, resetColorsUsageTextDraftRevision_);
             if (closeRequested_) flushRequested_ = true;
             ShowMessage(std::wstring(message.GetNamedString(L"error", L"The action took effect, but its changes could not be saved.").c_str()), true);
         }
@@ -982,12 +1057,14 @@ namespace winrt::SettingsUI::implementation
         {
             settingsRefreshPending_ = true;
             if (completedSettingsAction == L"reset_colors")
-                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_);
+                ClearResetColorDraftsIfUnchanged(resetColorsClaudeDraftRevision_, resetColorsCodexDraftRevision_, resetColorsUsageTextDraftRevision_);
         }
-        if (HasPendingChanges() && !flushRequested_ && debounceElapsed_) SendNextMutation();
+        if (HasPendingChanges() && flushRequested_) SendNextMutation();
         else if (flushRequested_) SendNextMutation();
         else ContinueDeferredWork();
+        if (previewPending_) SendWidgetPreviewIfIdle();
         RefreshSettingsControlsIfSafe();
+        UpdateSaveBar();
     }
 
     JsonObject MainWindow::State() const
@@ -1011,13 +1088,18 @@ namespace winrt::SettingsUI::implementation
         if (hydrating_) return;
         if (!pendingChanges_) pendingChanges_ = JsonObject();
         pendingChanges_.Insert(key, value);
-        debounceElapsed_ = false;
         flushRequested_ = false;
-        if (debounceTimer_) { debounceTimer_.Stop(); debounceTimer_.Start(); }
-        ShowMessage(L"Changes will be applied shortly.");
+        UpdateSaveBar();
+        if (key == L"palette" || key == L"bar_style" || key == L"bar_thickness" || key == L"font_size" ||
+            key == L"window_label_font_size" || key == L"claude_accent" || key == L"codex_accent" ||
+            key == L"usage_text_color" || key == L"show_provider_icon" || key == L"show_provider_icons" ||
+            key == L"show_percentage" || key == L"show_bar" || key == L"show_reset_time")
+            ScheduleWidgetPreview();
     }
     void MainWindow::Action(std::wstring const& action)
     {
+        if (previewTimer_) previewTimer_.Stop();
+        previewPending_ = false;
         deferredAction_ = action;
         FlushPending();
     }
@@ -1027,6 +1109,125 @@ namespace winrt::SettingsUI::implementation
         MessageBar().Severity(error ? InfoBarSeverity::Error : InfoBarSeverity::Informational);
         MessageBar().IsOpen(true);
         if (messageTimer_) { messageTimer_.Stop(); messageTimer_.Start(); }
+    }
+    void MainWindow::ScheduleWidgetPreview()
+    {
+        if (closed_ || page_ != L"Appearance") return;
+        ++widgetPreviewGeneration_;
+        ++widgetPreviewImageGeneration_;
+        previewPending_ = true;
+        if (widgetPreviewStatus_) widgetPreviewStatus_.Text(L"Updating the sample from the widget…");
+        if (widgetPreviewImage_)
+        {
+            widgetPreviewImage_.Visibility(Visibility::Collapsed);
+            displayedWidgetPreviewBase64_.clear();
+        }
+        if (previewTimer_) { previewTimer_.Stop(); previewTimer_.Start(); }
+    }
+    void MainWindow::SendWidgetPreviewIfIdle()
+    {
+        if (closed_ || stopping_ || page_ != L"Appearance" || !previewPending_ || inFlight_ != 0) return;
+        if (previewTimer_) previewTimer_.Stop();
+        auto settings = State();
+        auto changes = JsonObject();
+        static const std::array<std::wstring, 12> previewKeys{
+            L"palette", L"bar_style", L"bar_thickness", L"font_size", L"window_label_font_size",
+            L"claude_accent", L"codex_accent", L"usage_text_color", L"show_provider_icon",
+            L"show_percentage", L"show_bar", L"show_reset_time" };
+        for (auto const& key : previewKeys)
+            if (settings.HasKey(key)) changes.Insert(key, settings.GetNamedValue(key));
+        auto addColorDraft = [&changes](std::wstring const& key, std::optional<std::wstring> const& draft)
+        {
+            if (!draft) return;
+            const auto rgb = ParseHexColor(*draft);
+            if (!rgb) return;
+            auto array = JsonArray();
+            for (const auto component : *rgb) array.Append(JsonValue::CreateNumberValue(component));
+            changes.Insert(key, array);
+        };
+        addColorDraft(L"claude_accent", claudeColorDraft_);
+        addColorDraft(L"codex_accent", codexColorDraft_);
+        addColorDraft(L"usage_text_color", usageTextColorDraft_);
+
+        auto request = Request(L"preview");
+        request.Insert(L"changes", changes);
+        widgetPreviewFlightGeneration_ = widgetPreviewGeneration_;
+        previewInFlight_ = true;
+        previewPending_ = false;
+        Send(request);
+        if (inFlight_ == 0) previewInFlight_ = false;
+    }
+    void MainWindow::UpdateWidgetPreview(JsonObject const& snapshot)
+    {
+        if (snapshot)
+        {
+            const auto width = snapshot.HasKey(L"widget_preview_width") &&
+                snapshot.GetNamedValue(L"widget_preview_width").ValueType() == JsonValueType::Number
+                ? snapshot.GetNamedNumber(L"widget_preview_width", 0) : 0;
+            const auto height = snapshot.HasKey(L"widget_preview_height") &&
+                snapshot.GetNamedValue(L"widget_preview_height").ValueType() == JsonValueType::Number
+                ? snapshot.GetNamedNumber(L"widget_preview_height", 0) : 0;
+            widgetPreviewWidthPx_ = width > 0 && width <= 8192 ? static_cast<uint32_t>(width) : 0;
+            widgetPreviewHeightPx_ = height > 0 && height <= 8192 ? static_cast<uint32_t>(height) : 0;
+            const auto dpi = snapshot.GetNamedNumber(L"widget_preview_dpi", 96);
+            widgetPreviewDpi_ = dpi >= 48 && dpi <= 768 ? static_cast<uint32_t>(dpi) : 96u;
+        }
+        if (snapshot && snapshot.HasKey(L"widget_preview_image"))
+        {
+            const auto image = snapshot.GetNamedValue(L"widget_preview_image").ValueType() == JsonValueType::String
+                ? std::wstring(snapshot.GetNamedString(L"widget_preview_image").c_str()) : std::wstring();
+            if (image != latestWidgetPreviewBase64_)
+            {
+                latestWidgetPreviewBase64_ = image;
+                ++widgetPreviewImageGeneration_;
+                displayedWidgetPreviewBase64_.clear();
+            }
+        }
+
+        if (!widgetPreviewStatus_) return;
+        if (latestWidgetPreviewBase64_.empty())
+        {
+            if (widgetPreviewImage_) widgetPreviewImage_.Visibility(Visibility::Collapsed);
+            widgetPreviewStatus_.Text(L"Waiting for the widget’s sample preview…");
+            return;
+        }
+        if (widgetPreviewImage_ && displayedWidgetPreviewBase64_ != latestWidgetPreviewBase64_)
+            LoadWidgetPreview(latestWidgetPreviewBase64_, widgetPreviewImageGeneration_);
+    }
+    winrt::fire_and_forget MainWindow::LoadWidgetPreview(std::wstring imageBase64, uint64_t generation)
+    {
+        auto weak = get_weak();
+        const auto displayKey = imageBase64;
+        try
+        {
+            constexpr wchar_t dataPrefix[] = L"data:image/bmp;base64,";
+            if (imageBase64.rfind(dataPrefix, 0) == 0) imageBase64.erase(0, (sizeof(dataPrefix) / sizeof(dataPrefix[0])) - 1);
+            auto buffer = Windows::Security::Cryptography::CryptographicBuffer::DecodeFromBase64String(imageBase64);
+            Windows::Storage::Streams::InMemoryRandomAccessStream stream;
+            Windows::Storage::Streams::DataWriter writer(stream);
+            writer.WriteBuffer(buffer);
+            co_await writer.StoreAsync();
+            writer.DetachStream();
+            stream.Seek(0);
+            Media::Imaging::BitmapImage bitmap;
+            co_await bitmap.SetSourceAsync(stream);
+            if (auto self = weak.get(); self && generation == self->widgetPreviewImageGeneration_ && self->widgetPreviewImage_)
+            {
+                const auto dpi = self->widgetPreviewDpi_;
+                const double scale = dpi ? static_cast<double>(dpi) / 96.0 : 1.0;
+                self->widgetPreviewImage_.Source(bitmap);
+                self->widgetPreviewImage_.Width((self->widgetPreviewWidthPx_ ? self->widgetPreviewWidthPx_ : bitmap.PixelWidth()) / scale);
+                self->widgetPreviewImage_.Height((self->widgetPreviewHeightPx_ ? self->widgetPreviewHeightPx_ : bitmap.PixelHeight()) / scale);
+                self->widgetPreviewImage_.Visibility(Visibility::Visible);
+                self->displayedWidgetPreviewBase64_ = displayKey;
+                self->widgetPreviewStatus_.Text(L"Sample values rendered by the widget.");
+            }
+        }
+        catch (...)
+        {
+            if (auto self = weak.get(); self && generation == self->widgetPreviewImageGeneration_ && self->widgetPreviewStatus_)
+                self->widgetPreviewStatus_.Text(L"The widget preview is temporarily unavailable.");
+        }
     }
     void MainWindow::UpdateClaudeAvailability()
     {
@@ -1168,6 +1369,7 @@ namespace winrt::SettingsUI::implementation
     {
         SyncPaneState();
         RenderPage(page_);
+        UpdateSaveBar();
     }
 
     void MainWindow::SyncPaneState()
@@ -1185,7 +1387,9 @@ namespace winrt::SettingsUI::implementation
     {
         if (key == L"claude_accent") claudeColorDraft_ = std::move(draft);
         else if (key == L"codex_accent") codexColorDraft_ = std::move(draft);
-        appearanceColorDraft_ = claudeColorDraft_.has_value() || codexColorDraft_.has_value();
+        else if (key == L"usage_text_color") usageTextColorDraft_ = std::move(draft);
+        appearanceColorDraft_ = claudeColorDraft_.has_value() || codexColorDraft_.has_value() || usageTextColorDraft_.has_value();
+        UpdateSaveBar();
     }
 
     void MainWindow::CompleteColorApply(std::wstring const& key, std::optional<std::wstring> const& appliedDraft)
@@ -1195,6 +1399,8 @@ namespace winrt::SettingsUI::implementation
             SetColorDraft(key, std::nullopt);
         else if (key == L"codex_accent" && codexColorDraft_ == appliedDraft)
             SetColorDraft(key, std::nullopt);
+        else if (key == L"usage_text_color" && usageTextColorDraft_ == appliedDraft)
+            SetColorDraft(key, std::nullopt);
     }
 
     bool MainWindow::HasUnappliedColorDraft() const
@@ -1202,10 +1408,12 @@ namespace winrt::SettingsUI::implementation
         return (claudeColorDraft_ && claudeColorApplyText_ != claudeColorDraft_ &&
                 flightClaudeColorApplyText_ != claudeColorDraft_ && persistClaudeColorApplyText_ != claudeColorDraft_) ||
             (codexColorDraft_ && codexColorApplyText_ != codexColorDraft_ &&
-                flightCodexColorApplyText_ != codexColorDraft_ && persistCodexColorApplyText_ != codexColorDraft_);
+                flightCodexColorApplyText_ != codexColorDraft_ && persistCodexColorApplyText_ != codexColorDraft_) ||
+            (usageTextColorDraft_ && usageTextColorApplyText_ != usageTextColorDraft_ &&
+                flightUsageTextColorApplyText_ != usageTextColorDraft_ && persistUsageTextColorApplyText_ != usageTextColorDraft_);
     }
 
-    void MainWindow::ClearResetColorDraftsIfUnchanged(uint64_t claudeRevision, uint64_t codexRevision)
+    void MainWindow::ClearResetColorDraftsIfUnchanged(uint64_t claudeRevision, uint64_t codexRevision, uint64_t usageTextRevision)
     {
         if (claudeColorDraftRevision_ == claudeRevision)
         {
@@ -1216,6 +1424,11 @@ namespace winrt::SettingsUI::implementation
         {
             SetColorDraft(L"codex_accent", std::nullopt);
             codexColorApplyText_.reset();
+        }
+        if (usageTextColorDraftRevision_ == usageTextRevision)
+        {
+            SetColorDraft(L"usage_text_color", std::nullopt);
+            usageTextColorApplyText_.reset();
         }
     }
 
@@ -1236,7 +1449,17 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::RenderPage(std::wstring const& page)
     {
         page_ = page; PageHost().Children().Clear();
+        ++widgetPreviewGeneration_;
+        ++widgetPreviewImageGeneration_;
+        displayedWidgetPreviewBase64_.clear();
+        if (page != L"Appearance")
+        {
+            if (previewTimer_) previewTimer_.Stop();
+            previewPending_ = false;
+        }
         claudeToggle_ = nullptr;
+        widgetPreviewImage_ = nullptr;
+        widgetPreviewStatus_ = nullptr;
         versionText_ = nullptr;
         updateStatusText_ = nullptr;
         uninstallDescription_ = nullptr;
@@ -1263,13 +1486,19 @@ namespace winrt::SettingsUI::implementation
         {
             auto copy = StackPanel(); copy.Spacing(3); copy.Children().Append(Label(title, 14));
             auto sub = Label(detail, 12); sub.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>()); copy.Children().Append(sub);
-            auto sw = ToggleSwitch(); Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(sw, title); Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(sw, std::wstring(L"Setting_") + key); SetSwitchContent(sw); sw.IsOn(Bool(key)); sw.Toggled([this, key](auto const& sender, auto const&) { SetValue(key, JsonValue::CreateBooleanValue(sender.as<ToggleSwitch>().IsOn())); });
+            auto sw = ToggleSwitch();
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(sw, title);
+            const auto automationId = key == L"show_provider_icon" ? std::wstring(L"Setting_show_provider_icons") : std::wstring(L"Setting_") + key;
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(sw, automationId);
+            SetSwitchContent(sw);
+            sw.IsOn(key == L"show_provider_icon" ? State().GetNamedBoolean(key, true) : Bool(key));
+            sw.Toggled([this, key](auto const& sender, auto const&) { SetValue(key, JsonValue::CreateBooleanValue(sender.as<ToggleSwitch>().IsOn())); });
             stack.Children().Append(ToggleRow(copy, sw));
         };
         toggle(L"startup", L"Start with Windows", L"Open the widget when you sign in.");
         toggle(L"widget_visible", L"Show the taskbar widget", L"Keep the live usage view visible in your taskbar.");
         toggle(L"show_tray_icon", L"Show the Windows notification-area icon", L"Show or hide Codex Usage’s separate icon beside the Windows clock.");
-        toggle(L"show_provider_icons", L"Show provider marks inside the widget", L"Show or hide the small provider icons in the usage widget; this does not affect the Windows notification-area icon.");
+        toggle(L"show_provider_icon", L"Show provider marks inside the widget", L"Show or hide the small provider icons in the usage widget; this does not affect the Windows notification-area icon.");
         auto languageRow = StackPanel(); languageRow.Spacing(8); languageRow.Children().Append(Label(L"Language"));
         auto languages = ComboBox(); Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(languages, L"Language"); Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(languages, L"LanguageSelector"); languages.MinWidth(230); languages.HorizontalAlignment(HorizontalAlignment::Left);
         if (state_ && state_.HasKey(L"languages")) for (auto const& value : state_.GetNamedArray(L"languages"))
@@ -1302,6 +1531,45 @@ namespace winrt::SettingsUI::implementation
         add(L"show_codex",L"Codex",L"Monitor your Codex account.",Bool(L"show_codex"),false);
         add(L"show_antigravity",L"Antigravity",L"Monitor your Antigravity account.",Bool(L"show_antigravity"),false);
         auto note=Label(L"At least one provider must stay enabled.",12);note.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());p.Children().Append(note);providers.Child(p);PageHost().Children().Append(providers);
+        auto widgetCard = Card(); auto widgetSettings = StackPanel(); widgetSettings.Spacing(14);
+        widgetSettings.Children().Append(Label(L"Widget contents", 19));
+        widgetSettings.Children().Append(Label(L"Choose what appears in the taskbar widget. Keep at least one usage value visible; provider marks alone do not count.", 12));
+        auto addWidgetToggle = [this, &widgetSettings](std::wstring const& key, std::wstring const& title, std::wstring const& detail)
+        {
+            auto copy = StackPanel(); copy.Spacing(3); copy.Children().Append(Label(title));
+            auto description = Label(detail, 12);
+            description.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+            copy.Children().Append(description);
+            auto toggle = ToggleSwitch(); SetSwitchContent(toggle);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle, title);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(toggle, std::wstring(L"Setting_") + key);
+            toggle.IsOn(State().GetNamedBoolean(key, true));
+            toggle.Toggled([this, key](auto const& sender, auto const&)
+            {
+                auto control = sender.as<ToggleSwitch>();
+                if (hydrating_) return;
+                if (!control.IsOn() && key != L"show_provider_icon")
+                {
+                    auto settings = State();
+                    const bool hasOtherValue = (key != L"show_percentage" && settings.GetNamedBoolean(L"show_percentage", true)) ||
+                        (key != L"show_bar" && settings.GetNamedBoolean(L"show_bar", true)) ||
+                        (key != L"show_reset_time" && settings.GetNamedBoolean(L"show_reset_time", true));
+                    if (!hasOtherValue)
+                    {
+                        const bool wasHydrating = hydrating_.load(); hydrating_ = true;
+                        control.IsOn(true); hydrating_ = wasHydrating;
+                        ShowMessage(L"Keep at least one of percentage, progress bar, or reset time visible.", true);
+                        return;
+                    }
+                }
+                SetValue(key, JsonValue::CreateBooleanValue(control.IsOn()));
+            });
+            widgetSettings.Children().Append(ToggleRow(copy, toggle));
+        };
+        addWidgetToggle(L"show_percentage", L"Show usage percentages", L"Show current usage percentages for enabled providers.");
+        addWidgetToggle(L"show_bar", L"Show progress bars", L"Show the remaining-usage bars for each provider.");
+        addWidgetToggle(L"show_reset_time", L"Show reset times", L"Show when each usage window resets.");
+        widgetCard.Child(widgetSettings); PageHost().Children().Append(widgetCard);
         auto options=Card();auto o=StackPanel();o.Spacing(16);o.Children().Append(Label(L"Refresh and alerts",19));
         auto interval=ComboBox();Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(interval,L"Polling interval");Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(interval,L"PollingInterval");interval.MinWidth(220);interval.HorizontalAlignment(HorizontalAlignment::Left);
         for(auto [ms,label]:std::array<std::pair<uint32_t,std::wstring>,4>{{{60000,L"Every minute"},{300000,L"Every 5 minutes"},{900000,L"Every 15 minutes"},{3600000,L"Every hour"}}}){auto it=ComboBoxItem();it.Content(box_value(label));it.Tag(box_value(ms));interval.Items().Append(it);}
@@ -1319,85 +1587,212 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::BuildAppearance()
     {
-        auto card=Card();auto stack=StackPanel();stack.Spacing(16);stack.Children().Append(Label(L"Widget style",19));
-         auto addCombo=[this,&stack](std::wstring title,std::wstring key,std::vector<std::pair<std::wstring,std::wstring>> values){auto group=StackPanel();group.Spacing(6);group.Children().Append(Label(title));auto combo=ComboBox();Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(combo,title);Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(combo,std::wstring(L"Appearance_")+key);combo.MinWidth(250);combo.MaxWidth(520);combo.HorizontalAlignment(HorizontalAlignment::Stretch);for(auto const& [value,label]:values){auto item=ComboBoxItem();item.Content(box_value(label));item.Tag(box_value(value));combo.Items().Append(item);}auto current=Text(key);for(uint32_t i=0;i<combo.Items().Size();++i)if(unbox_value<hstring>(combo.Items().GetAt(i).as<ComboBoxItem>().Tag())==current)combo.SelectedIndex(i);combo.SelectionChanged([this,key](auto const&sender,auto const&){auto control=sender.as<ComboBox>();if(!hydrating_&&control.SelectedItem())SetValue(key,JsonValue::CreateStringValue(unbox_value<hstring>(control.SelectedItem().as<ComboBoxItem>().Tag())));});group.Children().Append(combo);stack.Children().Append(group);};
-        addCombo(L"Theme",L"palette",{{L"system",L"Follow Windows"},{L"high_contrast_dark",L"Dark"},{L"high_contrast_light",L"Light"}});addCombo(L"Progress bars",L"bar_style",{{L"continuous",L"Continuous"},{L"segmented",L"Segmented"}});addCombo(L"Bar thickness",L"bar_thickness",{{L"standard",L"Standard"},{L"slim",L"Slim"}});addCombo(L"Text size",L"font_size",{{L"standard",L"Standard"},{L"large",L"Large"}});
-        auto buttons=StackPanel();buttons.Spacing(8);for(auto [label,action]:std::array<std::pair<std::wstring,std::wstring>,3>{{{L"Recommended",L"recommended"},{L"Reset appearance",L"reset_appearance"},{L"Reset colors",L"reset_colors"}}}){auto b=Button();b.Content(box_value(label));Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(b,std::wstring(L"AppearanceAction_")+action);b.HorizontalAlignment(HorizontalAlignment::Left);b.Click([this,action](auto const&,auto const&){Action(action);});buttons.Children().Append(b);}stack.Children().Append(buttons);
-        card.Child(stack);PageHost().Children().Append(card);
-        auto colors=Card();auto c=StackPanel();c.Spacing(12);c.Children().Append(Label(L"Provider colors",19));c.Children().Append(Label(L"Use the widget’s recommended colors, or set a custom RGB accent from hex." ,12));
-         for (auto const& [key, title] : std::array<std::pair<std::wstring, std::wstring>, 2>{ {
-             { L"claude_accent", L"Claude Code accent" }, { L"codex_accent", L"Codex accent" } } })
-         {
-             auto group = StackPanel(); group.Spacing(6); group.Children().Append(Label(title));
-             auto row = StackPanel(); row.Orientation(Orientation::Horizontal); row.Spacing(8);
-             auto input = TextBox();
-             Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(input, title);
-             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(input, std::wstring(L"Color_") + key);
-             input.PlaceholderText(L"Default color"); input.Width(145);
-             const auto savedText = StoredColorText(State(), key);
-             const auto& draft = key == L"claude_accent" ? claudeColorDraft_ : codexColorDraft_;
-             input.Text(draft ? hstring(*draft) : hstring(savedText));
-             input.TextChanging([this, key](auto const& sender, auto const&)
-             {
-                 if (hydrating_) return;
-                 const auto text = std::wstring(sender.as<TextBox>().Text().c_str());
-                 if (key == L"claude_accent") ++claudeColorDraftRevision_;
-                 else ++codexColorDraftRevision_;
-                 if (key == L"claude_accent" && claudeColorApplyText_ && *claudeColorApplyText_ != text)
-                     claudeColorApplyText_.reset();
-                 if (key == L"codex_accent" && codexColorApplyText_ && *codexColorApplyText_ != text)
-                     codexColorApplyText_.reset();
-                 SetColorDraft(key, text);
-             });
-             auto apply = Button(); apply.Content(box_value(L"Apply color"));
-             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(apply, std::wstring(L"ApplyColor_") + key);
-             apply.Click([this, input, key](auto const&, auto const&)
-             {
-                 const std::wstring raw(input.Text().c_str());
-                 const auto color = ParseHexColor(raw);
-                 if (!color)
-                 {
-                     SetColorDraft(key, raw);
-                     ShowMessage(L"Enter exactly # followed by six ASCII hexadecimal digits, for example #D97757.", true);
-                     return;
-                 }
-                 const auto normalized = FormatHexColor(*color);
-                 input.Text(normalized);
-                 SetColorDraft(key, normalized);
-                 if (key == L"claude_accent") claudeColorApplyText_ = normalized;
-                 else codexColorApplyText_ = normalized;
-                 auto value = JsonArray();
-                 for (const auto component : *color) value.Append(JsonValue::CreateNumberValue(component));
-                 SetValue(key, value);
-             });
-             auto discard = Button(); discard.Content(box_value(L"Discard"));
-             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(discard, std::wstring(L"DiscardColor_") + key);
-             discard.Click([this, input, key](auto const&, auto const&)
-             {
-                 SetColorDraft(key, std::nullopt);
-                 if (pendingChanges_ && pendingChanges_.HasKey(key))
-                 {
-                     pendingChanges_.Remove(key);
-                     if (pendingChanges_.Size() == 0) pendingChanges_ = nullptr;
-                 }
-                 if (key == L"claude_accent") claudeColorApplyText_.reset();
-                 else codexColorApplyText_.reset();
-                 const bool wasHydrating = hydrating_.load();
-                 hydrating_ = true;
-                 input.Text(StoredColorText(State(), key));
-                 hydrating_ = wasHydrating;
-                 ShowMessage(L"Color draft discarded.");
-                 RefreshSettingsControlsIfSafe();
-             });
-             row.Children().Append(input); row.Children().Append(apply); row.Children().Append(discard);
-             group.Children().Append(row); c.Children().Append(group);
-         }
-        colors.Child(c);PageHost().Children().Append(colors);
+        auto styleCard = Card();
+        auto style = StackPanel(); style.Spacing(16);
+        style.Children().Append(Label(L"Widget style", 19));
+
+        auto theme = ComboBox();
+        auto bars = ComboBox();
+        auto thickness = ComboBox();
+        auto fontSize = ComboBox();
+        auto addCombo = [this](StackPanel const& parent, ComboBox const& combo, std::wstring const& title,
+            std::wstring const& key, std::vector<std::pair<std::wstring, std::wstring>> const& values)
+        {
+            auto group = StackPanel(); group.Spacing(6); group.Children().Append(Label(title));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(combo, title);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(combo, std::wstring(L"Appearance_") + key);
+            combo.MinWidth(250); combo.MaxWidth(360); combo.HorizontalAlignment(HorizontalAlignment::Left);
+            for (auto const& [value, label] : values)
+            {
+                auto item = ComboBoxItem(); item.Content(box_value(label)); item.Tag(box_value(value)); combo.Items().Append(item);
+            }
+            const auto current = Text(key);
+            for (uint32_t i = 0; i < combo.Items().Size(); ++i)
+                if (unbox_value<hstring>(combo.Items().GetAt(i).as<ComboBoxItem>().Tag()) == current) combo.SelectedIndex(i);
+            combo.SelectionChanged([this, key](auto const& sender, auto const&)
+            {
+                auto control = sender.as<ComboBox>();
+                if (!hydrating_ && control.SelectedItem()) SetValue(key, JsonValue::CreateStringValue(unbox_value<hstring>(control.SelectedItem().as<ComboBoxItem>().Tag())));
+            });
+            group.Children().Append(combo); parent.Children().Append(group);
+        };
+        addCombo(style, theme, L"Theme", L"palette", {{L"system",L"Follow Windows"},{L"high_contrast_dark",L"Dark"},{L"high_contrast_light",L"Light"}});
+        addCombo(style, bars, L"Progress bars", L"bar_style", {{L"continuous",L"Continuous"},{L"segmented",L"Segmented"}});
+        addCombo(style, thickness, L"Bar thickness", L"bar_thickness", {{L"standard",L"Standard"},{L"slim",L"Slim"}});
+        addCombo(style, fontSize, L"Text size", L"font_size", {{L"standard",L"Standard"},{L"large",L"Large"}});
+        auto labelSizeGroup = StackPanel(); labelSizeGroup.Spacing(6);
+        labelSizeGroup.Children().Append(Label(L"Usage window label size"));
+        auto labelSizeNote = Label(L"Sets the 5-hour and 7-day labels in the widget using normal weight.", 12);
+        labelSizeNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        labelSizeGroup.Children().Append(labelSizeNote);
+        auto labelSize = ComboBox();
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(labelSize, L"Usage window label size");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(labelSize, L"Appearance_window_label_font_size");
+        labelSize.MinWidth(250); labelSize.MaxWidth(360); labelSize.HorizontalAlignment(HorizontalAlignment::Left);
+        for (int32_t size = 8; size <= 14; ++size)
+        {
+            auto item = ComboBoxItem(); item.Content(box_value(std::to_wstring(size) + L" pt")); item.Tag(box_value(size)); labelSize.Items().Append(item);
+        }
+        const auto currentLabelSize = static_cast<int32_t>(State().GetNamedNumber(L"window_label_font_size", 9));
+        labelSize.SelectedIndex(std::clamp(currentLabelSize, 8, 14) - 8);
+        labelSize.SelectionChanged([this](auto const& sender, auto const&)
+        {
+            auto control = sender.as<ComboBox>();
+            if (!hydrating_ && control.SelectedItem())
+                SetValue(L"window_label_font_size", JsonValue::CreateNumberValue(unbox_value<int32_t>(control.SelectedItem().as<ComboBoxItem>().Tag())));
+        });
+        labelSizeGroup.Children().Append(labelSize); style.Children().Append(labelSizeGroup);
+
+        auto previewCard = Card();
+        auto previewStack = StackPanel(); previewStack.Spacing(10);
+        auto previewHeading = Label(L"Live widget preview · sample values", 17);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(previewHeading, L"AppearancePreview");
+        previewStack.Children().Append(previewHeading);
+        auto previewNote = Label(L"This image is rendered by the widget using sample usage data.", 12);
+        previewNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(previewNote, L"AppearancePreviewSummary");
+        previewStack.Children().Append(previewNote);
+        widgetPreviewImage_ = Image();
+        widgetPreviewImage_.Stretch(Media::Stretch::None);
+        widgetPreviewImage_.HorizontalAlignment(HorizontalAlignment::Left);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(widgetPreviewImage_, L"Widget appearance preview with sample usage values");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(widgetPreviewImage_, L"WidgetPreviewImage");
+        widgetPreviewImage_.Visibility(Visibility::Collapsed);
+        previewStack.Children().Append(widgetPreviewImage_);
+        widgetPreviewStatus_ = Label(L"Waiting for the widget’s sample preview…", 12);
+        widgetPreviewStatus_.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(widgetPreviewStatus_, L"WidgetPreviewStatus");
+        previewStack.Children().Append(widgetPreviewStatus_);
+        previewCard.Child(previewStack); style.Children().Append(previewCard);
+        ScheduleWidgetPreview();
+        UpdateWidgetPreview(state_);
+
+        auto refreshPreview = [this]() { ScheduleWidgetPreview(); };
+        auto buttons = StackPanel(); buttons.Orientation(Orientation::Horizontal); buttons.Spacing(8);
+        buttons.SizeChanged([](auto const& sender, auto const&)
+        {
+            auto panel = sender.as<StackPanel>();
+            panel.Orientation(panel.ActualWidth() < 480 ? Orientation::Vertical : Orientation::Horizontal);
+        });
+        for (auto [label, action] : std::array<std::pair<std::wstring, std::wstring>, 3>{{
+            {L"Recommended",L"recommended"},{L"Reset appearance",L"reset_appearance"},{L"Reset colors",L"reset_colors"}}})
+        {
+            auto button = Button(); button.Content(box_value(label));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(button, std::wstring(L"AppearanceAction_") + action);
+            button.Click([this, action](auto const&, auto const&) { Action(action); }); buttons.Children().Append(button);
+        }
+        style.Children().Append(buttons); styleCard.Child(style); PageHost().Children().Append(styleCard);
+
+        auto colorsCard = Card(); auto colors = StackPanel(); colors.Spacing(12);
+        colors.Children().Append(Label(L"Widget colors", 19));
+        colors.Children().Append(Label(L"Progress-bar accents stay provider-specific. The shared text color applies to provider marks and usage percentages.", 12));
+        colors.Children().Append(Label(L"Progress-bar accents", 14));
+        for (auto const& [key, title] : std::array<std::pair<std::wstring, std::wstring>, 3>{{
+            {L"claude_accent",L"Claude Code bar accent"},{L"codex_accent",L"Codex bar accent"},
+            {L"usage_text_color",L"Provider mark and percentage color"}}})
+        {
+            auto group = StackPanel(); group.Spacing(6); group.Children().Append(Label(title));
+            auto row = StackPanel(); row.Orientation(Orientation::Horizontal); row.Spacing(8);
+            row.SizeChanged([](auto const& sender, auto const&)
+            {
+                auto panel = sender.as<StackPanel>();
+                panel.Orientation(panel.ActualWidth() < 610 ? Orientation::Vertical : Orientation::Horizontal);
+            });
+            auto input = TextBox();
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(input, title);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(input, std::wstring(L"Color_") + key);
+            input.PlaceholderText(L"Default color"); input.Width(145);
+            const auto savedText = StoredColorText(State(), key);
+            const auto& draft = key == L"claude_accent" ? claudeColorDraft_ : key == L"codex_accent" ? codexColorDraft_ : usageTextColorDraft_;
+            input.Text(draft ? hstring(*draft) : hstring(savedText));
+            input.TextChanging([this, key, refreshPreview](auto const& sender, auto const&)
+            {
+                if (hydrating_ || syncingColorText_) return;
+                const auto text = std::wstring(sender.as<TextBox>().Text().c_str());
+                if (key == L"claude_accent") ++claudeColorDraftRevision_;
+                else if (key == L"codex_accent") ++codexColorDraftRevision_;
+                else ++usageTextColorDraftRevision_;
+                if (key == L"claude_accent" && claudeColorApplyText_ && *claudeColorApplyText_ != text) claudeColorApplyText_.reset();
+                if (key == L"codex_accent" && codexColorApplyText_ && *codexColorApplyText_ != text) codexColorApplyText_.reset();
+                if (key == L"usage_text_color" && usageTextColorApplyText_ && *usageTextColorApplyText_ != text) usageTextColorApplyText_.reset();
+                SetColorDraft(key, text); refreshPreview();
+            });
+
+            auto pickerButton = Button(); pickerButton.Content(box_value(L"Choose color…"));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(pickerButton, std::wstring(L"ChooseColor_") + key);
+            auto flyout = Flyout(); auto pickerPanel = StackPanel(); pickerPanel.Spacing(10); pickerPanel.Padding(Thickness{12,12,12,12});
+            auto picker = ColorPicker(); picker.IsAlphaEnabled(false); picker.IsColorChannelTextInputVisible(true);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(picker, title + L" RGB color");
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(picker, std::wstring(L"ColorPicker_") + key);
+            pickerPanel.Children().Append(picker);
+            auto pickerActions = StackPanel(); pickerActions.Orientation(Orientation::Horizontal); pickerActions.Spacing(8);
+            auto useColor = Button(); useColor.Content(box_value(L"Use color"));
+            auto cancelColor = Button(); cancelColor.Content(box_value(L"Cancel"));
+            pickerActions.Children().Append(useColor); pickerActions.Children().Append(cancelColor); pickerPanel.Children().Append(pickerActions);
+            flyout.Content(pickerPanel); pickerButton.Flyout(flyout);
+            flyout.Opened([this, picker, input, key, theme](auto const&, auto const&)
+            {
+                auto color = ParseHexColor(std::wstring(input.Text().c_str()));
+                if (!color) color = ParseHexColor(StoredColorText(State(), key));
+                const auto effective = state_ ? state_.GetNamedObject(L"effective_appearance", JsonObject()) : JsonObject();
+                const bool systemDark = effective.GetNamedBoolean(L"dark", true);
+                const auto palette = theme.SelectedItem() ? std::wstring(unbox_value<hstring>(theme.SelectedItem().as<ComboBoxItem>().Tag()).c_str()) : Text(L"palette");
+                const bool dark = palette == L"high_contrast_dark" || (palette == L"system" && systemDark);
+                if (!color && palette == L"system") color = ParseHexColor(EffectiveColorText(state_, key));
+                if (!color) color = ParseHexColor(key == L"claude_accent" ? L"#D97757" : key == L"codex_accent"
+                    ? (dark ? L"#34D399" : L"#0F8F70")
+                    : palette == L"system" ? (dark ? L"#888888" : L"#404040") : (dark ? L"#FFFFFF" : L"#101820"));
+                const auto rgb = color.value_or(std::array<uint8_t, 3>{217,119,87});
+                picker.Color(Windows::UI::Color{255, rgb[0], rgb[1], rgb[2]});
+            });
+            useColor.Click([this, picker, input, key, flyout, refreshPreview](auto const&, auto const&)
+            {
+                const auto color = picker.Color();
+                const auto value = FormatHexColor({color.R, color.G, color.B});
+                syncingColorText_ = true; input.Text(value); syncingColorText_ = false;
+                if (key == L"claude_accent") ++claudeColorDraftRevision_;
+                else if (key == L"codex_accent") ++codexColorDraftRevision_;
+                else ++usageTextColorDraftRevision_;
+                SetColorDraft(key, value); refreshPreview(); flyout.Hide();
+            });
+            cancelColor.Click([flyout](auto const&, auto const&) { flyout.Hide(); });
+
+            auto apply = Button(); apply.Content(box_value(L"Apply color"));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(apply, std::wstring(L"ApplyColor_") + key);
+            apply.Click([this, input, key](auto const&, auto const&)
+            {
+                const std::wstring raw(input.Text().c_str()); const auto color = ParseHexColor(raw);
+                if (!color) { SetColorDraft(key, raw); ShowMessage(L"Enter exactly # followed by six ASCII hexadecimal digits, for example #D97757.", true); return; }
+                const auto normalized = FormatHexColor(*color);
+                syncingColorText_ = true; input.Text(normalized); syncingColorText_ = false;
+                SetColorDraft(key, normalized);
+                if (key == L"claude_accent") claudeColorApplyText_ = normalized;
+                else if (key == L"codex_accent") codexColorApplyText_ = normalized;
+                else usageTextColorApplyText_ = normalized;
+                auto value = JsonArray(); for (const auto component : *color) value.Append(JsonValue::CreateNumberValue(component)); SetValue(key, value);
+            });
+            auto discard = Button(); discard.Content(box_value(L"Discard"));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(discard, std::wstring(L"DiscardColor_") + key);
+            discard.Click([this, input, key, refreshPreview](auto const&, auto const&)
+            {
+                SetColorDraft(key, std::nullopt);
+                if (pendingChanges_ && pendingChanges_.HasKey(key)) { pendingChanges_.Remove(key); if (pendingChanges_.Size() == 0) pendingChanges_ = nullptr; }
+                if (key == L"claude_accent") claudeColorApplyText_.reset();
+                else if (key == L"codex_accent") codexColorApplyText_.reset();
+                else usageTextColorApplyText_.reset();
+                const bool wasHydrating = hydrating_.load(); hydrating_ = true;
+                syncingColorText_ = true; input.Text(StoredColorText(State(), key)); syncingColorText_ = false;
+                hydrating_ = wasHydrating; refreshPreview(); ShowMessage(L"Color draft discarded."); RefreshSettingsControlsIfSafe();
+            });
+            row.Children().Append(input); row.Children().Append(pickerButton); row.Children().Append(apply); row.Children().Append(discard);
+            group.Children().Append(row); colors.Children().Append(group);
+        }
+        colorsCard.Child(colors); PageHost().Children().Append(colorsCard);
     }
 
     void MainWindow::BuildPlacement()
     {
-        auto card=Card();auto stack=StackPanel();stack.Spacing(16);stack.Children().Append(Label(L"Taskbar placement",19));stack.Children().Append(Label(L"Choose the display where the widget should appear. The widget stays aligned with the taskbar.",13));auto monitors=ComboBox();Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(monitors,L"Monitor device");Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(monitors,L"MonitorSelector");monitors.MaxWidth(520);monitors.HorizontalAlignment(HorizontalAlignment::Stretch);auto automatic=ComboBoxItem();automatic.Content(box_value(L"Automatic (primary display)"));automatic.Tag(box_value(L""));monitors.Items().Append(automatic);if(state_&&state_.HasKey(L"monitors"))for(auto const& v:state_.GetNamedArray(L"monitors")){auto m=v.GetObject();auto device=m.GetNamedString(L"device",L"");auto item=ComboBoxItem();item.Content(box_value(std::wstring(m.GetNamedBoolean(L"primary",false)?L"Primary display · ":L"Display · ")+device));item.Tag(box_value(device));monitors.Items().Append(item);}monitors.SelectedIndex(0);auto current=Text(L"monitor_device");if(state_&&State().HasKey(L"monitor_device")&&State().GetNamedValue(L"monitor_device").ValueType()==JsonValueType::String)current=std::wstring(State().GetNamedString(L"monitor_device").c_str());for(uint32_t i=0;i<monitors.Items().Size();++i)if(std::wstring(unbox_value<hstring>(monitors.Items().GetAt(i).as<ComboBoxItem>().Tag()).c_str())==current)monitors.SelectedIndex(i);monitors.SelectionChanged([this](auto const&sender,auto const&){auto control=sender.as<ComboBox>();if(!hydrating_&&control.SelectedItem()){auto val=unbox_value<hstring>(control.SelectedItem().as<ComboBoxItem>().Tag());SetValue(L"monitor_device",val.empty()?JsonValue::CreateNullValue():JsonValue::CreateStringValue(val));}});stack.Children().Append(monitors);
+        auto card=Card();auto stack=StackPanel();stack.Spacing(16);stack.Children().Append(Label(L"Taskbar placement",19));stack.Children().Append(Label(L"Choose the display where the widget should appear. The widget stays aligned with the taskbar.",13));auto monitors=ComboBox();Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(monitors,L"Monitor device");Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(monitors,L"MonitorSelector");monitors.MinWidth(250);monitors.MaxWidth(520);monitors.HorizontalAlignment(HorizontalAlignment::Left);auto automatic=ComboBoxItem();automatic.Content(box_value(L"Automatic (primary display)"));automatic.Tag(box_value(L""));monitors.Items().Append(automatic);if(state_&&state_.HasKey(L"monitors"))for(auto const& v:state_.GetNamedArray(L"monitors")){auto m=v.GetObject();auto device=m.GetNamedString(L"device",L"");auto item=ComboBoxItem();item.Content(box_value(std::wstring(m.GetNamedBoolean(L"primary",false)?L"Primary display · ":L"Display · ")+device));item.Tag(box_value(device));monitors.Items().Append(item);}monitors.SelectedIndex(0);auto current=Text(L"monitor_device");if(state_&&State().HasKey(L"monitor_device")&&State().GetNamedValue(L"monitor_device").ValueType()==JsonValueType::String)current=std::wstring(State().GetNamedString(L"monitor_device").c_str());for(uint32_t i=0;i<monitors.Items().Size();++i)if(std::wstring(unbox_value<hstring>(monitors.Items().GetAt(i).as<ComboBoxItem>().Tag()).c_str())==current)monitors.SelectedIndex(i);monitors.SelectionChanged([this](auto const&sender,auto const&){auto control=sender.as<ComboBox>();if(!hydrating_&&control.SelectedItem()){auto val=unbox_value<hstring>(control.SelectedItem().as<ComboBoxItem>().Tag());SetValue(L"monitor_device",val.empty()?JsonValue::CreateNullValue():JsonValue::CreateStringValue(val));}});stack.Children().Append(monitors);
          auto sideCopy=StackPanel();sideCopy.Spacing(3);sideCopy.Children().Append(Label(L"Anchor to the left"));auto sideDetail=Label(L"Place the widget at the left edge of the taskbar.",12);sideDetail.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());sideCopy.Children().Append(sideDetail);auto side=ToggleSwitch();Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(side,L"Anchor to the left");Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(side,L"Setting_anchor_left");SetSwitchContent(side);side.IsOn(Bool(L"anchor_left"));side.Toggled([this](auto const&sender,auto const&){auto control=sender.as<ToggleSwitch>();SetValue(L"anchor_left",JsonValue::CreateBooleanValue(control.IsOn()));});stack.Children().Append(ToggleRow(sideCopy,side));auto reset=Button();reset.Content(box_value(L"Reset position"));Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(reset,L"ResetPlacement");reset.HorizontalAlignment(HorizontalAlignment::Left);reset.Click([this](auto const&,auto const&){Action(L"reset_position");});stack.Children().Append(reset);card.Child(stack);PageHost().Children().Append(card);
     }
 

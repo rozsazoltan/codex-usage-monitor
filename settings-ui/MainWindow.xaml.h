@@ -8,6 +8,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <vector>
 #include <winrt/Microsoft.UI.Dispatching.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
 #include <winrt/Windows.Data.Json.h>
@@ -38,6 +39,8 @@ namespace winrt::SettingsUI::implementation
         void OnWindowClosed();
         void RevokeWindowEvents();
         void SyncPaneState();
+        void QueuePaneState(bool open);
+        void SendPendingPaneState();
         void SetColorDraft(std::wstring const& key, std::optional<std::wstring> draft);
         void ClearResetColorDraftsIfUnchanged(uint64_t claudeRevision, uint64_t codexRevision, uint64_t antigravityRevision, uint64_t opencodeRevision, uint64_t cursorRevision, uint64_t grokRevision, uint64_t copilotRevision, uint64_t usageTextRevision);
         void CompleteColorApply(std::wstring const& key, std::optional<std::wstring> const& appliedDraft);
@@ -52,7 +55,7 @@ namespace winrt::SettingsUI::implementation
         void SetValue(std::wstring const& key, winrt::Windows::Data::Json::IJsonValue const& value);
         void Action(std::wstring const& action);
         void ShowMessage(std::wstring const& text, bool error = false);
-        void UpdateClaudeAvailability();
+        void UpdateProviderAvailability();
         void UpdateAboutControls();
         void UpdateUpdateIndicator();
         void UpdateTitleBarLayout();
@@ -85,7 +88,9 @@ namespace winrt::SettingsUI::implementation
         winrt::Windows::Data::Json::JsonObject state_{ nullptr };
         winrt::Windows::Data::Json::JsonObject flightChanges_{ nullptr };
         winrt::Windows::Data::Json::JsonObject pendingChanges_{ nullptr };
-        winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch claudeToggle_{ nullptr };
+        std::vector<winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch> providerToggles_;
+        winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch providerDetailEnableToggle_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::ComboBox providerIconPositionSelector_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Image widgetPreviewImage_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock widgetPreviewStatus_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Border appearancePreviewCard_{ nullptr };
@@ -102,7 +107,7 @@ namespace winrt::SettingsUI::implementation
         winrt::Microsoft::UI::Xaml::Controls::TextBlock updateStatusText_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock uninstallDescription_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Button checkForUpdatesButton_{ nullptr };
-        winrt::Microsoft::UI::Xaml::Controls::Border updateIndicator_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::InfoBadge updateIndicator_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::ContentDialog closeSaveFailureDialog_{ nullptr };
         winrt::Microsoft::UI::Dispatching::DispatcherQueue dispatcher_{ nullptr };
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer previewTimer_{ nullptr };
@@ -130,6 +135,9 @@ namespace winrt::SettingsUI::implementation
         bool settingsActionInFlight_{};
         bool settingsRefreshPending_{};
         bool paneStateKnown_{};
+        bool paneStateRequestInFlight_{};
+        std::optional<bool> pendingPaneState_;
+        std::optional<bool> paneStateRequestValue_;
         bool appearanceColorDraft_{};
         std::optional<std::wstring> claudeColorDraft_;
         std::optional<std::wstring> codexColorDraft_;

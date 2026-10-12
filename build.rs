@@ -8,7 +8,10 @@ fn main() {
     let mut res = WindowsResource::new();
     let numeric_version = pack_version(version);
 
-    res.set_icon("src/icons/icon.ico")
+    res.set_icon("src/icons/redesign/codex-usage-meter.ico")
+        .set("CompanyName", "datarose.net")
+        .set("ProductName", "Codex Usage Monitor")
+        .set("FileDescription", "Codex Usage Monitor")
         .set("FileVersion", version)
         .set("ProductVersion", version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)
@@ -23,7 +26,7 @@ fn embed_settings_payload() {
     println!("cargo:rerun-if-env-changed=CODEX_SETTINGS_MSBUILD");
     println!("cargo:rerun-if-env-changed=CODEX_SETTINGS_SKIP_NATIVE_BUILD");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/icons/icon.ico");
+    println!("cargo:rerun-if-changed=src/icons/redesign/codex-usage-meter.ico");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     if let Some(directory) = env::var_os("CODEX_SETTINGS_PAYLOAD") {
         assert_eq!(

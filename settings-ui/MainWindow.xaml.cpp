@@ -238,24 +238,10 @@ namespace winrt::SettingsUI::implementation
         dispatcher_ = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
         appWindow_ = AppWindow();
         navigationView_ = Navigation();
-        auto updateContent = Grid();
-        auto updateColumns = updateContent.ColumnDefinitions();
-        updateColumns.Append(ColumnDefinition());
-        updateColumns.Append(ColumnDefinition());
-        updateColumns.GetAt(0).Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
-        updateColumns.GetAt(1).Width(GridLengthHelper::Auto());
-        auto updateLabel = TextBlock(); updateLabel.Text(L"Update");
-        updateContent.Children().Append(updateLabel);
-        updateIndicator_ = Border();
-        updateIndicator_.Width(7); updateIndicator_.Height(7);
-        updateIndicator_.CornerRadius(CornerRadiusHelper::FromUniformRadius(4));
+        updateIndicator_ = InfoBadge();
         updateIndicator_.Background(Media::SolidColorBrush(Windows::UI::Color{ 255, 0, 120, 212 }));
-        updateIndicator_.Margin(Thickness{ 10, 0, 12, 0 });
-        updateIndicator_.VerticalAlignment(VerticalAlignment::Center);
-        updateIndicator_.Visibility(Visibility::Collapsed);
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(updateIndicator_, L"Update available");
-        Grid::SetColumn(updateIndicator_, 1); updateContent.Children().Append(updateIndicator_);
-        NavigationUpdate().Content(updateContent);
+        NavigationUpdate().InfoBadge(updateIndicator_);
         NavigationUpdate().Visibility(Visibility::Collapsed);
         auto weak = get_weak();
         previewTimer_ = dispatcher_.CreateTimer();
@@ -278,13 +264,13 @@ namespace winrt::SettingsUI::implementation
         });
         Navigation().PaneOpened([this](auto const&, auto const&)
         {
-            if (paneStateKnown_ && !hydrating_ && !Bool(L"settings_pane_open"))
-                SetValue(L"settings_pane_open", JsonValue::CreateBooleanValue(true));
+            UpdateUpdateIndicator();
+            if (paneStateKnown_ && !hydrating_) QueuePaneState(true);
         });
         Navigation().PaneClosed([this](auto const&, auto const&)
         {
-            if (paneStateKnown_ && !hydrating_ && Bool(L"settings_pane_open"))
-                SetValue(L"settings_pane_open", JsonValue::CreateBooleanValue(false));
+            UpdateUpdateIndicator();
+            if (paneStateKnown_ && !hydrating_) QueuePaneState(false);
         });
         SaveChangesButton().Click([this](auto const&, auto const&) { FlushPending(); });
         DiscardChangesButton().Click([this](auto const&, auto const&) { DiscardPendingChanges(); });
@@ -620,7 +606,9 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::UpdateSaveBar()
     {
-        const bool dirty = !closed_ && (HasPendingChanges() || HasUnappliedColorDraft());
+        const bool saveInProgress = mutationInFlight_ || persistInFlight_;
+        const bool dirty = !closed_ && (HasPendingChanges() || HasUnappliedColorDraft() ||
+            (persistNeeded_ && !saveInProgress));
         SaveBar().Visibility(dirty ? Visibility::Visible : Visibility::Collapsed);
         UpdateToastPosition();
     }
@@ -691,6 +679,7 @@ namespace winrt::SettingsUI::implementation
                 snapshot.Insert(key, pair.Value());
             }
             pendingChanges_ = remainder;
+            UpdateSaveBar();
             if (changes.Size() != 0)
             {
                 auto request = Request(L"set_batch"); request.Insert(L"changes", changes);
@@ -712,6 +701,7 @@ namespace winrt::SettingsUI::implementation
                 if (flightCopilotColorApplyText_) copilotColorApplyText_.reset();
                 if (flightUsageTextColorApplyText_) usageTextColorApplyText_.reset();
                 mutationInFlight_ = true;
+                UpdateSaveBar();
                 ShowMessage(L"Applying changes…");
                 Send(request);
                 return;
@@ -734,6 +724,7 @@ namespace winrt::SettingsUI::implementation
             mutationInFlight_ = false;
             auto request = Request(L"persist");
             persistInFlight_ = true;
+            UpdateSaveBar();
             ShowMessage(L"Saving changes…");
             Send(request);
             return;
@@ -938,6 +929,9 @@ namespace winrt::SettingsUI::implementation
                 if (!target.empty()) target[0] = static_cast<wchar_t>(towupper(target[0]));
                 for (auto const& item : Navigation().MenuItems()) if (item.try_as<NavigationViewItem>() && std::wstring(unbox_value<hstring>(item.as<NavigationViewItem>().Tag()).c_str()) == target) Navigation().SelectedItem(item);
                 for (auto const& item : Navigation().FooterMenuItems()) if (item.try_as<NavigationViewItem>() && std::wstring(unbox_value<hstring>(item.as<NavigationViewItem>().Tag()).c_str()) == target) Navigation().SelectedItem(item);
+                if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+                Activate();
+                SetForegroundWindow(hwnd_);
             }
             else if (event == L"state" && message.HasKey(L"state") && message.GetNamedValue(L"state").ValueType() == JsonValueType::Object)
             {
@@ -956,7 +950,7 @@ namespace winrt::SettingsUI::implementation
                     revision_ = revision;
                     UpdateWidgetPreview(updated);
                 }
-                UpdateClaudeAvailability();
+                UpdateProviderAvailability();
                 UpdateAboutControls();
                 if (settingsChanged) SyncPaneState();
                 // Poll/status events are frequent; avoid rebuilding controls (and
@@ -978,10 +972,16 @@ namespace winrt::SettingsUI::implementation
         const bool wasPreview = previewInFlight_;
         const auto completedPreviewGeneration = widgetPreviewFlightGeneration_;
         const bool wasMutation = mutationInFlight_;
+        const bool wasPanePersistence = paneStateRequestInFlight_;
         const bool wasSettingsAction = settingsActionInFlight_;
         const auto completedSettingsAction = settingsActionInFlightName_;
         initialGetPending_ = false;
         previewInFlight_ = false;
+        if (wasPanePersistence)
+        {
+            paneStateRequestInFlight_ = false;
+            paneStateRequestValue_.reset();
+        }
         settingsActionInFlight_ = false;
         settingsActionInFlightName_.reset();
         inFlight_ = 0;
@@ -994,6 +994,7 @@ namespace winrt::SettingsUI::implementation
             else if (!ok && completedPreviewGeneration == widgetPreviewGeneration_ && widgetPreviewStatus_)
                 widgetPreviewStatus_.Text(L"The widget preview is temporarily unavailable.");
 
+            SendPendingPaneState();
             if (previewPending_) SendWidgetPreviewIfIdle();
             else if (flushRequested_) SendNextMutation();
             else ContinueDeferredWork();
@@ -1007,7 +1008,7 @@ namespace winrt::SettingsUI::implementation
         {
             SyncPaneState();
         }
-        UpdateClaudeAvailability();
+        UpdateProviderAvailability();
         UpdateAboutControls();
         const bool wasPersist = persistInFlight_;
         persistInFlight_ = false;
@@ -1123,6 +1124,11 @@ namespace winrt::SettingsUI::implementation
                 ShowMessage(std::wstring(message.GetNamedString(L"error", L"Changes could not be saved. Try again.").c_str()), true);
             }
         }
+        else if (wasPanePersistence && !ok)
+        {
+            ShowMessage(std::wstring(message.GetNamedString(L"error", L"The navigation layout could not be saved.").c_str()), true);
+            if (!pendingPaneState_) SyncPaneState();
+        }
         const bool settingsActionSaveFailed = wasSettingsAction && !ok &&
             message.GetNamedString(L"error_code", L"") == L"save_failed";
         if (settingsActionSaveFailed)
@@ -1134,7 +1140,7 @@ namespace winrt::SettingsUI::implementation
             if (closeRequested_) flushRequested_ = true;
             ShowMessage(std::wstring(message.GetNamedString(L"error", L"The action took effect, but its changes could not be saved.").c_str()), true);
         }
-        else if (!ok && !wasMutation && !wasPersist) ShowMessage(std::wstring(message.GetNamedString(L"error", L"The request could not be completed.").c_str()), true);
+        else if (!ok && !wasMutation && !wasPersist && !wasPanePersistence) ShowMessage(std::wstring(message.GetNamedString(L"error", L"The request could not be completed.").c_str()), true);
         if (wasSettingsAction && !ok && !settingsActionSaveFailed)
         {
             closeRequested_ = false;
@@ -1160,6 +1166,7 @@ namespace winrt::SettingsUI::implementation
         if (HasPendingChanges() && flushRequested_) SendNextMutation();
         else if (flushRequested_) SendNextMutation();
         else ContinueDeferredWork();
+        SendPendingPaneState();
         if (previewPending_) SendWidgetPreviewIfIdle();
         RefreshSettingsControlsIfSafe();
         UpdateSaveBar();
@@ -1188,7 +1195,8 @@ namespace winrt::SettingsUI::implementation
         pendingChanges_.Insert(key, value);
         flushRequested_ = false;
         UpdateSaveBar();
-        if (key == L"palette" || key == L"bar_style" || key == L"bar_thickness" || key == L"font_size" ||
+        if (key == L"palette" || key == L"bar_style" || key == L"bar_thickness" || key == L"provider_spacing" || key == L"font_size" ||
+            key == L"provider_icon_position" || key == L"provider_order" || key == L"provider_monochrome" ||
             key == L"window_label_font_size" || key == L"claude_accent" || key == L"codex_accent" ||
             key == L"antigravity_accent" || key == L"opencode_accent" || key == L"cursor_accent" ||
             key == L"grok_accent" || key == L"copilot_accent" ||
@@ -1228,10 +1236,11 @@ namespace winrt::SettingsUI::implementation
         if (previewTimer_) previewTimer_.Stop();
         auto settings = State();
         auto changes = JsonObject();
-        static const std::array<std::wstring, 24> previewKeys{
-            L"palette", L"bar_style", L"bar_thickness", L"font_size", L"window_label_font_size",
+        static const std::array<std::wstring, 28> previewKeys{
+            L"palette", L"bar_style", L"bar_thickness", L"provider_spacing", L"font_size", L"window_label_font_size",
             L"claude_accent", L"codex_accent", L"antigravity_accent", L"opencode_accent",
-            L"cursor_accent", L"grok_accent", L"copilot_accent", L"usage_text_color", L"show_provider_icon",
+            L"cursor_accent", L"grok_accent", L"copilot_accent", L"usage_text_color", L"provider_monochrome", L"provider_order",
+            L"show_provider_icon", L"provider_icon_position",
             L"show_claude_icon", L"show_codex_icon", L"show_antigravity_icon", L"show_opencode_icon",
             L"show_cursor_icon", L"show_grok_icon", L"show_copilot_icon",
             L"show_percentage", L"show_bar", L"show_reset_time" };
@@ -1336,11 +1345,56 @@ namespace winrt::SettingsUI::implementation
                 self->widgetPreviewStatus_.Text(L"The widget preview is temporarily unavailable.");
         }
     }
-    void MainWindow::UpdateClaudeAvailability()
+    struct ProviderAppearanceEntry
     {
-        if (!claudeToggle_) return;
-        const bool available = state_ && state_.GetNamedBoolean(L"claude_code_available", false);
-        claudeToggle_.IsEnabled(available || Bool(L"show_claude_code"));
+        std::wstring enable;
+        std::wstring icon;
+        std::wstring accent;
+        std::wstring name;
+        std::wstring accentTitle;
+        std::wstring availability;
+        std::wstring setupName;
+        std::wstring monitoringDetail;
+    };
+
+    static std::array<ProviderAppearanceEntry, 7> ProviderAppearanceMeta()
+    {
+        return {{
+            {L"show_claude_code", L"show_claude_icon", L"claude_accent", L"Claude Code", L"Claude Code bar accent", L"claude_code_available", L"Claude CLI", L"Monitor usage from your Claude CLI account."},
+            {L"show_codex", L"show_codex_icon", L"codex_accent", L"Codex", L"Codex bar accent", L"codex_available", L"Codex", L"Monitor your Codex account."},
+            {L"show_antigravity", L"show_antigravity_icon", L"antigravity_accent", L"Antigravity", L"Antigravity bar accent", L"antigravity_available", L"Antigravity", L"Monitor your Antigravity account."},
+            {L"show_opencode", L"show_opencode_icon", L"opencode_accent", L"OpenCode", L"OpenCode bar accent", L"opencode_available", L"OpenCode Go", L"Monitor your OpenCode Go usage."},
+            {L"show_cursor", L"show_cursor_icon", L"cursor_accent", L"Cursor", L"Cursor bar accent", L"cursor_available", L"Cursor", L"Monitor your Cursor usage."},
+            {L"show_grok", L"show_grok_icon", L"grok_accent", L"Grok", L"Grok bar accent", L"grok_available", L"Grok", L"Monitor your Grok usage."},
+            {L"show_copilot", L"show_copilot_icon", L"copilot_accent", L"Copilot", L"Copilot bar accent", L"copilot_available", L"GitHub Copilot", L"Monitor your GitHub Copilot usage."},
+        }};
+    }
+
+    static std::wstring ProviderUnavailableDetail(ProviderAppearanceEntry const& provider, bool enabled)
+    {
+        const auto message = L"No local " + provider.setupName + L" credentials or configuration were detected. ";
+        return message + (enabled
+            ? L"Turn this off, or set up " + provider.setupName + L" to resume monitoring."
+            : L"Set up " + provider.setupName + L" to enable monitoring.");
+    }
+
+    void MainWindow::UpdateProviderAvailability()
+    {
+        const auto providers = ProviderAppearanceMeta();
+        const auto count = std::min(providerToggles_.size(), providers.size());
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (!providerToggles_[i]) continue;
+            const bool available = state_ && state_.GetNamedBoolean(hstring(providers[i].availability), false);
+            providerToggles_[i].IsEnabled(available || Bool(providers[i].enable));
+        }
+        if (providerDetailEnableToggle_ && page_ == L"Appearance" && detailProvider_ >= 0 &&
+            detailProvider_ < static_cast<int>(providers.size()))
+        {
+            const auto& provider = providers[static_cast<size_t>(detailProvider_)];
+            const bool available = state_ && state_.GetNamedBoolean(hstring(provider.availability), false);
+            providerDetailEnableToggle_.IsEnabled(available || Bool(provider.enable));
+        }
     }
     void MainWindow::UpdateAboutControls()
     {
@@ -1369,7 +1423,14 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::UpdateUpdateIndicator()
     {
         const bool available = state_ && state_.GetNamedBoolean(L"update_available", false);
-        if (updateIndicator_) updateIndicator_.Visibility(available ? Visibility::Visible : Visibility::Collapsed);
+        if (updateIndicator_)
+        {
+            updateIndicator_.Visibility(available ? Visibility::Visible : Visibility::Collapsed);
+            updateIndicator_.HorizontalAlignment(HorizontalAlignment::Right);
+            updateIndicator_.VerticalAlignment(VerticalAlignment::Center);
+            updateIndicator_.Margin(Navigation().IsPaneOpen()
+                ? Thickness{ 0, 0, 12, 0 } : Thickness{ 0, 7, 6, 0 });
+        }
         NavigationUpdate().Visibility(available ? Visibility::Visible : Visibility::Collapsed);
         if (!available && page_ == L"Update")
         {
@@ -1488,6 +1549,46 @@ namespace winrt::SettingsUI::implementation
         Navigation().IsPaneOpen(paneOpen);
         hydrating_ = wasHydrating;
         paneStateKnown_ = true;
+    }
+
+    void MainWindow::QueuePaneState(bool open)
+    {
+        const auto current = state_ ? state_.GetNamedObject(L"settings", JsonObject()) : JsonObject();
+        const bool authoritativeValue = current.GetNamedBoolean(L"settings_pane_open", true);
+        if (pendingPaneState_ && *pendingPaneState_ == open) return;
+        if (paneStateRequestInFlight_ && paneStateRequestValue_ && *paneStateRequestValue_ == open)
+        {
+            pendingPaneState_.reset();
+            return;
+        }
+        if (!pendingPaneState_ && !paneStateRequestInFlight_ && authoritativeValue == open) return;
+        pendingPaneState_ = open;
+        SendPendingPaneState();
+    }
+
+    void MainWindow::SendPendingPaneState()
+    {
+        if (!pendingPaneState_ || paneStateRequestInFlight_ || inFlight_ != 0 || stopping_ || closed_) return;
+        const bool requested = *pendingPaneState_;
+        const auto current = state_ ? state_.GetNamedObject(L"settings", JsonObject()) : JsonObject();
+        if (current.GetNamedBoolean(L"settings_pane_open", true) == requested)
+        {
+            pendingPaneState_.reset();
+            return;
+        }
+        auto request = Request(L"set");
+        request.Insert(L"key", JsonValue::CreateStringValue(L"settings_pane_open"));
+        request.Insert(L"value", JsonValue::CreateBooleanValue(requested));
+        pendingPaneState_.reset();
+        paneStateRequestValue_ = requested;
+        paneStateRequestInFlight_ = true;
+        Send(request);
+        if (inFlight_ == 0)
+        {
+            paneStateRequestInFlight_ = false;
+            paneStateRequestValue_.reset();
+            pendingPaneState_ = requested;
+        }
     }
 
     void MainWindow::SetColorDraft(std::wstring const& key, std::optional<std::wstring> draft)
@@ -1619,7 +1720,9 @@ namespace winrt::SettingsUI::implementation
             previewPending_ = false;
             detailProvider_ = -1;
         }
-        claudeToggle_ = nullptr;
+        providerToggles_.clear();
+        providerDetailEnableToggle_ = nullptr;
+        providerIconPositionSelector_ = nullptr;
         widgetPreviewImage_ = nullptr;
         widgetPreviewStatus_ = nullptr;
         ClearStickyPreview();
@@ -1685,19 +1788,32 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::BuildMonitoring()
     {
         auto providers=Card(); auto p=StackPanel(); p.Spacing(14); p.Children().Append(Label(L"Usage providers",19));
-        auto available=state_ && state_.GetNamedBoolean(L"claude_code_available", false);
-        auto add=[this,&p,available](std::wstring key,std::wstring name,std::wstring detail,bool enabled,bool unavailable)
+        providerToggles_.clear();
+        for (auto const& meta : ProviderAppearanceMeta())
         {
-             auto copy=StackPanel(); copy.Spacing(3); copy.Children().Append(Label(name)); auto d=Label(unavailable?(enabled?L"Claude credentials are unavailable. Turn this off, or sign in to resume monitoring.":L"Sign in to the Claude CLI to enable monitoring."):detail,12); d.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>()); copy.Children().Append(d);
-             auto sw=ToggleSwitch(); Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(sw,name); Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(sw,std::wstring(L"Setting_")+key); SetSwitchContent(sw); sw.IsOn(enabled); sw.IsEnabled(!unavailable || enabled); sw.Toggled([this,key](auto const& s,auto const&){SetValue(key,JsonValue::CreateBooleanValue(s.as<ToggleSwitch>().IsOn()));}); if(key==L"show_claude_code") claudeToggle_=sw; p.Children().Append(ToggleRow(copy,sw));
-        };
-        add(L"show_claude_code",L"Claude Code",L"Monitor usage from your Claude CLI account.",Bool(L"show_claude_code"),!available);
-        add(L"show_codex",L"Codex",L"Monitor your Codex account.",Bool(L"show_codex"),false);
-        add(L"show_antigravity",L"Antigravity",L"Monitor your Antigravity account.",Bool(L"show_antigravity"),false);
-        add(L"show_opencode",L"OpenCode",L"Monitor your OpenCode Go usage.",Bool(L"show_opencode"),false);
-        add(L"show_cursor",L"Cursor",L"Monitor your Cursor usage.",Bool(L"show_cursor"),false);
-        add(L"show_grok",L"Grok",L"Monitor your Grok usage.",Bool(L"show_grok"),false);
-        add(L"show_copilot",L"Copilot",L"Monitor your GitHub Copilot usage.",Bool(L"show_copilot"),false);
+            const bool enabled = Bool(meta.enable);
+            const bool available = state_ && state_.GetNamedBoolean(hstring(meta.availability), false);
+            auto copy=StackPanel(); copy.Spacing(3); copy.Children().Append(Label(meta.name));
+            auto description = Label(available ? meta.monitoringDetail : ProviderUnavailableDetail(meta, enabled), 12);
+            description.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+            copy.Children().Append(description);
+            auto toggle=ToggleSwitch();
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle, meta.name);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(toggle, std::wstring(L"Setting_") + meta.enable);
+            SetSwitchContent(toggle); toggle.IsOn(enabled); toggle.IsEnabled(available || enabled);
+            const auto key = meta.enable;
+            const auto availabilityKey = meta.availability;
+            toggle.Toggled([this, key, availabilityKey](auto const& sender, auto const&)
+            {
+                auto control = sender.as<ToggleSwitch>();
+                const bool enabledNow = control.IsOn();
+                SetValue(key, JsonValue::CreateBooleanValue(enabledNow));
+                const bool availableNow = state_ && state_.GetNamedBoolean(hstring(availabilityKey), false);
+                control.IsEnabled(availableNow || enabledNow);
+            });
+            providerToggles_.push_back(toggle);
+            p.Children().Append(ToggleRow(copy, toggle));
+        }
         auto note=Label(L"At least one provider must stay enabled.",12);note.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());p.Children().Append(note);
         auto personalizeFooter = StackPanel(); personalizeFooter.Orientation(Orientation::Horizontal); personalizeFooter.Spacing(8);
         auto personalizeNote = Label(L"Want to personalize the appearance?", 12);
@@ -1761,31 +1877,10 @@ namespace winrt::SettingsUI::implementation
         options.Child(o);PageHost().Children().Append(options);
     }
 
-    struct ProviderAppearanceEntry
-    {
-        std::wstring enable;
-        std::wstring icon;
-        std::wstring accent;
-        std::wstring name;
-        std::wstring accentTitle;
-    };
-
-    static std::array<ProviderAppearanceEntry, 7> ProviderAppearanceMeta()
-    {
-        return {{
-            {L"show_claude_code", L"show_claude_icon", L"claude_accent", L"Claude Code", L"Claude Code bar accent"},
-            {L"show_codex", L"show_codex_icon", L"codex_accent", L"Codex", L"Codex bar accent"},
-            {L"show_antigravity", L"show_antigravity_icon", L"antigravity_accent", L"Antigravity", L"Antigravity bar accent"},
-            {L"show_opencode", L"show_opencode_icon", L"opencode_accent", L"OpenCode", L"OpenCode bar accent"},
-            {L"show_cursor", L"show_cursor_icon", L"cursor_accent", L"Cursor", L"Cursor bar accent"},
-            {L"show_grok", L"show_grok_icon", L"grok_accent", L"Grok", L"Grok bar accent"},
-            {L"show_copilot", L"show_copilot_icon", L"copilot_accent", L"Copilot", L"Copilot bar accent"},
-        }};
-    }
-
     void MainWindow::AddAccentColorRow(StackPanel const& parent, std::wstring const& key, std::wstring const& title)
     {
         auto group = StackPanel(); group.Spacing(6); group.Children().Append(Label(title));
+        const bool accentEnabled = key == L"usage_text_color" || Bool(L"show_bar");
         auto row = StackPanel(); row.Orientation(Orientation::Horizontal); row.Spacing(8);
         row.SizeChanged([](auto const& sender, auto const&)
         {
@@ -1819,7 +1914,10 @@ namespace winrt::SettingsUI::implementation
             if (key == L"grok_accent" && grokColorApplyText_ && *grokColorApplyText_ != text) grokColorApplyText_.reset();
             if (key == L"copilot_accent" && copilotColorApplyText_ && *copilotColorApplyText_ != text) copilotColorApplyText_.reset();
             if (key == L"usage_text_color" && usageTextColorApplyText_ && *usageTextColorApplyText_ != text) usageTextColorApplyText_.reset();
-            SetColorDraft(key, text); ScheduleWidgetPreview();
+            SetColorDraft(key, text);
+            if (key == L"usage_text_color" && ParseHexColor(text))
+                SetValue(L"provider_monochrome", JsonValue::CreateBooleanValue(false));
+            ScheduleWidgetPreview();
         });
 
         auto pickerButton = Button(); pickerButton.Content(box_value(L"Choose color…"));
@@ -1865,7 +1963,9 @@ namespace winrt::SettingsUI::implementation
             else if (key == L"grok_accent") ++grokColorDraftRevision_;
             else if (key == L"copilot_accent") ++copilotColorDraftRevision_;
             else ++usageTextColorDraftRevision_;
-            SetColorDraft(key, value); ScheduleWidgetPreview(); flyout.Hide();
+            SetColorDraft(key, value);
+            if (key == L"usage_text_color") SetValue(L"provider_monochrome", JsonValue::CreateBooleanValue(false));
+            ScheduleWidgetPreview(); flyout.Hide();
         });
         cancelColor.Click([flyout](auto const&, auto const&) { flyout.Hide(); });
 
@@ -1878,6 +1978,7 @@ namespace winrt::SettingsUI::implementation
             const auto normalized = FormatHexColor(*color);
             syncingColorText_ = true; input.Text(normalized); syncingColorText_ = false;
             SetColorDraft(key, normalized);
+            if (key == L"usage_text_color") SetValue(L"provider_monochrome", JsonValue::CreateBooleanValue(false));
             if (key == L"claude_accent") claudeColorApplyText_ = normalized;
             else if (key == L"codex_accent") codexColorApplyText_ = normalized;
             else if (key == L"antigravity_accent") antigravityColorApplyText_ = normalized;
@@ -1906,7 +2007,33 @@ namespace winrt::SettingsUI::implementation
             syncingColorText_ = true; input.Text(StoredColorText(State(), key)); syncingColorText_ = false;
             hydrating_ = wasHydrating; ScheduleWidgetPreview(); ShowMessage(L"Color draft discarded."); RefreshSettingsControlsIfSafe();
         });
-        row.Children().Append(input); row.Children().Append(pickerButton); row.Children().Append(apply); row.Children().Append(discard);
+        input.IsEnabled(accentEnabled); pickerButton.IsEnabled(accentEnabled);
+        apply.IsEnabled(accentEnabled); discard.IsEnabled(accentEnabled);
+        if (key == L"usage_text_color")
+        {
+            auto monochrome = Button(); monochrome.Content(box_value(L"Monochrome"));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(monochrome, L"AppearanceColor_Monochrome");
+            monochrome.Click([this, input](auto const&, auto const&)
+            {
+                SetColorDraft(L"usage_text_color", std::nullopt);
+                usageTextColorApplyText_.reset();
+                syncingColorText_ = true; input.Text(L""); syncingColorText_ = false;
+                SetValue(L"usage_text_color", JsonValue::CreateNullValue());
+                SetValue(L"provider_monochrome", JsonValue::CreateBooleanValue(true));
+            });
+            auto useDefault = Button(); useDefault.Content(box_value(L"Default"));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(useDefault, L"AppearanceColor_Default");
+            useDefault.Click([this, input](auto const&, auto const&)
+            {
+                SetColorDraft(L"usage_text_color", std::nullopt);
+                usageTextColorApplyText_.reset();
+                syncingColorText_ = true; input.Text(L""); syncingColorText_ = false;
+                SetValue(L"usage_text_color", JsonValue::CreateNullValue());
+                SetValue(L"provider_monochrome", JsonValue::CreateBooleanValue(false));
+            });
+            monochrome.IsEnabled(accentEnabled); useDefault.IsEnabled(accentEnabled);
+            row.Children().Append(monochrome); row.Children().Append(useDefault);
+        }
         group.Children().Append(row); parent.Children().Append(group);
     }
 
@@ -1965,62 +2092,102 @@ namespace winrt::SettingsUI::implementation
         auto providersNote = Label(L"Edit each provider's widget appearance separately.", 12);
         providersNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
         providers.Children().Append(providersNote);
-        auto providerTiles = Grid(); providerTiles.ColumnSpacing(12); providerTiles.RowSpacing(12);
-        {
-            auto singleColumn = ColumnDefinition(); singleColumn.Width(GridLength{ 1, GridUnitType::Star });
-            providerTiles.ColumnDefinitions().Append(singleColumn);
-        }
+        auto providerTiles = GridView();
+        providerTiles.HorizontalAlignment(HorizontalAlignment::Stretch);
+        providerTiles.SelectionMode(ListViewSelectionMode::None);
+        providerTiles.IsItemClickEnabled(true);
+        providerTiles.CanDragItems(true);
+        providerTiles.CanReorderItems(true);
+        providerTiles.AllowDrop(true);
         const auto allProviders = ProviderAppearanceMeta();
-        for (int metaIndex = 0; metaIndex < static_cast<int>(allProviders.size()); ++metaIndex)
+        const std::array<std::wstring, 7> providerIds{ L"claude", L"codex", L"antigravity", L"opencode", L"cursor", L"grok", L"copilot" };
+        std::vector<int> orderedProviders;
+        auto addProviderIndex = [&orderedProviders](int index)
         {
+            if (std::find(orderedProviders.begin(), orderedProviders.end(), index) == orderedProviders.end())
+                orderedProviders.push_back(index);
+        };
+        const auto currentState = State();
+        if (currentState.HasKey(L"provider_order") && currentState.GetNamedValue(L"provider_order").ValueType() == JsonValueType::Array)
+        {
+            for (auto const& value : currentState.GetNamedArray(L"provider_order"))
+            {
+                if (value.ValueType() != JsonValueType::String) continue;
+                const auto id = std::wstring(value.GetString().c_str());
+                const auto found = std::find(providerIds.begin(), providerIds.end(), id);
+                if (found != providerIds.end()) addProviderIndex(static_cast<int>(std::distance(providerIds.begin(), found)));
+            }
+        }
+        for (int i = 0; i < static_cast<int>(allProviders.size()); ++i) addProviderIndex(i);
+        int visibleProviderNumber = 0;
+        for (int orderIndex = 0; orderIndex < static_cast<int>(orderedProviders.size()); ++orderIndex)
+        {
+            const int metaIndex = orderedProviders[static_cast<size_t>(orderIndex)];
             const auto& meta = allProviders[static_cast<size_t>(metaIndex)];
             if (!Bool(meta.enable)) continue;
-            auto tile = Grid();
-            auto starColumn = ColumnDefinition(); starColumn.Width(GridLength{ 1, GridUnitType::Star });
-            auto autoColumn = ColumnDefinition(); autoColumn.Width(GridLength{ 1, GridUnitType::Auto });
-            tile.ColumnDefinitions().Append(starColumn); tile.ColumnDefinitions().Append(autoColumn);
+            ++visibleProviderNumber;
+            auto tileContent = Grid();
+            auto nameColumn = ColumnDefinition(); nameColumn.Width(GridLength{ 1, GridUnitType::Star });
+            auto numberColumn = ColumnDefinition(); numberColumn.Width(GridLength{ 1, GridUnitType::Auto });
+            auto iconColumn = ColumnDefinition(); iconColumn.Width(GridLength{ 1, GridUnitType::Auto });
+            tileContent.ColumnDefinitions().Append(nameColumn); tileContent.ColumnDefinitions().Append(numberColumn); tileContent.ColumnDefinitions().Append(iconColumn);
             auto providerName = Label(meta.name); providerName.VerticalAlignment(VerticalAlignment::Center);
-            Grid::SetColumn(providerName, 0);
-            auto editProvider = Button(); editProvider.Content(SymbolIcon(Symbol::Edit));
-            Grid::SetColumn(editProvider, 1);
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(editProvider, meta.name + L" appearance settings");
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(editProvider, std::wstring(L"EditProvider_") + meta.enable);
-            editProvider.Click([this, metaIndex](auto const&, auto const&)
-            {
-                detailProvider_ = metaIndex;
-                RenderPage(L"Appearance");
-                if (pageScroll_) pageScroll_.ScrollToVerticalOffset(0);
-            });
-            tile.Children().Append(providerName); tile.Children().Append(editProvider);
-            providerTiles.Children().Append(tile);
+            auto number = Label(std::to_wstring(visibleProviderNumber), 12); number.VerticalAlignment(VerticalAlignment::Center);
+            number.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+            auto editIcon = SymbolIcon(Symbol::Edit); editIcon.VerticalAlignment(VerticalAlignment::Center);
+            editIcon.Margin(Thickness{12, 0, 0, 0});
+            Grid::SetColumn(number, 1); Grid::SetColumn(editIcon, 2);
+            tileContent.Children().Append(providerName); tileContent.Children().Append(number); tileContent.Children().Append(editIcon);
+            auto tileCard = Border();
+            tileCard.Background(Application::Current().Resources().Lookup(box_value(L"CardBackgroundFillColorDefaultBrush")).as<Media::Brush>());
+            tileCard.BorderBrush(Application::Current().Resources().Lookup(box_value(L"CardStrokeColorDefaultBrush")).as<Media::Brush>());
+            tileCard.BorderThickness(ThicknessHelper::FromUniformLength(1));
+            tileCard.CornerRadius(CornerRadiusHelper::FromUniformRadius(8));
+            tileCard.Padding(Thickness{12, 8, 12, 8}); tileCard.Width(280); tileCard.Height(64);
+            tileCard.Child(tileContent);
+            tileCard.Tag(box_value(providerIds[static_cast<size_t>(metaIndex)]));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(tileCard, meta.name + L" appearance settings");
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(tileCard, std::wstring(L"EditProvider_") + meta.enable);
+            providerTiles.Items().Append(tileCard);
         }
-        providerTiles.SizeChanged([](auto const& sender, auto const&)
+        providerTiles.ItemClick([this, providerIds](auto const&, auto const& args)
         {
-            auto grid = sender.as<Grid>();
-            const auto width = grid.ActualWidth();
-            const int cols = width >= 900 ? 3 : width >= 560 ? 2 : 1;
-            grid.ColumnDefinitions().Clear();
-            for (int c = 0; c < cols; ++c)
+            auto tile = args.ClickedItem().as<Border>();
+            const auto id = std::wstring(unbox_value<hstring>(tile.Tag()).c_str());
+            const auto found = std::find(providerIds.begin(), providerIds.end(), id);
+            if (found == providerIds.end()) return;
+            detailProvider_ = static_cast<int>(std::distance(providerIds.begin(), found));
+            RenderPage(L"Appearance");
+            if (pageScroll_) pageScroll_.ScrollToVerticalOffset(0);
+        });
+        providerTiles.DragItemsCompleted([this, providerIds, orderedProviders, allProviders](auto const& sender, auto const&)
+        {
+            const auto grid = sender.as<GridView>();
+            std::vector<std::wstring> draggedEnabledOrder;
+            size_t panelNumber = 0;
+            for (auto const& item : grid.Items())
             {
-                auto def = ColumnDefinition();
-                def.Width(GridLength{ 1, GridUnitType::Star });
-                grid.ColumnDefinitions().Append(def);
+                auto tile = item.try_as<Border>();
+                if (tile && tile.Tag() && unbox_value<hstring>(tile.Tag()).size())
+                {
+                    draggedEnabledOrder.emplace_back(unbox_value<hstring>(tile.Tag()).c_str());
+                    ++panelNumber;
+                    auto content = tile.Child().try_as<Grid>();
+                    if (content && content.Children().Size() > 1)
+                        content.Children().GetAt(1).as<TextBlock>().Text(std::to_wstring(panelNumber));
+                }
             }
-            const int count = static_cast<int>(grid.Children().Size());
-            const int rows = count > 0 ? (count + cols - 1) / cols : 0;
-            grid.RowDefinitions().Clear();
-            for (int r = 0; r < rows; ++r)
+            if (draggedEnabledOrder.empty()) return;
+            auto fullOrder = JsonArray();
+            size_t enabledIndex = 0;
+            for (const auto oldIndex : orderedProviders)
             {
-                auto rowDef = RowDefinition();
-                rowDef.Height(GridLength{ 1, GridUnitType::Auto });
-                grid.RowDefinitions().Append(rowDef);
+                const auto& meta = allProviders[static_cast<size_t>(oldIndex)];
+                const auto id = Bool(meta.enable) && enabledIndex < draggedEnabledOrder.size()
+                    ? draggedEnabledOrder[enabledIndex++] : providerIds[static_cast<size_t>(oldIndex)];
+                fullOrder.Append(JsonValue::CreateStringValue(id));
             }
-            for (int i = 0; i < count; ++i)
-            {
-                auto child = grid.Children().GetAt(static_cast<uint32_t>(i)).as<FrameworkElement>();
-                Grid::SetRow(child, i / cols);
-                Grid::SetColumn(child, i % cols);
-            }
+            SetValue(L"provider_order", fullOrder);
         });
         providers.Children().Append(providerTiles);
         auto providersFooter = StackPanel(); providersFooter.Orientation(Orientation::Horizontal); providersFooter.Spacing(4);
@@ -2033,6 +2200,56 @@ namespace winrt::SettingsUI::implementation
         providers.Children().Append(providersFooter);
         providersCard.Child(providers); PageHost().Children().Append(providersCard);
 
+        auto visibilityCard = Card(); auto visibility = StackPanel(); visibility.Spacing(10);
+        visibility.Children().Append(Label(L"Widget contents", 19));
+        auto addVisibilityToggle = [this, &visibility](std::wstring const& key, std::wstring const& title)
+        {
+            auto copy = StackPanel(); copy.Children().Append(Label(title));
+            auto toggle = ToggleSwitch(); SetSwitchContent(toggle);
+            toggle.IsOn(State().GetNamedBoolean(hstring(key), true));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle, title);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(toggle, L"Appearance_" + key);
+            toggle.Toggled([this, key](auto const& sender, auto const&)
+            {
+                if (!hydrating_)
+                {
+                    const bool enabled = sender.as<ToggleSwitch>().IsOn();
+                    SetValue(key, JsonValue::CreateBooleanValue(enabled));
+                    if (key == L"show_provider_icon" && providerIconPositionSelector_)
+                        providerIconPositionSelector_.IsEnabled(enabled);
+                }
+            });
+            visibility.Children().Append(ToggleRow(copy, toggle));
+        };
+        addVisibilityToggle(L"show_provider_icon", L"Provider logos");
+        addVisibilityToggle(L"show_percentage", L"Percentages");
+        addVisibilityToggle(L"show_bar", L"Progress bars");
+        auto iconPositionGroup = StackPanel(); iconPositionGroup.Spacing(6);
+        iconPositionGroup.Children().Append(Label(L"Provider logo position"));
+        auto iconPosition = ComboBox();
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(iconPosition, L"Provider logo position");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(iconPosition, L"Appearance_provider_icon_position");
+        for (auto const& [value, label] : std::array<std::pair<std::wstring, std::wstring>, 3>{{
+            {L"top", L"Top"}, {L"center", L"Center"}, {L"bottom", L"Bottom"}}})
+        {
+            auto item = ComboBoxItem(); item.Content(box_value(label)); item.Tag(box_value(value)); iconPosition.Items().Append(item);
+        }
+        const auto position = Text(L"provider_icon_position");
+        const auto selectedPosition = position.empty() ? std::wstring(L"top") : position;
+        for (uint32_t i = 0; i < iconPosition.Items().Size(); ++i)
+            if (unbox_value<hstring>(iconPosition.Items().GetAt(i).as<ComboBoxItem>().Tag()) == selectedPosition) iconPosition.SelectedIndex(i);
+        iconPosition.MinWidth(250); iconPosition.MaxWidth(360); iconPosition.HorizontalAlignment(HorizontalAlignment::Left);
+        iconPosition.IsEnabled(Bool(L"show_provider_icon"));
+        providerIconPositionSelector_ = iconPosition;
+        iconPosition.SelectionChanged([this](auto const& sender, auto const&)
+        {
+            auto control = sender.as<ComboBox>();
+            if (!hydrating_ && control.SelectedItem())
+                SetValue(L"provider_icon_position", JsonValue::CreateStringValue(unbox_value<hstring>(control.SelectedItem().as<ComboBoxItem>().Tag())));
+        });
+        iconPositionGroup.Children().Append(iconPosition); visibility.Children().Append(iconPositionGroup);
+        visibilityCard.Child(visibility); PageHost().Children().Append(visibilityCard);
+
         auto styleCard = Card();
         auto style = StackPanel(); style.Spacing(16);
         style.Children().Append(Label(L"Widget style", 19));
@@ -2041,6 +2258,7 @@ namespace winrt::SettingsUI::implementation
         auto theme = ComboBox();
         auto bars = ComboBox();
         auto thickness = ComboBox();
+        auto providerSpacing = ComboBox();
         auto fontSize = ComboBox();
         auto addCombo = [this](Panel const& parent, ComboBox const& combo, std::wstring const& title,
             std::wstring const& key, std::vector<std::pair<std::wstring, std::wstring>> const& values)
@@ -2066,6 +2284,7 @@ namespace winrt::SettingsUI::implementation
         addCombo(styleCombos, theme, L"Theme", L"palette", {{L"system",L"Follow Windows"},{L"high_contrast_dark",L"Dark"},{L"high_contrast_light",L"Light"}});
         addCombo(styleCombos, bars, L"Progress bars", L"bar_style", {{L"continuous",L"Continuous"},{L"segmented",L"Segmented"}});
         addCombo(styleCombos, thickness, L"Bar thickness", L"bar_thickness", {{L"standard",L"Standard"},{L"slim",L"Slim"}});
+        addCombo(styleCombos, providerSpacing, L"Provider spacing", L"provider_spacing", {{L"none",L"None"},{L"small",L"Small"},{L"normal",L"Normal"},{L"large",L"Large"}});
         addCombo(styleCombos, fontSize, L"Text size", L"font_size", {{L"standard",L"Standard"},{L"large",L"Large"}});
         styleCombos.SizeChanged([styleCombos](auto const& sender, auto const&) mutable
         {
@@ -2109,7 +2328,14 @@ namespace winrt::SettingsUI::implementation
 
         // The live preview now leads the page; see the top of BuildAppearance.
 
-        auto refreshPreview = [this]() { ScheduleWidgetPreview(); };
+        styleCard.Child(style); PageHost().Children().Append(styleCard);
+
+        auto actionsCard = Card();
+        auto actions = StackPanel(); actions.Spacing(12);
+        actions.Children().Append(Label(L"Appearance actions", 19));
+        auto actionsNote = Label(L"Restore recommended settings or reset appearance and colors.", 12);
+        actionsNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        actions.Children().Append(actionsNote);
         auto buttons = StackPanel(); buttons.Orientation(Orientation::Horizontal); buttons.Spacing(8);
         buttons.SizeChanged([](auto const& sender, auto const&)
         {
@@ -2123,7 +2349,8 @@ namespace winrt::SettingsUI::implementation
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(button, std::wstring(L"AppearanceAction_") + action);
             button.Click([this, action](auto const&, auto const&) { Action(action); }); buttons.Children().Append(button);
         }
-        style.Children().Append(buttons); styleCard.Child(style); PageHost().Children().Append(styleCard);
+        actions.Children().Append(buttons);
+        actionsCard.Child(actions); PageHost().Children().Append(actionsCard);
 
         if (pageScroll_ && pageScroll_.VerticalOffset() > 8)
         {
@@ -2146,9 +2373,11 @@ namespace winrt::SettingsUI::implementation
         const auto& meta = metas[static_cast<size_t>(provider)];
         BuildPreviewCard();
         auto titleCard = Card();
-        auto titleRow = StackPanel(); titleRow.Orientation(Orientation::Horizontal); titleRow.Spacing(12);
+        auto titleRow = StackPanel(); titleRow.Orientation(Orientation::Horizontal); titleRow.Spacing(8);
         titleRow.VerticalAlignment(VerticalAlignment::Center);
         auto back = Button(); back.Content(SymbolIcon(Symbol::Back));
+        back.Background(nullptr); back.BorderBrush(nullptr); back.BorderThickness(Thickness{ 0 });
+        back.VerticalAlignment(VerticalAlignment::Center);
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(back, L"Back to providers");
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(back, L"ProviderDetailBack");
         back.Click([this](auto const&, auto const&)
@@ -2158,21 +2387,36 @@ namespace winrt::SettingsUI::implementation
             if (pageScroll_) pageScroll_.ScrollToVerticalOffset(0);
         });
         titleRow.Children().Append(back);
-        titleRow.Children().Append(Label(meta.name, 19));
+        auto detailName = Label(meta.name, 19); detailName.VerticalAlignment(VerticalAlignment::Center);
+        titleRow.Children().Append(detailName);
+        titleCard.Padding(Thickness{ 12, 6, 12, 6 });
+        titleCard.Background(Application::Current().Resources().Lookup(box_value(L"SolidBackgroundFillColorBaseBrush")).as<Media::Brush>());
         titleCard.Child(titleRow);
         appearanceDetailTitleCard_ = titleCard;
         PageHost().Children().Append(titleCard);
         auto card = Card(); auto stack = StackPanel(); stack.Spacing(12);
+        const bool enabled = Bool(meta.enable);
+        const bool available = state_ && state_.GetNamedBoolean(hstring(meta.availability), false);
         auto enableCopy = StackPanel(); enableCopy.Spacing(3); enableCopy.Children().Append(Label(L"Show in widget"));
+        if (!available)
+        {
+            auto availabilityNote = Label(ProviderUnavailableDetail(meta, enabled), 12);
+            availabilityNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+            enableCopy.Children().Append(availabilityNote);
+        }
         auto enableToggle = ToggleSwitch(); SetSwitchContent(enableToggle);
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(enableToggle, meta.name);
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(enableToggle, std::wstring(L"Setting_") + meta.enable);
-        enableToggle.IsOn(Bool(meta.enable));
+        enableToggle.IsOn(enabled); enableToggle.IsEnabled(available || enabled);
+        providerDetailEnableToggle_ = enableToggle;
         enableToggle.Toggled([this, meta](auto const& sender, auto const&)
         {
             auto control = sender.as<ToggleSwitch>();
             if (hydrating_) return;
-            SetValue(meta.enable, JsonValue::CreateBooleanValue(control.IsOn()));
+            const bool enabledNow = control.IsOn();
+            SetValue(meta.enable, JsonValue::CreateBooleanValue(enabledNow));
+            const bool availableNow = state_ && state_.GetNamedBoolean(hstring(meta.availability), false);
+            control.IsEnabled(availableNow || enabledNow);
         });
         stack.Children().Append(ToggleRow(enableCopy, enableToggle));
         auto iconCopy = StackPanel(); iconCopy.Spacing(3); iconCopy.Children().Append(Label(L"Provider logo"));
@@ -2180,6 +2424,7 @@ namespace winrt::SettingsUI::implementation
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(iconToggle, meta.name + L" logo");
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(iconToggle, std::wstring(L"Setting_") + meta.icon);
         iconToggle.IsOn(State().GetNamedBoolean(meta.icon, true));
+        iconToggle.IsEnabled(Bool(L"show_provider_icon"));
         iconToggle.Toggled([this, meta](auto const& sender, auto const&)
         {
             auto control = sender.as<ToggleSwitch>();
@@ -2187,7 +2432,6 @@ namespace winrt::SettingsUI::implementation
             SetValue(meta.icon, JsonValue::CreateBooleanValue(control.IsOn()));
         });
         stack.Children().Append(ToggleRow(iconCopy, iconToggle));
-        stack.Children().Append(Label(L"Bar accent", 14));
         AddAccentColorRow(stack, meta.accent, meta.accentTitle);
         card.Child(stack); PageHost().Children().Append(card);
     }
@@ -2347,11 +2591,11 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::BuildExperimental()
     {
         auto card = Card(); auto stack = StackPanel(); stack.Spacing(12);
-        stack.Children().Append(Label(L"Experimental", 19));
+        stack.Children().Append(Label(L"Provider limit", 19));
         stack.Children().Append(Label(L"Try upcoming ideas early. These options may change or disappear in a later version.", 13));
         auto copy = StackPanel(); copy.Spacing(3);
         copy.Children().Append(Label(L"Allow unlimited providers"));
-        auto detail = Label(L"Normally at most 3 providers can stay enabled at once. Enabling irrelevantly many providers is not needed, but the option is here if you want it.", 12);
+        auto detail = Label(L"By default, up to 3 providers can be enabled at once. Turn this on to remove that limit.", 12);
         detail.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
         copy.Children().Append(detail);
         auto toggle = ToggleSwitch();

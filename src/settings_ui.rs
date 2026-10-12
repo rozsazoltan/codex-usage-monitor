@@ -36,7 +36,9 @@
 //! show_claude_code, show_codex, show_antigravity, show_opencode, show_cursor, show_grok,
 //! show_copilot, allow_unlimited_providers (at most 3 providers enabled unless lifted),
 //! show_session_window, show_weekly_window, adaptive_refresh, anchor_left,
-//! settings_pane_open (booleans); poll_interval_ms (60000..=3600000 integer),
+//! settings_pane_open (boolean; a standalone op="set" or one-change set_batch
+//! persists only the pane preference immediately, without saving other drafts);
+//! poll_interval_ms (60000..=3600000 integer),
 //! show_provider_icon (boolean, legacy show_provider_icons alias), show_percentage,
 //! show_bar, show_reset_time (booleans; at least one of the latter three required),
 //! usage_text_color (null for palette text defaults, or [u8,u8,u8]; tints marks
@@ -45,7 +47,12 @@
 //! alert_threshold_percent (0|10|20|30); palette
 //! (system|high_contrast_dark|high_contrast_light), bar_style
 //! (continuous|segmented), bar_thickness (standard|slim), font_size
-//! (standard|large), claude_accent/codex_accent/antigravity_accent/
+//! (standard|large), provider_spacing (none|small|normal|large; default small),
+//! provider_order (array of all seven unique IDs claude/codex/antigravity/opencode/
+//! cursor/grok/copilot), provider_icon_position (top|center|bottom; default top),
+//! provider_monochrome (boolean; default false; uses the palette percentage text
+//! color for logos while usage_text_color is null),
+//! claude_accent/codex_accent/antigravity_accent/
 //! opencode_accent/cursor_accent/grok_accent/copilot_accent (null or
 //! [u8,u8,u8]), show_claude_icon/show_codex_icon/show_antigravity_icon/
 //! show_opencode_icon/show_cursor_icon/show_grok_icon/show_copilot_icon
@@ -57,7 +64,10 @@
 //! be supplied. Update/uninstall retain the widget's confirmation flows.
 //!
 //! State schema: {"settings": {all set keys above with their effective values},
-//! "effective_language":string,"claude_code_available":bool,
+//! "effective_language":string,"claude_code_available":bool,"codex_available":bool,
+//! "antigravity_available":bool,"opencode_available":bool,"cursor_available":bool,
+//! "grok_available":bool,"copilot_available":bool (all availability fields
+//! report local credential presence only),
 //! "monitors":[{"device":string,"primary":bool}],"version":string,
 //! "update_status":string,"install_channel":"portable"|"winget"}.
 //! `settings.monitor_device` may be null before explicit selection.
@@ -148,6 +158,10 @@ pub enum Key {
     BarStyle,
     BarThickness,
     FontSize,
+    ProviderSpacing,
+    ProviderOrder,
+    ProviderIconPosition,
+    ProviderMonochrome,
     ClaudeAccent,
     CodexAccent,
     AntigravityAccent,
@@ -989,6 +1003,10 @@ mod tests {
             br#"{"v":1,"id":4,"op":"set_batch","changes":[{"key":"show_opencode","value":true},{"key":"show_cursor","value":false},{"key":"show_grok","value":false},{"key":"show_copilot","value":false}]}"#
         )
         .is_ok());
+        assert!(parse_request(
+            br#"{"v":1,"id":5,"op":"set_batch","changes":[{"key":"provider_spacing","value":"large"}]}"#
+        )
+        .is_ok());
         assert!(parse_request(br#"{"v":1,"id":1,"op":"persist"}"#).is_ok());
         for input in [
             r#"{"v":2,"id":1,"op":"get"}"#,
@@ -1211,11 +1229,14 @@ mod tests {
     }
     #[test]
     fn preview_requests_accept_only_a_bounded_known_changes_object() {
-        let request = parse_request(br#"{"v":1,"id":7,"op":"preview","changes":{"show_bar":false,"usage_text_color":[1,2,3],"window_label_font_size":9}}"#).unwrap();
+        let request = parse_request(
+            br#"{"v":1,"id":7,"op":"preview","changes":{"show_bar":false,"usage_text_color":[1,2,3],"window_label_font_size":9,"provider_spacing":"small"}}"#,
+        )
+        .unwrap();
         let Operation::Preview { changes } = request.operation else {
             panic!("expected preview");
         };
-        assert_eq!(changes.len(), 3);
+        assert_eq!(changes.len(), 4);
         for wire in [
             br#"{"v":1,"id":7,"op":"preview","changes":{"arbitrary":false}}"#.as_slice(),
             br#"{"v":1,"id":7,"op":"preview","changes":[]}"#,

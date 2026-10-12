@@ -12,7 +12,9 @@ Preview and explicitly authorized setting edits use only an in-memory synthetic 
 param(
     [string]$CompanionDirectory = (Join-Path $PSScriptRoot '../../settings-ui/bin/portable'),
     [string]$TemporaryDirectory = (Join-Path ([IO.Path]::GetTempPath()) 'opencode'),
-    [ValidateRange(2, 60)][int]$TimeoutSeconds = 15
+    [ValidateRange(2, 60)][int]$TimeoutSeconds = 15,
+    [switch]$AppearanceOnly,
+    [switch]$SaveStateOnly
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -86,15 +88,18 @@ $snapshot = @{
     settings = @{
         language = 'en'; startup = $false; widget_visible = $true; settings_pane_open = $true
         show_tray_icon = $true; show_provider_icons = $true
-        show_claude_code = $false; show_codex = $true; show_antigravity = $false
+        show_claude_code = $false; show_codex = $true; show_antigravity = $true
+        show_opencode = $true; show_cursor = $false; show_grok = $false; show_copilot = $false
         show_session_window = $true; show_weekly_window = $true
         poll_interval_ms = 900000; adaptive_refresh = $true; alert_threshold_percent = 0
-        palette = 'system'; bar_style = 'continuous'; bar_thickness = 'standard'; font_size = 'standard'
+        palette = 'system'; bar_style = 'continuous'; bar_thickness = 'standard'; provider_spacing = 'small'; font_size = 'standard'
         window_label_font_size = 9; show_provider_icon = $true
         show_percentage = $true; show_bar = $true; show_reset_time = $true; usage_text_color = $null
         claude_accent = $null; codex_accent = $null; monitor_device = 'smoke-display'; anchor_left = $false
     }
-    effective_language = 'en'; claude_code_available = $false
+    effective_language = 'en'; claude_code_available = $false; codex_available = $true
+    antigravity_available = $false; opencode_available = $false; cursor_available = $true
+    grok_available = $false; copilot_available = $true
     effective_appearance = @{ dark = $false; claude_accent = @(217, 119, 87); codex_accent = @(15, 143, 112) }
     update_busy = $false; update_available = $true; update_status = 'Synthetic update available'; install_channel = 'portable'
     version = 'smoke-test'; languages = @(@{ code = 'en'; name = 'English' })
@@ -134,6 +139,14 @@ function New-PreviewSnapshot([hashtable]$Canonical, [hashtable]$Changes = @{}) {
     if ($Changes.ContainsKey('show_provider_icons')) { $candidate.show_provider_icon = $Changes.show_provider_icons }
     $width = 160
     $height = 24 + 2 * [int]$candidate.window_label_font_size
+    $spacingPixels = switch ([string]$candidate.provider_spacing) {
+        none { 0 }
+        small { 1 }
+        normal { 3 }
+        large { 6 }
+        default { throw "Unknown synthetic provider_spacing value: $($candidate.provider_spacing)" }
+    }
+    $height += $spacingPixels - 1
     $bitmap = [Drawing.Bitmap]::new($width, $height, [Drawing.Imaging.PixelFormat]::Format24bppRgb)
     $graphics = [Drawing.Graphics]::FromImage($bitmap)
     $stream = [IO.MemoryStream]::new()
@@ -189,7 +202,7 @@ function Receive-SmokeRequests {
                 preview {
                     Assert ($request.Count -eq 4 -and $request.changes -is [hashtable]) 'Preview must contain a changes object.'
                     foreach ($key in $request.changes.Keys) {
-                        Assert ($key -in @('palette', 'bar_style', 'bar_thickness', 'font_size', 'window_label_font_size',
+                        Assert ($key -in @('palette', 'bar_style', 'bar_thickness', 'provider_spacing', 'font_size', 'window_label_font_size',
                             'claude_accent', 'codex_accent', 'usage_text_color', 'show_provider_icon', 'show_provider_icons',
                             'show_percentage', 'show_bar', 'show_reset_time')) "Unexpected preview candidate key: $key"
                     }
@@ -214,10 +227,32 @@ function Receive-SmokeRequests {
                         }
                     }
                     Assert ($backend.State.settings.show_percentage -or $backend.State.settings.show_bar -or $backend.State.settings.show_reset_time) 'Native UI submitted an all-hidden usage configuration.'
-                    $backend.Commits.Add($request)
+                    $failSave = $backend.FailNextSetBatchSave
+                    $backend.FailNextSetBatchSave = $false
+                    if (-not $failSave) { $backend.Commits.Add($request) }
                     $backend.Revision++
-                    Write-Frame $backend.Pipe $backend.Process @{ v = 1; id = $request.id; ok = $true;
+                    $response = @{ v = 1; id = $request.id; ok = (-not $failSave);
                         revision = $backend.Revision; state = (New-PreviewSnapshot $backend.State) }
+                    if ($failSave) {
+                        $response.error_code = 'save_failed'
+                        $response.error = 'Synthetic persistence failure.'
+                    }
+                    if ($backend.HoldNextSetBatch) {
+                        $backend.HoldNextSetBatch = $false
+                        $backend.HeldMutationResponse = $response
+                    } else { Write-Frame $backend.Pipe $backend.Process $response }
+                }
+                persist {
+                    $backend.PersistRequests++
+                    $failPersist = $backend.FailNextPersist
+                    $backend.FailNextPersist = $false
+                    $response = @{ v = 1; id = $request.id; ok = (-not $failPersist);
+                        revision = $backend.Revision; state = (New-PreviewSnapshot $backend.State) }
+                    if ($failPersist) {
+                        $response.error_code = 'save_failed'
+                        $response.error = 'Synthetic persistence failure.'
+                    }
+                    Write-Frame $backend.Pipe $backend.Process $response
                 }
                 default { throw "Unexpected backend operation: $($request.op). No requests were forwarded to the widget." }
             }
@@ -252,7 +287,12 @@ function Write-Frame([IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process
     $frame = [byte[]]::new($body.Length + 4)
     [BitConverter]::GetBytes([uint32]$body.Length).CopyTo($frame, 0)
     $body.CopyTo($frame, 4)
-    Wait-SmokeTask ($Pipe.WriteAsync($frame, 0, $frame.Length)) $Process 'writing a synthetic response/event' | Out-Null
+    # A pending frame must finish before request servicing can write another one.
+    $wasServicing = $script:servicingPipe
+    $script:servicingPipe = $true
+    try {
+        Wait-SmokeTask ($Pipe.WriteAsync($frame, 0, $frame.Length)) $Process 'writing a synthetic response/event' | Out-Null
+    } finally { $script:servicingPipe = $wasServicing }
 }
 
 function Find-Control([Windows.Automation.AutomationElement]$Window, [string]$Id) {
@@ -317,7 +357,8 @@ function Assert-NoUnexpectedRequests([IO.Pipes.NamedPipeServerStream]$Pipe) {
     Assert ($script:smokeBackend.Commits.Count -eq $commits) 'A preview-only interaction unexpectedly committed settings.'
 }
 
-function Show-SmokeControl([Windows.Automation.AutomationElement]$Control, [int]$BudgetMs = -1) {
+function Show-SmokeControl([Windows.Automation.AutomationElement]$Control, [int]$BudgetMs = -1,
+    [double]$MinimumVisibleHeight = 1) {
     # Invoke does not reliably scroll WinUI controls into view. Keep screen-color checks
     # inside the actual ScrollViewer viewport rather than sampling clipped content.
     $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
@@ -339,13 +380,13 @@ function Show-SmokeControl([Windows.Automation.AutomationElement]$Control, [int]
     do {
         $bounds = $Control.Current.BoundingRectangle
         $viewport = $ancestor.Current.BoundingRectangle
-        if (-not $Control.Current.IsOffscreen -and $bounds.Height -gt 0 -and
+        if (-not $Control.Current.IsOffscreen -and $bounds.Height -ge $MinimumVisibleHeight -and
             $bounds.Top -ge $viewport.Top -and $bounds.Bottom -le $viewport.Bottom) { return }
         $scroll.Scroll([Windows.Automation.ScrollAmount]::NoAmount, [Windows.Automation.ScrollAmount]::SmallIncrement)
         Start-Sleep -Milliseconds 50
     } while ($clock.ElapsedMilliseconds -lt $BudgetMs)
     $bounds = $Control.Current.BoundingRectangle
-    throw "Could not scroll $($Control.Current.AutomationId) fully into view. Offscreen=$($Control.Current.IsOffscreen) Bounds=$($bounds.Left),$($bounds.Top),$($bounds.Width)x$($bounds.Height)."
+    throw "Could not scroll $($Control.Current.AutomationId) fully into view. Offscreen=$($Control.Current.IsOffscreen) Bounds=$($bounds.Left),$($bounds.Top),$($bounds.Width)x$($bounds.Height), required height=$MinimumVisibleHeight."
 }
 
 function Wait-PreviewColor([Windows.Automation.AutomationElement]$Window,
@@ -455,7 +496,8 @@ function Open-ColorPicker([Windows.Automation.AutomationElement]$Window, [Diagno
     [string]$Key = 'codex_accent') {
     $choose = Find-Control $Window "ChooseColor_$Key"
     Assert ($null -ne $choose -and $choose.Current.Name -ceq 'Choose color…') 'Missing native Choose color button.'
-    Show-SmokeControl $choose
+    $minimumButtonHeight = if ($Key -ceq 'usage_text_color') { 24 } else { 1 }
+    Show-SmokeControl $choose -MinimumVisibleHeight $minimumButtonHeight
     $choose.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
     $clock = [Diagnostics.Stopwatch]::StartNew()
     do {
@@ -464,7 +506,8 @@ function Open-ColorPicker([Windows.Automation.AutomationElement]$Window, [Diagno
         if ($null -ne $root) { return $root }
         Start-Sleep -Milliseconds 50
     } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
-    throw "Choose color did not expose the native $Key RGB picker."
+    $bounds = $choose.Current.BoundingRectangle
+    throw "Choose color did not expose the native $Key RGB picker (button offscreen=$($choose.Current.IsOffscreen), bounds=$($bounds.Left),$($bounds.Top),$($bounds.Width)x$($bounds.Height))."
 }
 
 function Invoke-PickerAction([Windows.Automation.AutomationElement]$Root, [string]$Name,
@@ -485,10 +528,12 @@ function Invoke-PickerAction([Windows.Automation.AutomationElement]$Root, [strin
 }
 
 function Enter-CodexDetail([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process) {
-    $pencil = Find-Control $Window 'EditProvider_show_codex'
-    Assert ($null -ne $pencil) 'Missing Codex pencil button.'
-    Show-SmokeControl $pencil
-    $pencil.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $providerButton = Find-Control $Window 'EditProvider_show_codex'
+    Assert ($null -ne $providerButton) 'Missing unified Codex appearance button.'
+    Assert ($providerButton.Current.ControlType -eq [Windows.Automation.ControlType]::Button) 'Codex provider entry is not a single button.'
+    Assert ($providerButton.Current.Name -ceq 'Codex appearance settings') 'Codex provider button has an unexpected accessible name.'
+    Show-SmokeControl $providerButton
+    $providerButton.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
     $clock = [Diagnostics.Stopwatch]::StartNew()
     do {
         Assert-Running $Process 'opening the Codex appearance detail'
@@ -512,17 +557,81 @@ function Exit-CodexDetail([Windows.Automation.AutomationElement]$Window, [Diagno
     throw 'Appearance provider list did not return after Back.'
 }
 
+function Test-ProviderSpacing([Windows.Automation.AutomationElement]$Window,
+    [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    $combo = Find-Control $Window 'Appearance_provider_spacing'
+    Assert ($null -ne $combo) 'Missing provider spacing selector.'
+    Assert (Test-Selection $combo 'Small') 'Provider spacing did not hydrate to its small default.'
+
+    $options = @(
+        @{ Label = 'None'; Value = 'none'; Pixels = 0 }
+        @{ Label = 'Small'; Value = 'small'; Pixels = 1 }
+        @{ Label = 'Normal'; Value = 'normal'; Pixels = 3 }
+        @{ Label = 'Large'; Value = 'large'; Pixels = 6 }
+    )
+    foreach ($option in $options) {
+        $beforePreviews = $script:smokeBackend.Previews.Count
+        $combo.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+        $item = $combo.FindFirst([Windows.Automation.TreeScope]::Descendants,
+            [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, $option.Label))
+        Assert ($null -ne $item) "Provider spacing is missing option $($option.Label)."
+        $item.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select()
+        $combo.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+
+        $expectedHeight = 41 + [int]$option.Pixels
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $request = $null
+        do {
+            Assert-Running $Process "previewing provider spacing $($option.Value)"
+            if ($script:smokeBackend.Previews.Count -gt $beforePreviews) {
+                $request = $script:smokeBackend.Previews[$script:smokeBackend.Previews.Count - 1]
+                $image = Find-Control $Window 'WidgetPreviewImage'
+                if ($null -ne $image -and
+                    [Math]::Abs($image.Current.BoundingRectangle.Height - $expectedHeight) -le 1) { break }
+            }
+            Start-Sleep -Milliseconds 20
+        } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+        Assert ($null -ne $request) "Changing provider spacing to $($option.Value) did not request a preview."
+        Assert ($request.changes.ContainsKey('provider_spacing') -and
+            $request.changes.provider_spacing -ceq $option.Value) "Preview protocol did not carry provider_spacing=$($option.Value)."
+        Assert ([Math]::Abs($image.Current.BoundingRectangle.Height - $expectedHeight) -le 1) "Provider spacing $($option.Value) did not update the preview height to $expectedHeight px."
+
+        $response = $script:smokeBackend.LastPreviewResponse
+        $data = $response.state.widget_preview_image -replace '^data:image/bmp;base64,', ''
+        $stream = [IO.MemoryStream]::new([Convert]::FromBase64String($data))
+        $bitmap = [Drawing.Bitmap]::new($stream)
+        try {
+            $barY = $expectedHeight - 14
+            Assert ($bitmap.Height -eq $expectedHeight) "Synthetic provider spacing $($option.Value) produced an unexpected bitmap height."
+            Assert ($bitmap.GetPixel(10, $barY).ToArgb().ToString('X8') -ceq 'FF0F8F70') "Synthetic provider spacing $($option.Value) misplaced the provider bar."
+            Assert ($bitmap.GetPixel(10, $barY - 1).ToArgb().ToString('X8') -ceq 'FFF3F3F3') "Synthetic provider spacing $($option.Value) did not preserve the expected row gap."
+        } finally { $bitmap.Dispose(); $stream.Dispose() }
+    }
+
+    Assert ($script:smokeBackend.Commits.Count -eq 0) 'Provider spacing preview committed before the manual save action.'
+    $script:smokeBackend.AllowedChanges.provider_spacing = 'large'
+    Wait-SmokeCommit $Window $Process 0
+    $commit = $script:smokeBackend.Commits[$script:smokeBackend.Commits.Count - 1]
+    Assert ($commit.changes.Count -eq 1 -and $commit.changes[0].key -ceq 'provider_spacing' -and
+        $commit.changes[0].value -ceq 'large') 'Manual save did not submit the selected provider spacing value.'
+    Assert ($script:smokeBackend.State.settings.provider_spacing -ceq 'large') 'Manual save did not update the authoritative provider spacing value.'
+    Assert-NoUnexpectedRequests $Pipe
+    Write-Host 'Provider spacing verified: default small, none/small/normal/large preview geometry, wire values, and manual save.'
+}
+
 function Test-AppearanceDraftPreview([Windows.Automation.AutomationElement]$Window,
     [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
     foreach ($entry in @{
         Appearance_palette = 'Follow Windows'
         Appearance_bar_style = 'Continuous'
         Appearance_bar_thickness = 'Standard'
+        Appearance_provider_spacing = 'Small'
         Appearance_font_size = 'Standard'
     }.GetEnumerator()) {
         $control = Find-Control $Window $entry.Key
         Assert ($null -ne $control -and (Test-Selection $control $entry.Value)) "Incorrect hydrated Appearance selection: $($entry.Key)"
     }
+    Test-ProviderSpacing $Window $Pipe $Process
     foreach ($entry in @{
         AppearancePreview = 'Live widget preview · sample values'
         AppearancePreviewSummary = 'This image is rendered by the widget using sample usage data.'
@@ -566,6 +675,7 @@ function Test-AppearanceDraftPreview([Windows.Automation.AutomationElement]$Wind
     Test-StaleBitmapPreview $Window $Pipe $Process
     Test-UsageTextColor $Window $Pipe $Process
     Test-WidgetControls $Window $Pipe $Process
+    Test-ProviderAvailability $Window $Pipe $Process
     Write-Host 'Appearance verified: BMP transport, preview-only drafts, stale preview response, RGB picker, usage-text Apply/Discard, label font sizes, provider marks and visibility guard.'
 }
 
@@ -610,6 +720,119 @@ function Wait-SmokeCommit([Windows.Automation.AutomationElement]$Window, [Diagno
         Start-Sleep -Milliseconds 20
     } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
     throw 'The native UI did not acknowledge the authorized setting batch.'
+}
+
+function Select-SettingsCombo([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process,
+    [string]$Id, [string]$Option) {
+    $combo = Find-Control $Window $Id
+    Assert ($null -ne $combo) "Missing settings selector: $Id"
+    Show-SmokeControl $combo
+    $combo.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $item = $combo.FindFirst([Windows.Automation.TreeScope]::Descendants,
+        [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, $Option))
+    Assert ($null -ne $item) "Missing $Option option in $Id."
+    $item.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $combo.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+    Assert (Test-Selection $combo $Option) "$Id did not select $Option."
+}
+
+function Test-SaveBarTransitions([Windows.Automation.AutomationElement]$Window,
+    [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    Select-SettingsCombo $Window $Process 'Appearance_bar_style' 'Segmented'
+    Assert-NoUnexpectedRequests $Pipe
+    Assert ($script:smokeBackend.Commits.Count -eq 0) 'Changing widget style committed before the user pressed Save changes.'
+    $script:smokeBackend.AllowedChanges.bar_style = 'segmented'
+    $script:smokeBackend.HoldNextSetBatch = $true
+    (Find-Control $Window 'SavePendingChanges').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($null -eq $script:smokeBackend.HeldMutationResponse -and $clock.ElapsedMilliseconds -lt $timeoutMilliseconds) {
+        Assert-Running $Process 'waiting for the delayed settings save'
+        Start-Sleep -Milliseconds 20
+    }
+    Assert ($null -ne $script:smokeBackend.HeldMutationResponse) 'The synthetic backend did not hold the requested save response.'
+    $saveBar = Find-Control $Window 'SaveBar'
+    Assert ($null -eq $saveBar -or $saveBar.Current.IsOffscreen) 'The Unsaved changes bar stayed visible while the save was applying.'
+    $applying = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Applying changes…')
+    Assert ($null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $applying)) 'The UI did not identify the in-progress save as Applying changes….'
+
+    Select-SettingsCombo $Window $Process 'Appearance_font_size' 'Large'
+    $clock.Restart()
+    $saveButton = $null
+    do {
+        Assert-Running $Process 'restoring the Unsaved changes bar for the queued edit'
+        $saveButton = Find-Control $Window 'SavePendingChanges'
+        if ($null -ne $saveButton -and -not $saveButton.Current.IsOffscreen) { break }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    Assert ($null -ne $saveButton -and -not $saveButton.Current.IsOffscreen) 'A queued edit made while saving did not restore the Unsaved changes bar.'
+    $beforeFirstCommit = $script:smokeBackend.Commits.Count - 1
+    Write-Frame $Pipe $Process $script:smokeBackend.HeldMutationResponse
+    $script:smokeBackend.HeldMutationResponse = $null
+    $clock.Restart()
+    do {
+        Assert-Running $Process 'acknowledging the delayed settings save'
+        $saved = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Saved. Changes are now in effect.')
+        if ($null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $saved)) { break }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    Assert ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds) 'The delayed settings save did not complete successfully.'
+    Assert ($script:smokeBackend.Commits.Count -gt $beforeFirstCommit) 'The delayed settings change was not recorded by the backend.'
+    $saveButton = Find-Control $Window 'SavePendingChanges'
+    Assert ($null -ne $saveButton -and -not $saveButton.Current.IsOffscreen) 'The queued unsaved edit disappeared after the first save completed.'
+
+    $script:smokeBackend.AllowedChanges.Clear()
+    $script:smokeBackend.AllowedChanges.font_size = 'large'
+    $before = $script:smokeBackend.Commits.Count
+    Wait-SmokeCommit $Window $Process $before
+    $saveBar = Find-Control $Window 'SaveBar'
+    Assert ($null -eq $saveBar -or $saveBar.Current.IsOffscreen) 'The Unsaved changes bar did not hide after all queued edits were saved.'
+    Assert ($script:smokeBackend.State.settings.font_size -ceq 'large') 'The queued font-size edit was not saved.'
+
+    Select-SettingsCombo $Window $Process 'Appearance_bar_thickness' 'Slim'
+    $script:smokeBackend.AllowedChanges.Clear()
+    $script:smokeBackend.AllowedChanges.bar_thickness = 'slim'
+    $script:smokeBackend.FailNextSetBatchSave = $true
+    $script:smokeBackend.FailNextPersist = $true
+    $persistBefore = $script:smokeBackend.PersistRequests
+    $clock.Restart()
+    $saveButton = $null
+    do {
+        Assert-Running $Process 'showing the manual save action after the failed-save test edit'
+        $saveButton = Find-Control $Window 'SavePendingChanges'
+        if ($null -ne $saveButton -and -not $saveButton.Current.IsOffscreen) { break }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    Assert ($null -ne $saveButton -and -not $saveButton.Current.IsOffscreen) 'The failed-save setting did not expose the manual save action.'
+    $saveButton.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $clock.Restart()
+    do {
+        Assert-Running $Process 'recovering the failed settings persistence'
+        $failure = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Synthetic persistence failure.')
+        $saveButton = Find-Control $Window 'SavePendingChanges'
+        if ($script:smokeBackend.PersistRequests -gt $persistBefore -and $null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $failure) -and
+            $null -ne $saveButton -and -not $saveButton.Current.IsOffscreen) { break }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    Assert ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds) 'A failed persist did not restore the Unsaved changes action.'
+    Assert ($script:smokeBackend.PersistRequests -eq $persistBefore + 1) 'The failed save did not reach its persistence attempt.'
+
+    $script:smokeBackend.AllowedChanges.Clear()
+    $script:smokeBackend.FailNextPersist = $false
+    $persistBefore = $script:smokeBackend.PersistRequests
+    $saveButton.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $clock.Restart()
+    do {
+        Assert-Running $Process 'confirming the manual save retry'
+        $saved = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Changes saved.')
+        $saveBar = Find-Control $Window 'SaveBar'
+        if ($script:smokeBackend.PersistRequests -gt $persistBefore -and $null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $saved) -and
+            ($null -eq $saveBar -or $saveBar.Current.IsOffscreen)) { break }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    Assert ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds) 'Successful persistence retry did not clear the Unsaved changes bar.'
+    Assert ($script:smokeBackend.State.settings.bar_thickness -ceq 'slim') 'The failed-save setting was not retained for the successful retry.'
+    Write-Host 'Save bar verified: hidden while applying, restored for queued edits and failed persistence, hidden after successful retry.'
 }
 
 function Test-StaleBitmapPreview([Windows.Automation.AutomationElement]$Window,
@@ -713,7 +936,15 @@ function Test-WidgetControls([Windows.Automation.AutomationElement]$Window,
         Wait-SmokeCommit $Window $Process $before
         $image = Wait-BitmapPreview $Window $Process
         $bounds = $image.Current.BoundingRectangle
-        Assert ([Math]::Abs($bounds.Width - 160) -le 2 -and [Math]::Abs($bounds.Height - (24 + 2 * $size)) -le 2) 'Bitmap physical dimensions did not match the selected label size.'
+        $spacingPixels = switch ([string]$script:smokeBackend.State.settings.provider_spacing) {
+            none { 0 }
+            small { 1 }
+            normal { 3 }
+            large { 6 }
+            default { throw "Unknown synthetic provider_spacing value: $($script:smokeBackend.State.settings.provider_spacing)" }
+        }
+        $expectedHeight = 24 + 2 * $size + $spacingPixels - 1
+        Assert ([Math]::Abs($bounds.Width - 160) -le 2 -and [Math]::Abs($bounds.Height - $expectedHeight) -le 2) 'Bitmap physical dimensions did not match the selected label size and provider spacing.'
     }
     Select-Page $Window $Process 'General'
     Set-SmokeToggle $Window $Process 'Setting_show_provider_icons' 'show_provider_icons' $false
@@ -748,6 +979,64 @@ function Test-WidgetControls([Windows.Automation.AutomationElement]$Window,
     Wait-PreviewColor $Window $Process '#0F8F70'
     Wait-PreviewColor $Window $Process '#8030C0'
     Assert-NoUnexpectedRequests $Pipe
+}
+
+function Test-ProviderAvailability([Windows.Automation.AutomationElement]$Window,
+    [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    $tile = Find-Control $Window 'EditProvider_show_antigravity'
+    Assert ($null -ne $tile) 'Missing enabled Antigravity appearance entry for the unavailable-provider detail test.'
+    Show-SmokeControl $tile
+    $tile.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $detailToggle = Find-Control $Window 'Setting_show_antigravity'
+    Assert ($null -ne $detailToggle -and $detailToggle.Current.IsEnabled) 'An enabled but unavailable provider could not be switched off in its Appearance detail.'
+    Assert ($detailToggle.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq [Windows.Automation.ToggleState]::On) 'Antigravity detail did not hydrate as enabled.'
+    $detailCopy = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,
+        'No local Antigravity credentials or configuration were detected. Turn this off, or set up Antigravity to resume monitoring.')
+    Assert ($null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $detailCopy)) 'Antigravity detail did not explain its missing local setup.'
+
+    $script:smokeBackend.AllowedChanges.show_antigravity = $false
+    $before = $script:smokeBackend.Commits.Count
+    $detailToggle.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
+    Assert ($detailToggle.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq [Windows.Automation.ToggleState]::Off -and
+        -not $detailToggle.Current.IsEnabled) 'Turning off an unavailable detail provider did not disable its switch.'
+    Wait-SmokeCommit $Window $Process $before
+    Assert ($script:smokeBackend.State.settings.show_antigravity -eq $false) 'Appearance detail did not save the unavailable provider as disabled.'
+    (Find-Control $Window 'ProviderDetailBack').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+
+    Select-Page $Window $Process 'Monitoring'
+    $expected = @(
+        @{ Key = 'show_claude_code'; Enabled = $false; Available = $false }
+        @{ Key = 'show_codex'; Enabled = $true; Available = $true }
+        @{ Key = 'show_antigravity'; Enabled = $false; Available = $false }
+        @{ Key = 'show_opencode'; Enabled = $true; Available = $false }
+        @{ Key = 'show_cursor'; Enabled = $false; Available = $true }
+        @{ Key = 'show_grok'; Enabled = $false; Available = $false }
+        @{ Key = 'show_copilot'; Enabled = $false; Available = $true }
+    )
+    foreach ($provider in $expected) {
+        $toggle = Find-Control $Window "Setting_$($provider.Key)"
+        Assert ($null -ne $toggle) "Missing Monitoring switch for $($provider.Key)."
+        $state = $toggle.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState
+        Assert (($state -eq [Windows.Automation.ToggleState]::On) -eq $provider.Enabled) "Incorrect hydrated Monitoring state for $($provider.Key)."
+        Assert ($toggle.Current.IsEnabled -eq ($provider.Available -or $provider.Enabled)) "Incorrect availability gate for $($provider.Key)."
+    }
+    $claudeCopy = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,
+        'No local Claude CLI credentials or configuration were detected. Set up Claude CLI to enable monitoring.')
+    Assert ($null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $claudeCopy)) 'Unavailable Claude Code did not explain how to enable monitoring.'
+    $openCode = Find-Control $Window 'Setting_show_opencode'
+    $openCodeCopy = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,
+        'No local OpenCode Go credentials or configuration were detected. Turn this off, or set up OpenCode Go to resume monitoring.')
+    Assert ($null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $openCodeCopy)) 'Unavailable OpenCode did not explain its enabled state.'
+
+    $script:smokeBackend.AllowedChanges.show_opencode = $false
+    $before = $script:smokeBackend.Commits.Count
+    $openCode.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
+    Assert ($openCode.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq [Windows.Automation.ToggleState]::Off -and
+        -not $openCode.Current.IsEnabled) 'Monitoring could not turn off an unavailable enabled provider.'
+    Wait-SmokeCommit $Window $Process $before
+    Assert ($script:smokeBackend.State.settings.show_opencode -eq $false) 'Monitoring did not save the unavailable provider as disabled.'
+    Select-Page $Window $Process 'Appearance'
+    Write-Host 'Provider availability verified across Monitoring and Appearance detail: missing-setup copy, disabled unavailable/off switches, and saving unavailable/on switches off.'
 }
 
 function Request-WindowClose([IntPtr]$Window, [Diagnostics.Process]$Process) {
@@ -839,7 +1128,8 @@ function Open-Notices([Windows.Automation.AutomationElement]$Window, [Diagnostic
 }
 
 function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll = $false,
-    [bool]$DraftCloseCancellation = $false, [bool]$Notices = $false, [bool]$UpdateAvailable = $true) {
+    [bool]$DraftCloseCancellation = $false, [bool]$Notices = $false, [bool]$UpdateAvailable = $true,
+    [bool]$SaveStateOnly = $false) {
     $process = $null
     $pipe = $null
     $script:smokeBackend = $null
@@ -886,6 +1176,8 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
             Pipe = $pipe; Process = $process; State = $caseSnapshot; Revision = 1
             AllowedChanges = @{}; Commits = [Collections.Generic.List[object]]::new()
             Previews = [Collections.Generic.List[object]]::new(); HoldNextPreview = $false; HeldPreview = $null
+            HoldNextSetBatch = $false; HeldMutationResponse = $null; FailNextSetBatchSave = $false
+            FailNextPersist = $false; PersistRequests = 0
         }
         Write-Frame $pipe $process @{ v = 1; id = $request.id; ok = $true; revision = 1; state = (New-PreviewSnapshot $caseSnapshot) }
 
@@ -910,15 +1202,29 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
             $manualCheck = Find-Control $window 'CheckForUpdates'
             Assert ($null -ne $manualCheck -and $manualCheck.Current.Name -ceq 'Check for updates') 'About did not offer a manual update check.'
         }
+        else {
+            $updateNavigation = Find-Control $window 'NavigationUpdate'
+            Assert ($null -ne $updateNavigation -and -not $updateNavigation.Current.IsOffscreen) 'Update navigation did not appear when an update was available.'
+            $updateBadgeCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Update available')
+            $updateBadge = $window.FindFirst([Windows.Automation.TreeScope]::Descendants, $updateBadgeCondition)
+            Assert ($null -ne $updateBadge -and -not $updateBadge.Current.IsOffscreen) 'The available-update dot was not exposed with the Update navigation item.'
+        }
         Write-Host "$Page startup: PID $($process.Id), get received, HWND $($result.HWND), hydrated page ready after $($clock.ElapsedMilliseconds) ms."
         if ($NavigateAll) {
             foreach ($next in $pages) { Select-Page $window $process $next }
             $result.Navigated = $pages -join ', '
             Write-Host "Navigation verified: $($result.Navigated)."
         }
-        if ($DraftCloseCancellation) {
-            Assert ($Page -ceq 'Appearance') 'Draft cancellation requires the Appearance startup route.'
+        $runAppearanceValidation = $DraftCloseCancellation -or ($AppearanceOnly -and $Page -ceq 'Appearance')
+        if ($runAppearanceValidation) {
+            Assert ($Page -ceq 'Appearance') 'Appearance validation requires the Appearance startup route.'
             Test-AppearanceDraftPreview $window $pipe $process
+        }
+        if ($SaveStateOnly) {
+            Assert ($Page -ceq 'Appearance') 'Save-state validation requires the Appearance startup route.'
+            Test-SaveBarTransitions $window $pipe $process
+        }
+        elseif ($DraftCloseCancellation) {
             Test-DraftCloseCancellation $window $hwnd $pipe $process
             Test-DraftCloseCancellation $window $hwnd $pipe $process 'usage_text_color'
             $result.DraftCancel = $true
@@ -970,6 +1276,8 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
         $result.Status = 'Passed'
     } catch {
         $result.Error = $_.Exception.Message
+        Write-Host "Failure stack: $($_.ScriptStackTrace)"
+        if ($null -ne $process -and $process.HasExited) { Write-Host "Companion exit: $(Get-ExitDescription $process)" }
         if ($null -ne $process -and $process.HasExited) { $result.ExitCode = Get-ExitDescription $process }
         $diagnostic = Join-Path $profileDirectory 'CodexUsage-SettingsUI-startup.log'
         if (Test-Path -LiteralPath $diagnostic -PathType Leaf) {
@@ -1004,7 +1312,7 @@ try {
     }
     Write-Host "Companion: $companion"
     Write-Host "SettingsUI.exe SHA-256: $($hashes['SettingsUI.exe'])"
-    foreach ($case in @(
+    $cases = @(
         @{ Page = 'General'; CloseMode = 'Shutdown'; NavigateAll = $true },
         @{ Page = 'Monitoring'; CloseMode = 'Disconnect' },
         @{ Page = 'Appearance'; CloseMode = 'WindowClose'; DraftCloseCancellation = $true },
@@ -1014,7 +1322,10 @@ try {
         @{ Page = 'About'; CloseMode = 'WindowCloseDisconnect' },
         @{ Page = 'About'; CloseMode = 'Shutdown'; Notices = $true },
         @{ Page = 'About'; CloseMode = 'Shutdown'; UpdateAvailable = $false }
-    )) { $results.Add((Invoke-SmokeCase @case)) }
+    )
+    if ($SaveStateOnly) { $cases = @(@{ Page = 'Appearance'; CloseMode = 'WindowClose'; SaveStateOnly = $true }) }
+    elseif ($AppearanceOnly) { $cases = @(@{ Page = 'Appearance'; CloseMode = 'WindowClose' }) }
+    foreach ($case in $cases) { $results.Add((Invoke-SmokeCase @case)) }
     foreach ($name in $names) {
         Assert ((Get-FileHash -LiteralPath (Join-Path $companion $name) -Algorithm SHA256).Hash -ceq $hashes[$name]) "Payload changed during smoke testing: $name. Re-run against a stable published copy."
     }
@@ -1024,7 +1335,9 @@ try {
         $failed | Format-List Page, Close, PID, Error
         throw "$($failed.Count) Settings UI smoke test(s) failed."
     }
-    Write-Host 'Passed: all six startup routes and page navigation; shutdown/disconnect/window close and immediate EOF races with exit code 0; canceled draft close followed by discard/reuse/close; open notices cleaned up on shutdown.'
+    if ($SaveStateOnly) { Write-Host 'Passed: focused save-state transitions and close validation.' }
+    elseif ($AppearanceOnly) { Write-Host 'Passed: focused Appearance behavior and close validation.' }
+    else { Write-Host 'Passed: all six startup routes and page navigation; shutdown/disconnect/window close and immediate EOF races with exit code 0; canceled draft close followed by discard/reuse/close; open notices cleaned up on shutdown.' }
 } finally {
     # Only this invocation's random test root and owned child processes are cleaned up.
     Remove-Item -LiteralPath $root -Recurse -Force

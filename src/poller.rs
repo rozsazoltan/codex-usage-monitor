@@ -71,6 +71,18 @@ pub enum CredentialWatchMode {
 
 pub type CredentialWatchSnapshot = Vec<String>;
 
+/// Local credential presence only; this never probes provider endpoints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProviderAvailability {
+    pub claude_code_available: bool,
+    pub codex_available: bool,
+    pub antigravity_available: bool,
+    pub opencode_available: bool,
+    pub cursor_available: bool,
+    pub grok_available: bool,
+    pub copilot_available: bool,
+}
+
 #[derive(Deserialize)]
 struct UsageResponse {
     five_hour: Option<UsageBucket>,
@@ -225,6 +237,21 @@ pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
 /// Claude Desktop authentication is intentionally not treated as CLI access.
 pub fn claude_code_credentials_available() -> bool {
     read_first_credentials().is_some()
+}
+
+/// Check each provider's local credential sources without making network calls.
+pub fn provider_availability() -> ProviderAvailability {
+    ProviderAvailability {
+        claude_code_available: claude_code_credentials_available(),
+        codex_available: read_codex_credentials().is_some(),
+        antigravity_available: read_antigravity_credentials().is_some(),
+        opencode_available: read_opencode_credentials().is_some(),
+        cursor_available: read_cursor_session_cookie().is_some(),
+        grok_available: grok_auth_path()
+            .and_then(|path| read_grok_session(&path))
+            .is_some(),
+        copilot_available: !copilot_token_candidates().is_empty(),
+    }
 }
 
 fn poll_claude_code() -> Result<UsageData, PollError> {

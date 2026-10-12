@@ -411,14 +411,16 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
                 HWND_TOP,
             )
         } else {
+            // Taskbar visibility comes from the Explorer parent in child mode.
+            // A floating fallback is ordinary non-activating UI, not a global
+            // always-on-top window that can cover capture/system overlays.
             (
                 ((old.style as u32 & !WS_CHILD_STYLE) | WS_POPUP_STYLE) as i32,
-                old.ex_style
+                (old.ex_style & !WS_EX_TOPMOST.0 as i32)
                     | WS_EX_LAYERED.0 as i32
                     | WS_EX_TOOLWINDOW.0 as i32
-                    | WS_EX_NOACTIVATE.0 as i32
-                    | WS_EX_TOPMOST.0 as i32,
-                HWND_TOPMOST,
+                    | WS_EX_NOACTIVATE.0 as i32,
+                HWND_NOTOPMOST,
             )
         };
 
@@ -529,25 +531,20 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
     }
 }
 
-/// Reposition an already configured child/popup without activating it.
-pub fn position_window(hwnd: HWND, parent: Option<HWND>, position: WindowPosition) -> bool {
+/// Reposition without activating or raising the widget over transient UI.
+pub fn position_window(hwnd: HWND, _parent: Option<HWND>, position: WindowPosition) -> bool {
     if position.width <= 0 || position.height <= 0 {
         return false;
     }
-    let insert_after = if parent.is_some() {
-        HWND_TOP
-    } else {
-        HWND_TOPMOST
-    };
     unsafe {
         SetWindowPos(
             hwnd,
-            insert_after,
+            None,
             position.x,
             position.y,
             position.width,
             position.height,
-            SWP_NOACTIVATE,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
         )
         .is_ok()
     }
@@ -559,6 +556,107 @@ mod attachment_tests {
     use windows::core::w;
     use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
     use windows::Win32::Graphics::Gdi::*;
+
+    #[test]
+    fn repeated_placement_preserves_floating_and_child_z_order() {
+        unsafe {
+            let widget = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("placement-test"),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                30,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let position = WindowPosition {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 30,
+            };
+            assert!(set_window_mode(widget, None, position));
+            let overlay = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("overlay-test"),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                30,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let previous = GetWindow(widget, GW_HWNDPREV).unwrap();
+            for offset in 0..5 {
+                assert!(position_window(
+                    widget,
+                    None,
+                    WindowPosition {
+                        x: 10 + offset,
+                        ..position
+                    }
+                ));
+                assert_eq!(
+                    GetWindowLongW(widget, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,
+                    0
+                );
+                assert_eq!(GetWindow(widget, GW_HWNDPREV).unwrap(), previous);
+            }
+            assert!(set_window_mode(widget, Some(overlay), position));
+            let sibling = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("sibling-test"),
+                WS_CHILD,
+                0,
+                0,
+                100,
+                30,
+                overlay,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            SetWindowPos(
+                sibling,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            )
+            .unwrap();
+            let previous = GetWindow(widget, GW_HWNDPREV).unwrap_or_default();
+            assert_eq!(previous, sibling);
+            for offset in 0..5 {
+                assert!(position_window(
+                    widget,
+                    Some(overlay),
+                    WindowPosition {
+                        x: 10 + offset,
+                        ..position
+                    }
+                ));
+                assert_eq!(GetWindow(widget, GW_HWNDPREV).unwrap_or_default(), previous);
+            }
+            let _ = DestroyWindow(sibling);
+            let _ = DestroyWindow(widget);
+            let _ = DestroyWindow(overlay);
+        }
+    }
 
     unsafe fn update_test_layered_surface(hwnd: HWND) -> windows::core::Result<()> {
         let mut client_rect = RECT::default();
@@ -929,7 +1027,7 @@ mod attachment_tests {
                 GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0,
                 0
             );
-            assert_ne!(
+            assert_eq!(
                 GetWindowLongW(child, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,
                 0
             );

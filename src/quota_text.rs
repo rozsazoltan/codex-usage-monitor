@@ -45,7 +45,7 @@ pub unsafe fn create_reset_font(height: i32) -> HFONT {
     )
 }
 
-fn parts(text: &str) -> (&str, &str) {
+pub(crate) fn parts(text: &str) -> (&str, &str) {
     if let Some(end) = text.find('%') {
         if text[..end].chars().all(|c| c.is_ascii_digit()) && end > 0 {
             return (
@@ -188,5 +188,7 @@ mod tests {
         assert_eq!(parts("18% · 2h 34m"), ("18%", "2h 34m"));
         assert_eq!(parts("--"), ("--", ""));
         assert_eq!(parts("网络"), ("网络", ""));
+        assert_eq!(parts("error% details"), ("error% details", ""));
+        assert_eq!(parts("18% • 2h"), ("18%", "• 2h"));
     }
 }

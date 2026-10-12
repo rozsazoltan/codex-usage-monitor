@@ -12,6 +12,7 @@ use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
+use windows::Win32::UI::Controls::{NMHDR, TTN_SHOW};
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::{ExtractIconExW, ShellExecuteW};
@@ -94,7 +95,7 @@ struct AppState {
     copilot_session_text: String,
     copilot_weekly_percent: f64,
     copilot_weekly_text: String,
-    claude_code_available: bool,
+    provider_availability: poller::ProviderAvailability,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -583,6 +584,81 @@ enum FontSize {
     Large,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderSpacing {
+    None,
+    #[default]
+    Small,
+    Normal,
+    Large,
+}
+
+impl ProviderSpacing {
+    fn scaled_gap(self) -> i32 {
+        sc(match self {
+            Self::None => 0,
+            Self::Small => 2,
+            Self::Normal => 5,
+            Self::Large => 9,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProviderId {
+    Claude,
+    Codex,
+    Antigravity,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    Cursor,
+    Grok,
+    Copilot,
+}
+
+impl ProviderId {
+    const ALL: [Self; 7] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Antigravity,
+        Self::OpenCode,
+        Self::Cursor,
+        Self::Grok,
+        Self::Copilot,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Claude => 0,
+            Self::Codex => 1,
+            Self::Antigravity => 2,
+            Self::OpenCode => 3,
+            Self::Cursor => 4,
+            Self::Grok => 5,
+            Self::Copilot => 6,
+        }
+    }
+}
+
+fn default_provider_order() -> [ProviderId; 7] {
+    ProviderId::ALL
+}
+
+fn valid_provider_order(order: &[ProviderId; 7]) -> bool {
+    order.iter().copied().collect::<HashSet<_>>().len() == ProviderId::ALL.len()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderIconPosition {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct Appearance {
@@ -590,6 +666,13 @@ struct Appearance {
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
+    provider_spacing: ProviderSpacing,
+    #[serde(default = "default_provider_order")]
+    provider_order: [ProviderId; 7],
+    #[serde(default)]
+    provider_icon_position: ProviderIconPosition,
+    #[serde(default)]
+    provider_monochrome: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_accent: Option<[u8; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -626,6 +709,10 @@ impl Default for Appearance {
             bar_style: BarStyle::default(),
             bar_thickness: BarThickness::default(),
             font_size: FontSize::default(),
+            provider_spacing: ProviderSpacing::default(),
+            provider_order: default_provider_order(),
+            provider_icon_position: ProviderIconPosition::default(),
+            provider_monochrome: false,
             claude_accent: None,
             codex_accent: None,
             antigravity_accent: None,
@@ -884,6 +971,9 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
         settings.appearance.show_provider_icon = false;
     }
     settings.show_provider_icons = settings.appearance.show_provider_icon;
+    if !valid_provider_order(&settings.appearance.provider_order) {
+        settings.appearance.provider_order = default_provider_order();
+    }
     if !settings.appearance.show_percentage
         && !settings.appearance.show_bar
         && !settings.appearance.show_reset_time
@@ -1233,68 +1323,61 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
         Some(s) if s.has_poll_result => {
             let mut services = Vec::new();
             let strings = s.language.strings();
-            if s.show_claude_code {
-                services.push(service_tooltip(
+            let providers = [
+                (
+                    s.show_claude_code,
                     strings.claude_code_model,
                     &s.session_text,
                     &s.weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
-            }
-            if s.show_codex {
-                services.push(service_tooltip(
+                ),
+                (
+                    s.show_codex,
                     strings.codex_model,
                     &s.codex_session_text,
                     &s.codex_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
-            }
-            if s.show_antigravity {
-                services.push(service_tooltip(
+                ),
+                (
+                    s.show_antigravity,
                     strings.antigravity_model,
                     &s.antigravity_session_text,
                     &s.antigravity_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
-            }
-            if s.show_opencode {
-                services.push(service_tooltip(
+                ),
+                (
+                    s.show_opencode,
                     strings.opencode_model,
                     &s.opencode_session_text,
                     &s.opencode_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
-            }
-            if s.show_cursor {
-                services.push(service_tooltip(
+                ),
+                (
+                    s.show_cursor,
                     strings.cursor_model,
                     &s.cursor_session_text,
                     &s.cursor_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
-            }
-            if s.show_grok {
-                services.push(service_tooltip(
+                ),
+                (
+                    s.show_grok,
                     strings.grok_model,
                     &s.grok_session_text,
                     &s.grok_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
-            }
-            if s.show_copilot {
-                services.push(service_tooltip(
+                ),
+                (
+                    s.show_copilot,
                     strings.copilot_model,
                     &s.copilot_session_text,
                     &s.copilot_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
+                ),
+            ];
+            for provider_id in s.appearance.provider_order {
+                let (enabled, name, session, weekly) = providers[provider_id.index()];
+                if enabled {
+                    services.push(service_tooltip(
+                        name,
+                        session,
+                        weekly,
+                        s.show_session_window,
+                        s.show_weekly_window,
+                    ));
+                }
             }
             Some(tray_icon::TrayIconData {
                 tooltip: if services.is_empty() {
@@ -1361,20 +1444,24 @@ fn toggle_widget_visibility(hwnd: HWND) {
         }
     };
     save_state_settings();
-    unsafe {
-        if new_visible {
-            position_at_taskbar();
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            render_layered();
-        } else {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
+    if new_visible {
+        position_at_taskbar();
+        set_widget_visibility(hwnd, true);
+        render_layered();
+    } else {
+        set_widget_visibility(hwnd, false);
     }
 }
 
 fn set_widget_visibility(hwnd: HWND, visible: bool) {
     unsafe {
-        let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        // Placement retries must not repeatedly show/raise an already visible
+        // widget. Inspect its own visibility bit: Explorer may hide the parent
+        // for auto-hide or full-screen UI without changing our desired state.
+        let shown = GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+        if shown != visible {
+            let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        }
     }
 }
 
@@ -2665,7 +2752,6 @@ const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 110;
 const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
 const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 138;
-const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
@@ -2839,7 +2925,7 @@ fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: 
         + label_width
         + sc(LABEL_RIGHT_MARGIN)
         + model_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
+        + appearance.provider_spacing.scaled_gap() * (active_models - 1)
         + sc(RIGHT_MARGIN)
 }
 
@@ -3003,8 +3089,8 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
-        let claude_code_available = poller::claude_code_credentials_available();
-        let mut settings = load_settings(claude_code_available);
+        let provider_availability = poller::provider_availability();
+        let mut settings = load_settings(provider_availability.claude_code_available);
         let startup_monitors = native_interop::find_monitors();
         let startup_taskbars = native_interop::find_taskbars();
         let startup_legacy_taskbar_devices: Vec<_> = startup_taskbars
@@ -3123,7 +3209,7 @@ pub fn run() {
                 copilot_session_text: "--".to_string(),
                 copilot_weekly_percent: 0.0,
                 copilot_weekly_text: "--".to_string(),
-                claude_code_available,
+                provider_availability,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -3303,13 +3389,12 @@ fn update_quota_tooltips() {
                 s.show_grok,
                 s.show_copilot,
             );
-            let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
-            let width = model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
+            let (label_width, _) = usage_layout_widths(s.language, s.appearance);
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + label_width
                 + sc(LABEL_RIGHT_MARGIN);
-            for (id, visible, name, session, weekly) in [
+            let tooltip_providers = [
                 (
                     0,
                     s.show_claude_code,
@@ -3359,10 +3444,30 @@ fn update_quota_tooltips() {
                     &s.copilot_session_text,
                     &s.copilot_weekly_text,
                 ),
-            ] {
+            ];
+            for provider_id in s.appearance.provider_order {
+                let (id, visible, name, session, weekly) = tooltip_providers[provider_id.index()];
                 if !visible {
                     continue;
                 }
+                // Match the compact provider columns used by paint_content,
+                // rather than the worst-case width reserved by the window.
+                let dc = unsafe { GetDC(s.hwnd.to_hwnd()) };
+                let text_width = (if s.show_session_window {
+                    usage_value_width(dc, session, s.appearance)
+                } else {
+                    0
+                })
+                .max(if s.show_weekly_window {
+                    usage_value_width(dc, weekly, s.appearance)
+                } else {
+                    0
+                });
+                unsafe {
+                    ReleaseDC(s.hwnd.to_hwnd(), dc);
+                }
+                let width =
+                    model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
                 let description =
                     s.monitor.services[id].description(SystemTime::now(), Instant::now(), chinese);
                 let mut text = format!("{name}\n{description}");
@@ -3390,7 +3495,7 @@ fn update_quota_tooltips() {
                     },
                     text,
                 ));
-                left += width + sc(MODEL_RIGHT_MARGIN);
+                left += width + s.appearance.provider_spacing.scaled_gap();
             }
         }
         (s.hwnd.to_hwnd(), regions)
@@ -3675,6 +3780,18 @@ fn render_layered() {
 }
 
 /// Paint all widget content onto a DC with a given background color.
+#[derive(Clone, Copy)]
+struct WidgetProvider<'a> {
+    enabled: bool,
+    show_icon: bool,
+    icon: Provider,
+    session_percent: f64,
+    session_text: &'a str,
+    weekly_percent: f64,
+    weekly_text: &'a str,
+    accent: &'a Color,
+}
+
 fn paint_content(
     hdc: HDC,
     width: i32,
@@ -3748,7 +3865,7 @@ fn paint_content(
         let grok_weekly_pct = usage_percent_for_display(language, grok_weekly_pct);
         let copilot_session_pct = usage_percent_for_display(language, copilot_session_pct);
         let copilot_weekly_pct = usage_percent_for_display(language, copilot_weekly_pct);
-        let (label_width, text_width) = usage_layout_widths(language, appearance);
+        let (label_width, _) = usage_layout_widths(language, appearance);
 
         let client_rect = RECT {
             left: 0,
@@ -3815,12 +3932,20 @@ fn paint_content(
         let font = create_widget_font(appearance);
         let old_font = SelectObject(hdc, font);
 
-        // Anchor provider marks to first row instead of floating at widget center.
+        // Keep the default aligned with the first row while allowing the user to
+        // center marks or align them with the lower row.
         let icon_size = sc(provider_icons::SIZE);
-        let icon_y = if show_session_window && show_weekly_window {
-            row1_y + (appearance.row_height() - icon_size) / 2
-        } else {
-            single_row_y + (appearance.row_height() - icon_size) / 2
+        let icon_y = match appearance.provider_icon_position {
+            ProviderIconPosition::Top if show_session_window && show_weekly_window => {
+                row1_y + (appearance.row_height() - icon_size) / 2
+            }
+            ProviderIconPosition::Bottom if show_session_window && show_weekly_window => {
+                row2_y + (appearance.row_height() - icon_size) / 2
+            }
+            ProviderIconPosition::Top | ProviderIconPosition::Bottom => {
+                single_row_y + (appearance.row_height() - icon_size) / 2
+            }
+            ProviderIconPosition::Center => (height - icon_size) / 2,
         };
         let active_models = active_model_count(
             show_claude_code,
@@ -3831,35 +3956,115 @@ fn paint_content(
             show_grok,
             show_copilot,
         );
-        let model_width =
-            model_usage_width(row_bar_segment_count(active_models), text_width, appearance)
-                + sc(MODEL_RIGHT_MARGIN);
+        let providers = [
+            WidgetProvider {
+                enabled: show_claude_code,
+                show_icon: appearance.show_claude_icon,
+                icon: Provider::Claude,
+                session_percent: session_pct,
+                session_text,
+                weekly_percent: weekly_pct,
+                weekly_text,
+                accent,
+            },
+            WidgetProvider {
+                enabled: show_codex,
+                show_icon: appearance.show_codex_icon,
+                icon: Provider::Codex,
+                session_percent: codex_session_pct,
+                session_text: codex_session_text,
+                weekly_percent: codex_weekly_pct,
+                weekly_text: codex_weekly_text,
+                accent: codex_accent,
+            },
+            WidgetProvider {
+                enabled: show_antigravity,
+                show_icon: appearance.show_antigravity_icon,
+                icon: Provider::Antigravity,
+                session_percent: antigravity_session_pct,
+                session_text: antigravity_session_text,
+                weekly_percent: antigravity_weekly_pct,
+                weekly_text: antigravity_weekly_text,
+                accent: antigravity_accent,
+            },
+            WidgetProvider {
+                enabled: show_opencode,
+                show_icon: appearance.show_opencode_icon,
+                icon: Provider::OpenCode,
+                session_percent: opencode_session_pct,
+                session_text: opencode_session_text,
+                weekly_percent: opencode_weekly_pct,
+                weekly_text: opencode_weekly_text,
+                accent: opencode_accent,
+            },
+            WidgetProvider {
+                enabled: show_cursor,
+                show_icon: appearance.show_cursor_icon,
+                icon: Provider::Cursor,
+                session_percent: cursor_session_pct,
+                session_text: cursor_session_text,
+                weekly_percent: cursor_weekly_pct,
+                weekly_text: cursor_weekly_text,
+                accent: cursor_accent,
+            },
+            WidgetProvider {
+                enabled: show_grok,
+                show_icon: appearance.show_grok_icon,
+                icon: Provider::Grok,
+                session_percent: grok_session_pct,
+                session_text: grok_session_text,
+                weekly_percent: grok_weekly_pct,
+                weekly_text: grok_weekly_text,
+                accent: grok_accent,
+            },
+            WidgetProvider {
+                enabled: show_copilot,
+                show_icon: appearance.show_copilot_icon,
+                icon: Provider::Copilot,
+                session_percent: copilot_session_pct,
+                session_text: copilot_session_text,
+                weekly_percent: copilot_weekly_pct,
+                weekly_text: copilot_weekly_text,
+                accent: copilot_accent,
+            },
+        ];
+        let provider_text_widths = providers.map(|provider| {
+            (if show_session_window {
+                usage_value_width(hdc, provider.session_text, appearance)
+            } else {
+                0
+            })
+            .max(if show_weekly_window {
+                usage_value_width(hdc, provider.weekly_text, appearance)
+            } else {
+                0
+            })
+        });
+        let icon_tint = appearance.usage_text_color.or_else(|| {
+            appearance
+                .provider_monochrome
+                .then_some([text_color.r, text_color.g, text_color.b])
+        });
         let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
-        for (enabled, show_icon, provider) in [
-            (show_claude_code, appearance.show_claude_icon, Provider::Claude),
-            (show_codex, appearance.show_codex_icon, Provider::Codex),
-            (
-                show_antigravity,
-                appearance.show_antigravity_icon,
-                Provider::Antigravity,
-            ),
-            (show_opencode, appearance.show_opencode_icon, Provider::OpenCode),
-            (show_cursor, appearance.show_cursor_icon, Provider::Cursor),
-            (show_grok, appearance.show_grok_icon, Provider::Grok),
-            (show_copilot, appearance.show_copilot_icon, Provider::Copilot),
-        ] {
-            if enabled {
-                if appearance.show_provider_icon && show_icon {
+        for provider_id in appearance.provider_order {
+            let index = provider_id.index();
+            let provider = providers[index];
+            if provider.enabled {
+                if appearance.show_provider_icon && provider.show_icon {
                     provider_icons::draw(
                         hdc,
                         icon_x,
                         icon_y,
                         icon_size,
-                        provider,
-                        appearance.usage_text_color,
+                        provider.icon,
+                        icon_tint,
                     );
                 }
-                icon_x += model_width;
+                icon_x += model_usage_width(
+                    row_bar_segment_count(active_models),
+                    provider_text_widths[index],
+                    appearance,
+                ) + appearance.provider_spacing.scaled_gap();
             }
         }
 
@@ -3876,37 +4081,12 @@ fn paint_content(
                 appearance,
                 text_color,
                 strings.session_window,
-                session_pct,
-                session_text,
-                codex_session_pct,
-                codex_session_text,
-                antigravity_session_pct,
-                antigravity_session_text,
-                opencode_session_pct,
-                opencode_session_text,
-                cursor_session_pct,
-                cursor_session_text,
-                grok_session_pct,
-                grok_session_text,
-                copilot_session_pct,
-                copilot_session_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                show_opencode,
-                show_cursor,
-                show_grok,
-                show_copilot,
-                accent,
-                codex_accent,
-                antigravity_accent,
-                opencode_accent,
-                cursor_accent,
-                grok_accent,
-                copilot_accent,
+                false,
+                &providers,
+                appearance.provider_order,
                 track,
                 label_width,
-                text_width,
+                provider_text_widths,
             );
         }
         if show_weekly_window {
@@ -3922,37 +4102,12 @@ fn paint_content(
                 appearance,
                 text_color,
                 strings.weekly_window,
-                weekly_pct,
-                weekly_text,
-                codex_weekly_pct,
-                codex_weekly_text,
-                antigravity_weekly_pct,
-                antigravity_weekly_text,
-                opencode_weekly_pct,
-                opencode_weekly_text,
-                cursor_weekly_pct,
-                cursor_weekly_text,
-                grok_weekly_pct,
-                grok_weekly_text,
-                copilot_weekly_pct,
-                copilot_weekly_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                show_opencode,
-                show_cursor,
-                show_grok,
-                show_copilot,
-                accent,
-                codex_accent,
-                antigravity_accent,
-                opencode_accent,
-                cursor_accent,
-                grok_accent,
-                copilot_accent,
+                true,
+                &providers,
+                appearance.provider_order,
                 track,
                 label_width,
-                text_width,
+                provider_text_widths,
             );
         }
 
@@ -4398,6 +4553,13 @@ fn taskbar_window_position(
     ))
 }
 
+fn placement_matches(rect: RECT, position: native_interop::WindowPosition) -> bool {
+    rect.left == position.x
+        && rect.top == position.y
+        && rect.right - rect.left == position.width
+        && rect.bottom - rect.top == position.height
+}
+
 fn position_at_taskbar_with_save(save_offset: bool) {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
@@ -4499,7 +4661,26 @@ fn position_at_taskbar_with_save(save_offset: bool) {
         save_state_settings();
     }
 
-    if !native_interop::position_window(hwnd, parent, position) {
+    // Explorer can emit tray location events even when its geometry is unchanged.
+    // Avoid making an unchanged layered child participate in another native
+    // positioning/redraw cycle. Query the live rectangle rather than caching it,
+    // since Explorer can move the child independently of our own placement calls.
+    let already_positioned = parent.is_some_and(|parent| {
+        native_interop::get_window_rect_safe(hwnd).is_some_and(|rect| {
+            native_interop::screen_to_client(parent, rect.left, rect.top).is_some_and(|point| {
+                placement_matches(
+                    RECT {
+                        left: point.x,
+                        top: point.y,
+                        right: point.x + (rect.right - rect.left),
+                        bottom: point.y + (rect.bottom - rect.top),
+                    },
+                    position,
+                )
+            })
+        })
+    });
+    if !already_positioned && !native_interop::position_window(hwnd, parent, position) {
         diagnose::log("position_at_taskbar failed to reposition widget");
         return;
     }
@@ -4663,6 +4844,25 @@ unsafe extern "system" fn wnd_proc(
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     match msg {
+        WM_NOTIFY if lparam.0 != 0 => {
+            let notification = &*(lparam.0 as *const NMHDR);
+            if notification.code == TTN_SHOW {
+                // A tooltip owned by an embedded child must be above the
+                // taskbar too. Raise only the transient tip when it appears,
+                // never the widget or its Explorer parent on refresh.
+                let _ = SetWindowPos(
+                    notification.hwndFrom,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
+                );
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_PAINT => {
             // For non-embedded fallback, paint normally
             let embedded = {
@@ -5157,6 +5357,10 @@ fn settings_snapshot() -> serde_json::Value {
             "adaptive_refresh":s.adaptive_refresh,"alert_threshold_percent":s.alert_threshold_percent,
             "palette":s.appearance.palette,"bar_style":s.appearance.bar_style,
             "bar_thickness":s.appearance.bar_thickness,"font_size":s.appearance.font_size,
+            "provider_spacing":s.appearance.provider_spacing,
+            "provider_order":s.appearance.provider_order,
+            "provider_icon_position":s.appearance.provider_icon_position,
+            "provider_monochrome":s.appearance.provider_monochrome,
             "show_provider_icon":s.appearance.show_provider_icon,
             "show_claude_icon":s.appearance.show_claude_icon,
             "show_codex_icon":s.appearance.show_codex_icon,
@@ -5175,7 +5379,14 @@ fn settings_snapshot() -> serde_json::Value {
             "copilot_accent":s.appearance.copilot_accent,
             "monitor_device":s.monitor_device,"anchor_left":s.anchor_left
         },
-        "effective_language":s.language.code(),"claude_code_available":s.claude_code_available,
+        "effective_language":s.language.code(),
+        "claude_code_available":s.provider_availability.claude_code_available,
+        "codex_available":s.provider_availability.codex_available,
+        "antigravity_available":s.provider_availability.antigravity_available,
+        "opencode_available":s.provider_availability.opencode_available,
+        "cursor_available":s.provider_availability.cursor_available,
+        "grok_available":s.provider_availability.grok_available,
+        "copilot_available":s.provider_availability.copilot_available,
         "effective_appearance":{"dark":dark,"claude_accent":[claude.r,claude.g,claude.b],"codex_accent":[codex.r,codex.g,codex.b],"antigravity_accent":[antigravity.r,antigravity.g,antigravity.b],"opencode_accent":[opencode.r,opencode.g,opencode.b],"cursor_accent":[cursor.r,cursor.g,cursor.b],"grok_accent":[grok.r,grok.g,grok.b],"copilot_accent":[copilot.r,copilot.g,copilot.b]},
         "update_busy":matches!(s.update_status, UpdateStatus::Checking | UpdateStatus::Applying),
         "update_available":update_available(&s.update_status),
@@ -5191,7 +5402,7 @@ fn preview_settings_snapshot(
     changes: &[settings_ui::Change],
 ) -> Result<serde_json::Value, SettingsApplyError> {
     let snapshot = settings_snapshot();
-    let (current, available, language, system_dark) = {
+    let (current, availability, language, system_dark) = {
         let state = lock_state();
         let s = state
             .as_ref()
@@ -5201,7 +5412,7 @@ fn preview_settings_snapshot(
                 s,
                 snapshot["settings"]["startup"].as_bool().unwrap_or(false),
             ),
-            s.claude_code_available,
+            s.provider_availability,
             s.language,
             s.is_dark,
         )
@@ -5219,7 +5430,7 @@ fn preview_settings_snapshot(
         snapshot,
         &current,
         changes,
-        available,
+        availability,
         &monitors,
         language,
         system_dark,
@@ -5230,12 +5441,13 @@ fn draft_settings_snapshot(
     mut snapshot: serde_json::Value,
     current: &SettingsCandidate,
     changes: &[settings_ui::Change],
-    available: bool,
+    availability: poller::ProviderAvailability,
     monitors: &[String],
     language: LanguageId,
     system_dark: bool,
 ) -> Result<serde_json::Value, SettingsApplyError> {
-    let candidate = validate_settings_changes(current, changes, available, monitors)?;
+    let candidate =
+        validate_settings_changes_with_availability(current, changes, availability, monitors)?;
     let language = candidate.language_override.unwrap_or_else(|| {
         if changes.iter().any(|change| change.key == Key::Language) {
             localization::detect_system_language()
@@ -5451,9 +5663,9 @@ fn publish_settings() {
 }
 
 fn refresh_settings_availability() {
-    let available = poller::claude_code_credentials_available();
+    let availability = poller::provider_availability();
     if let Some(s) = lock_state().as_mut() {
-        s.claude_code_available = available;
+        s.provider_availability = availability;
     }
 }
 
@@ -5483,8 +5695,17 @@ fn handle_settings_requests(hwnd: HWND) {
         SETTINGS_SAVE_ERROR.with(|slot| slot.borrow_mut().take());
         let result = match pending.request.operation {
             Operation::Get => Ok(()),
+            Operation::Set {
+                key: Key::SettingsPaneOpen,
+                value,
+            } => setting_value(value).and_then(apply_settings_pane_open),
             Operation::Set { key, value } => {
                 apply_settings_batch(hwnd, &[settings_ui::Change { key, value }])
+            }
+            Operation::SetBatch { changes }
+                if changes.len() == 1 && changes[0].key == Key::SettingsPaneOpen =>
+            {
+                setting_value(changes[0].value.clone()).and_then(apply_settings_pane_open)
             }
             Operation::SetBatch { changes } => apply_settings_batch(hwnd, &changes),
             Operation::Preview { .. } => unreachable!("preview handled without side effects"),
@@ -5641,10 +5862,10 @@ impl SettingsCandidate {
 
 /// Validate all edits against one final candidate. No application state or OS
 /// side effect is touched until this succeeds.
-fn validate_settings_changes(
+fn validate_settings_changes_with_availability(
     current: &SettingsCandidate,
     changes: &[settings_ui::Change],
-    claude_code_available: bool,
+    availability: poller::ProviderAvailability,
     monitor_devices: &[String],
 ) -> Result<SettingsCandidate, SettingsApplyError> {
     if changes.len() > settings_ui::MAX_BATCH_CHANGES {
@@ -5756,6 +5977,28 @@ fn validate_settings_changes(
             }
             Key::Palette => candidate.appearance.palette = setting_value(change.value.clone())?,
             Key::BarStyle => candidate.appearance.bar_style = setting_value(change.value.clone())?,
+            Key::ProviderSpacing => {
+                candidate.appearance.provider_spacing = setting_value(change.value.clone())?
+            }
+            Key::ProviderOrder => {
+                let order: Vec<ProviderId> = setting_value(change.value.clone())?;
+                let order: [ProviderId; 7] = order.try_into().map_err(|_| {
+                    invalid_setting("Provider order must contain all seven providers exactly once.")
+                })?;
+                if !valid_provider_order(&order) {
+                    return Err(invalid_setting(
+                        "Provider order must contain all seven providers exactly once.",
+                    ));
+                }
+                candidate.appearance.provider_order = order;
+            }
+            Key::ProviderIconPosition => {
+                candidate.appearance.provider_icon_position =
+                    setting_value(change.value.clone())?
+            }
+            Key::ProviderMonochrome => {
+                candidate.appearance.provider_monochrome = setting_value(change.value.clone())?
+            }
             Key::BarThickness => {
                 candidate.appearance.bar_thickness = setting_value(change.value.clone())?
             }
@@ -5855,12 +6098,95 @@ fn validate_settings_changes(
             "At least one usage window must remain enabled.",
         ));
     }
-    if candidate.show_claude_code && !current.show_claude_code && !claude_code_available {
-        return Err(invalid_setting(
-            "Sign in to the Claude CLI before enabling Claude Code monitoring.",
-        ));
+    for (provider, was_enabled, is_enabled, available) in [
+        (
+            "Claude Code",
+            current.show_claude_code,
+            candidate.show_claude_code,
+            availability.claude_code_available,
+        ),
+        (
+            "Codex",
+            current.show_codex,
+            candidate.show_codex,
+            availability.codex_available,
+        ),
+        (
+            "Antigravity",
+            current.show_antigravity,
+            candidate.show_antigravity,
+            availability.antigravity_available,
+        ),
+        (
+            "OpenCode",
+            current.show_opencode,
+            candidate.show_opencode,
+            availability.opencode_available,
+        ),
+        (
+            "Cursor",
+            current.show_cursor,
+            candidate.show_cursor,
+            availability.cursor_available,
+        ),
+        (
+            "Grok",
+            current.show_grok,
+            candidate.show_grok,
+            availability.grok_available,
+        ),
+        (
+            "GitHub Copilot",
+            current.show_copilot,
+            candidate.show_copilot,
+            availability.copilot_available,
+        ),
+    ] {
+        if is_enabled && !was_enabled && !available {
+            let message = if provider == "Claude Code" {
+                "Sign in to the Claude CLI before enabling Claude Code monitoring.".to_string()
+            } else {
+                format!(
+                    "Local credentials for {provider} are unavailable. Sign in before enabling monitoring."
+                )
+            };
+            return Err(invalid_setting(message));
+        }
     }
     Ok(candidate)
+}
+
+#[cfg(test)]
+fn provider_availability_for_tests() -> poller::ProviderAvailability {
+    // Deterministic synthetic credentials; tests never consult the host.
+    poller::ProviderAvailability {
+        claude_code_available: true,
+        codex_available: true,
+        antigravity_available: true,
+        opencode_available: true,
+        cursor_available: true,
+        grok_available: true,
+        copilot_available: true,
+    }
+}
+
+#[cfg(test)]
+/// Use fixed synthetic non-Claude credentials in legacy bool-based tests.
+fn validate_settings_changes(
+    current: &SettingsCandidate,
+    changes: &[settings_ui::Change],
+    claude_code_available: bool,
+    monitor_devices: &[String],
+) -> Result<SettingsCandidate, SettingsApplyError> {
+    validate_settings_changes_with_availability(
+        current,
+        changes,
+        poller::ProviderAvailability {
+            claude_code_available,
+            ..provider_availability_for_tests()
+        },
+        monitor_devices,
+    )
 }
 
 fn settings_batch_needs_widget_redraw(changes: &[settings_ui::Change]) -> bool {
@@ -5877,7 +6203,7 @@ fn apply_settings_batch(
     let startup = is_startup_enabled();
     let (
         current,
-        claude_code_available,
+        provider_availability,
         effective_monitor_device,
         pending_monitor_device,
         current_embedded,
@@ -5890,7 +6216,7 @@ fn apply_settings_batch(
             .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
         (
             SettingsCandidate::from_app_state(app_state, startup),
-            app_state.claude_code_available,
+            app_state.provider_availability,
             app_state.effective_monitor_device.clone(),
             app_state.pending_monitor_device.clone(),
             app_state.embedded,
@@ -5915,8 +6241,12 @@ fn apply_settings_batch(
         .iter()
         .map(|monitor| monitor.device.clone())
         .collect();
-    let candidate =
-        validate_settings_changes(&current, changes, claude_code_available, &monitor_devices)?;
+    let candidate = validate_settings_changes_with_availability(
+        &current,
+        changes,
+        provider_availability,
+        &monitor_devices,
+    )?;
 
     let startup_changed = candidate.startup != current.startup;
     let monitor_target = if monitor_requested {
@@ -6167,6 +6497,48 @@ fn persist_settings_request() -> Result<(), SettingsApplyError> {
     persist_state_settings().map_err(|message| SettingsApplyError::new("save_failed", message))
 }
 
+/// Apply and persist only the navigation-pane preference. Its caller uses a
+/// standalone setting request so draft edits in the native settings window are
+/// neither applied nor accidentally included in this write.
+fn apply_settings_pane_open(open: bool) -> Result<(), SettingsApplyError> {
+    {
+        let mut state = lock_state();
+        let app_state = state
+            .as_mut()
+            .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
+        app_state.settings_pane_open = open;
+    }
+
+    let path = settings_path();
+    let snapshot_error = std::cell::RefCell::new(None::<std::io::Error>);
+    let saved = settings_store::save(&path, || {
+        let mut settings = match std::fs::read_to_string(&path) {
+            Ok(contents) => serde_json::from_str::<SettingsFile>(&contents).unwrap_or_default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                SettingsFile::default()
+            }
+            Err(error) => {
+                *snapshot_error.borrow_mut() = Some(error);
+                return None;
+            }
+        };
+        settings.settings_pane_open = open;
+        Some(settings)
+    });
+    if let Some(error) = snapshot_error.into_inner() {
+        return Err(SettingsApplyError::new(
+            "save_failed",
+            format!("The navigation pane preference could not be saved: {error}"),
+        ));
+    }
+    saved.map_err(|error| {
+        SettingsApplyError::new(
+            "save_failed",
+            format!("The navigation pane preference could not be saved: {error}"),
+        )
+    })
+}
+
 fn apply_settings_action(hwnd: HWND, action: Action) -> Result<(), String> {
     let command = match action {
         Action::Refresh => 1,
@@ -6402,47 +6774,14 @@ fn draw_row(
     appearance: Appearance,
     text_color: &Color,
     label: &str,
-    claude_percent: f64,
-    claude_text: &str,
-    codex_percent: f64,
-    codex_text: &str,
-    antigravity_percent: f64,
-    antigravity_text: &str,
-    opencode_percent: f64,
-    opencode_text: &str,
-    cursor_percent: f64,
-    cursor_text: &str,
-    grok_percent: f64,
-    grok_text: &str,
-    copilot_percent: f64,
-    copilot_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    show_opencode: bool,
-    show_cursor: bool,
-    show_grok: bool,
-    show_copilot: bool,
-    claude_accent: &Color,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
-    opencode_accent: &Color,
-    cursor_accent: &Color,
-    grok_accent: &Color,
-    copilot_accent: &Color,
+    weekly: bool,
+    providers: &[WidgetProvider<'_>; 7],
+    provider_order: [ProviderId; 7],
     track: &Color,
     label_width: i32,
-    text_width: i32,
+    provider_text_widths: [i32; 7],
 ) {
-    let active_models = active_model_count(
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        show_opencode,
-        show_cursor,
-        show_grok,
-        show_copilot,
-    );
+    let active_models = providers.iter().filter(|provider| provider.enabled).count() as i32;
     let segment_count = row_bar_segment_count(active_models);
     let value_color = custom_color(appearance.usage_text_color, *text_color);
 
@@ -6468,129 +6807,33 @@ fn draw_row(
         let _ = DeleteObject(label_font);
 
         let mut model_x = x + label_width + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
+        for provider_id in provider_order {
+            let index = provider_id.index();
+            let provider = providers[index];
+            if !provider.enabled {
+                continue;
+            }
+            let (percent, text) = if weekly {
+                (provider.weekly_percent, provider.weekly_text)
+            } else {
+                (provider.session_percent, provider.session_text)
+            };
             draw_usage_bar(
                 hdc,
                 model_x + provider_icon_width(appearance),
                 y,
                 segment_count,
-                claude_percent,
-                claude_text,
-                claude_accent,
+                percent,
+                text,
+                provider.accent,
                 track,
                 &value_color,
-                text_width,
+                provider_text_widths[index],
                 is_dark,
                 appearance,
             );
-            model_x +=
-                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_codex {
-            draw_usage_bar(
-                hdc,
-                model_x + provider_icon_width(appearance),
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &value_color,
-                text_width,
-                is_dark,
-                appearance,
-            );
-            model_x +=
-                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            draw_usage_bar(
-                hdc,
-                model_x + provider_icon_width(appearance),
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                antigravity_accent,
-                track,
-                &value_color,
-                text_width,
-                is_dark,
-                appearance,
-            );
-            model_x +=
-                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_opencode {
-            draw_usage_bar(
-                hdc,
-                model_x + provider_icon_width(appearance),
-                y,
-                segment_count,
-                opencode_percent,
-                opencode_text,
-                opencode_accent,
-                track,
-                &value_color,
-                text_width,
-                is_dark,
-                appearance,
-            );
-            model_x +=
-                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_cursor {
-            draw_usage_bar(
-                hdc,
-                model_x + provider_icon_width(appearance),
-                y,
-                segment_count,
-                cursor_percent,
-                cursor_text,
-                cursor_accent,
-                track,
-                &value_color,
-                text_width,
-                is_dark,
-                appearance,
-            );
-            model_x +=
-                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_grok {
-            draw_usage_bar(
-                hdc,
-                model_x + provider_icon_width(appearance),
-                y,
-                segment_count,
-                grok_percent,
-                grok_text,
-                grok_accent,
-                track,
-                &value_color,
-                text_width,
-                is_dark,
-                appearance,
-            );
-            model_x +=
-                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_copilot {
-            draw_usage_bar(
-                hdc,
-                model_x + provider_icon_width(appearance),
-                y,
-                segment_count,
-                copilot_percent,
-                copilot_text,
-                copilot_accent,
-                track,
-                &value_color,
-                text_width,
-                is_dark,
-                appearance,
-            );
+            model_x += model_usage_width(segment_count, provider_text_widths[index], appearance)
+                + appearance.provider_spacing.scaled_gap();
         }
     }
 }
@@ -6616,6 +6859,48 @@ fn model_usage_width(segment_count: i32, text_width: i32, appearance: Appearance
             0
         }
         + text_width
+}
+
+/// Keep the next provider close to the text that is actually visible, while
+/// measuring reset strings with the same font used by the quota renderer.
+/// The widget still reserves the translated worst-case width in its overall
+/// size, so a later long reset value can never be clipped by the window edge.
+fn usage_value_width(hdc: HDC, value: &str, appearance: Appearance) -> i32 {
+    let percent_width = if appearance.show_percentage {
+        sc(quota_text::percent_width(appearance.font_px()))
+    } else {
+        0
+    };
+    if !appearance.show_reset_time {
+        return percent_width;
+    }
+    let (_, reset) = quota_text::parts(value);
+    if reset.is_empty() {
+        return percent_width;
+    }
+
+    unsafe {
+        let font = quota_text::create_reset_font(sc(appearance.font_px()));
+        if font.is_invalid() {
+            return percent_width + sc(3);
+        }
+        let old_font = SelectObject(hdc, font);
+        let wide: Vec<u16> = reset.encode_utf16().collect();
+        let mut size = SIZE::default();
+        let measured = if GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() {
+            size.cx
+        } else {
+            0
+        };
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        (if appearance.show_percentage {
+            sc(quota_text::reset_offset(appearance.font_px()))
+        } else {
+            0
+        }) + measured
+            + sc(3)
+    }
 }
 
 fn usage_bar_fill_percentage(percent: f64, text: &str) -> f64 {
@@ -6783,12 +7068,192 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tooltip_show_raises_only_the_tooltip_not_its_widget_owner() {
+        use windows::core::{w, PWSTR};
+        use windows::Win32::UI::Controls::*;
+        static SAW_SHOW: AtomicBool = AtomicBool::new(false);
+        static POSITION_CHANGES: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn test_proc(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+        ) -> LRESULT {
+            if msg == WM_WINDOWPOSCHANGING {
+                POSITION_CHANGES.fetch_add(1, Ordering::Relaxed);
+            }
+            if msg == WM_NOTIFY && lp.0 != 0 && (*(lp.0 as *const NMHDR)).code == TTN_SHOW {
+                SAW_SHOW.store(true, Ordering::Relaxed);
+                return wnd_proc(hwnd, msg, wp, lp);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_WIN95_CLASSES,
+            };
+            InitCommonControlsEx(&controls).ok().unwrap();
+            let instance = GetModuleHandleW(None).unwrap().into();
+            let class = w!("CodexTooltipShowTest");
+            assert_ne!(
+                RegisterClassW(&WNDCLASSW {
+                    lpfnWndProc: Some(test_proc),
+                    hInstance: instance,
+                    lpszClassName: class,
+                    ..Default::default()
+                }),
+                0
+            );
+            let host = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("tooltip-host-test"),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                30,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let owner = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                class,
+                w!("tooltip-owner-test"),
+                WS_CHILD,
+                0,
+                0,
+                100,
+                30,
+                host,
+                None,
+                instance,
+                None,
+            )
+            .unwrap();
+            // A hidden parent must not make every retry show its child again.
+            set_widget_visibility(owner, true);
+            assert!(!IsWindowVisible(owner).as_bool());
+            assert_ne!(GetWindowLongW(owner, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            let changes = POSITION_CHANGES.load(Ordering::Relaxed);
+            for _ in 0..5 {
+                set_widget_visibility(owner, true);
+            }
+            assert_eq!(POSITION_CHANGES.load(Ordering::Relaxed), changes);
+            set_widget_visibility(owner, false);
+            let tooltip = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("tooltips_class32"),
+                w!(""),
+                WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+                0,
+                0,
+                100,
+                30,
+                owner,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let mut text: Vec<u16> = "quota test".encode_utf16().chain(Some(0)).collect();
+            let info = TTTOOLINFOW {
+                cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32,
+                uFlags: TTF_TRACK | TTF_ABSOLUTE,
+                hwnd: owner,
+                uId: 1,
+                lpszText: PWSTR(text.as_mut_ptr()),
+                ..Default::default()
+            };
+            assert_ne!(
+                SendMessageW(
+                    tooltip,
+                    TTM_ADDTOOLW,
+                    WPARAM(0),
+                    LPARAM(&info as *const _ as isize)
+                )
+                .0,
+                0
+            );
+            SendMessageW(
+                tooltip,
+                TTM_TRACKACTIVATE,
+                WPARAM(1),
+                LPARAM(&info as *const _ as isize),
+            );
+            assert!(
+                SAW_SHOW.load(Ordering::Relaxed),
+                "the child tool must receive TTN_SHOW"
+            );
+            assert_ne!(
+                GetWindowLongW(tooltip, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,
+                0
+            );
+            assert_eq!(
+                GetWindowLongW(owner, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,
+                0
+            );
+            assert_eq!(
+                GetWindowLongW(host, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,
+                0
+            );
+            let _ = DestroyWindow(tooltip);
+            let _ = DestroyWindow(owner);
+            let _ = DestroyWindow(host);
+            UnregisterClassW(class, instance).unwrap();
+        }
+    }
+
+    #[test]
+    fn unchanged_child_placement_requires_matching_position_and_size() {
+        let rect = RECT {
+            left: -40,
+            top: 8,
+            right: 160,
+            bottom: 38,
+        };
+        let position = native_interop::WindowPosition {
+            x: -40,
+            y: 8,
+            width: 200,
+            height: 30,
+        };
+        assert!(placement_matches(rect, position));
+        for changed in [
+            native_interop::WindowPosition { x: -39, ..position },
+            native_interop::WindowPosition { y: 9, ..position },
+            native_interop::WindowPosition {
+                width: 201,
+                ..position
+            },
+            native_interop::WindowPosition {
+                height: 31,
+                ..position
+            },
+        ] {
+            assert!(!placement_matches(rect, changed));
+        }
+    }
+
+    #[test]
     fn widget_elements_default_and_legacy_settings_round_trip() {
         let legacy: SettingsFile = serde_json::from_str("{}").unwrap();
         let a = legacy.appearance;
         assert!(a.show_provider_icon && a.show_percentage && a.show_bar && a.show_reset_time);
         assert_eq!(a.usage_text_color, None);
         assert_eq!(a.window_label_font_size, 9);
+        assert_eq!(a.provider_spacing, ProviderSpacing::Small);
+        let mut previous_settings = serde_json::to_value(SettingsFile::default()).unwrap();
+        previous_settings["appearance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_spacing");
+        let previous: SettingsFile = serde_json::from_value(previous_settings).unwrap();
+        assert_eq!(previous.appearance.provider_spacing, ProviderSpacing::Small);
         let settings = SettingsFile {
             appearance: Appearance {
                 show_provider_icon: false,
@@ -6803,6 +7268,10 @@ mod tests {
         let loaded: SettingsFile =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(loaded.appearance, settings.appearance);
+        assert_eq!(
+            serde_json::to_value(settings).unwrap()["appearance"]["provider_spacing"],
+            "small"
+        );
         let old_icons =
             normalize_settings(serde_json::from_str(r#"{"show_provider_icons":false}"#).unwrap());
         assert!(!old_icons.appearance.show_provider_icon);
@@ -6872,19 +7341,32 @@ mod tests {
                 value: json!(true),
             }
         });
-        assert!(validate_settings_changes(&current, &enable_more, false, &[]).is_err());
-        let lifted = validate_settings_changes(
+        let availability = provider_availability_for_tests();
+        assert!(validate_settings_changes_with_availability(
+            &current,
+            &enable_more,
+            availability,
+            &[]
+        )
+        .is_err());
+        let lifted = validate_settings_changes_with_availability(
             &current,
             &[settings_ui::Change {
                 key: Key::AllowUnlimitedProviders,
                 value: json!(true),
             }],
-            false,
+            availability,
             &[],
         )
         .unwrap();
         assert!(lifted.allow_unlimited_providers);
-        let candidate = validate_settings_changes(&lifted, &enable_more, false, &[]).unwrap();
+        let candidate = validate_settings_changes_with_availability(
+            &lifted,
+            &enable_more,
+            availability,
+            &[],
+        )
+        .unwrap();
         assert!(
             candidate.show_codex
                 && candidate.show_opencode
@@ -7001,6 +7483,112 @@ mod tests {
     }
 
     #[test]
+    fn provider_spacing_presets_are_strict_and_adjust_model_geometry() {
+        use serde_json::json;
+
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        let presets = [
+            (ProviderSpacing::None, "none", 0),
+            (ProviderSpacing::Small, "small", 2),
+            (ProviderSpacing::Normal, "normal", 5),
+            (ProviderSpacing::Large, "large", 9),
+        ];
+        for (preset, wire_value, pixels) in presets {
+            let candidate = validate_settings_changes(
+                &current,
+                &[settings_ui::Change {
+                    key: Key::ProviderSpacing,
+                    value: json!(wire_value),
+                }],
+                false,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(candidate.appearance.provider_spacing, preset);
+            assert_eq!(
+                serde_json::to_value(preset).unwrap(),
+                json!(wire_value)
+            );
+            assert_eq!(preset.scaled_gap(), sc(pixels));
+        }
+        for value in [json!("extra_small"), json!(null), json!(1)] {
+            assert!(validate_settings_changes(
+                &current,
+                &[settings_ui::Change {
+                    key: Key::ProviderSpacing,
+                    value,
+                }],
+                false,
+                &[],
+            )
+            .is_err());
+        }
+
+        let small = Appearance::default();
+        let none = Appearance {
+            provider_spacing: ProviderSpacing::None,
+            ..small
+        };
+        let large = Appearance {
+            provider_spacing: ProviderSpacing::Large,
+            ..small
+        };
+        let small_width = total_widget_width_for(2, LanguageId::English, small);
+        assert_eq!(
+            total_widget_width_for(2, LanguageId::English, none),
+            small_width - sc(2)
+        );
+        assert_eq!(
+            total_widget_width_for(2, LanguageId::English, large),
+            small_width + sc(7)
+        );
+    }
+
+    #[test]
+    fn provider_spacing_draft_preview_changes_geometry_without_changing_settings() {
+        use serde_json::json;
+
+        let current = SettingsCandidate::from_settings(
+            &SettingsFile {
+                show_opencode: true,
+                ..SettingsFile::default()
+            },
+            false,
+        );
+        let original = current.clone();
+        let snapshot = json!({
+            "settings": {"provider_spacing": "small"},
+            "monitors": [],
+            "effective_language": "en",
+            "effective_appearance": {"dark": true}
+        });
+        let draft = draft_settings_snapshot(
+            snapshot.clone(),
+            &current,
+            &[settings_ui::Change {
+                key: Key::ProviderSpacing,
+                value: json!("large"),
+            }],
+            provider_availability_for_tests(),
+            &[],
+            LanguageId::English,
+            true,
+        )
+        .unwrap();
+        let large = Appearance {
+            provider_spacing: ProviderSpacing::Large,
+            ..current.appearance
+        };
+        assert_eq!(draft["settings"]["provider_spacing"], "small");
+        assert_eq!(
+            draft["widget_preview_width"],
+            total_widget_width_for(2, LanguageId::English, large)
+        );
+        assert_eq!(current, original);
+        assert_eq!(snapshot["settings"]["provider_spacing"], "small");
+    }
+
+    #[test]
     fn hidden_widget_columns_release_their_width() {
         let a = Appearance::default();
         let width = total_widget_width_for(1, LanguageId::English, a);
@@ -7046,6 +7634,7 @@ mod tests {
             assert!(a.show_provider_icon && a.show_percentage && a.show_bar && a.show_reset_time);
             assert_eq!(a.window_label_font_size, 9);
             assert_eq!(a.usage_text_color, None);
+            assert_eq!(a.provider_spacing, ProviderSpacing::Small);
         }
     }
 
@@ -7063,7 +7652,7 @@ mod tests {
                 key: Key::ShowBar,
                 value: json!(false),
             }],
-            false,
+            provider_availability_for_tests(),
             &[],
             LanguageId::English,
             true,
@@ -7112,7 +7701,7 @@ mod tests {
             canonical.clone(),
             &current,
             &invalid,
-            false,
+            provider_availability_for_tests(),
             &[],
             LanguageId::English,
             true
@@ -7601,40 +8190,88 @@ mod tests {
     }
 
     #[test]
-    fn lost_claude_credentials_only_block_enabling_from_disabled_state() {
+    fn missing_credentials_only_block_new_provider_enables() {
         use serde_json::json;
-        let enabled_current = SettingsCandidate::from_settings(
-            &SettingsFile {
-                show_claude_code: true,
-                ..SettingsFile::default()
-            },
-            false,
-        );
+        let provider_keys = [
+            Key::ShowClaudeCode,
+            Key::ShowCodex,
+            Key::ShowAntigravity,
+            Key::ShowOpenCode,
+            Key::ShowCursor,
+            Key::ShowGrok,
+            Key::ShowCopilot,
+        ];
+        let set_enabled = |settings: &mut SettingsFile, key: Key, value| match key {
+            Key::ShowClaudeCode => settings.show_claude_code = value,
+            Key::ShowCodex => settings.show_codex = value,
+            Key::ShowAntigravity => settings.show_antigravity = value,
+            Key::ShowOpenCode => settings.show_opencode = value,
+            Key::ShowCursor => settings.show_cursor = value,
+            Key::ShowGrok => settings.show_grok = value,
+            Key::ShowCopilot => settings.show_copilot = value,
+            _ => unreachable!("only provider keys are used in this test"),
+        };
+        let unavailable = poller::ProviderAvailability::default();
 
-        let unrelated_change = [settings_ui::Change {
-            key: Key::WidgetVisible,
-            value: json!(false),
-        }];
-        assert!(validate_settings_changes(&enabled_current, &unrelated_change, false, &[]).is_ok());
+        for key in provider_keys {
+            let mut disabled_settings = SettingsFile::default();
+            set_enabled(&mut disabled_settings, key, false);
+            if key == Key::ShowCodex {
+                // Keep a different provider enabled to preserve the min-one rule.
+                disabled_settings.show_opencode = true;
+            }
+            let disabled = SettingsCandidate::from_settings(&disabled_settings, false);
+            let enable = [settings_ui::Change {
+                key,
+                value: json!(true),
+            }];
+            assert!(validate_settings_changes_with_availability(
+                &disabled,
+                &enable,
+                unavailable,
+                &[],
+            )
+            .is_err(), "unavailable {key:?} must not be enabled");
 
-        let keep_enabled = [settings_ui::Change {
-            key: Key::ShowClaudeCode,
-            value: json!(true),
-        }];
-        assert!(validate_settings_changes(&enabled_current, &keep_enabled, false, &[]).is_ok());
+            let mut enabled_settings = disabled_settings;
+            set_enabled(&mut enabled_settings, key, true);
+            let enabled = SettingsCandidate::from_settings(&enabled_settings, false);
+            let unrelated = [settings_ui::Change {
+                key: Key::WidgetVisible,
+                value: json!(false),
+            }];
+            assert!(validate_settings_changes_with_availability(
+                &enabled,
+                &unrelated,
+                unavailable,
+                &[],
+            )
+            .is_ok(), "unavailable {key:?} must not block unrelated edits");
 
-        let disable = [settings_ui::Change {
-            key: Key::ShowClaudeCode,
-            value: json!(false),
-        }];
-        assert!(validate_settings_changes(&enabled_current, &disable, false, &[]).is_ok());
+            let keep_enabled = [settings_ui::Change {
+                key,
+                value: json!(true),
+            }];
+            assert!(validate_settings_changes_with_availability(
+                &enabled,
+                &keep_enabled,
+                unavailable,
+                &[],
+            )
+            .is_ok(), "already-enabled unavailable {key:?} may remain enabled");
 
-        let disabled_current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
-        let enable = [settings_ui::Change {
-            key: Key::ShowClaudeCode,
-            value: json!(true),
-        }];
-        assert!(validate_settings_changes(&disabled_current, &enable, false, &[]).is_err());
+            let disable = [settings_ui::Change {
+                key,
+                value: json!(false),
+            }];
+            assert!(validate_settings_changes_with_availability(
+                &enabled,
+                &disable,
+                unavailable,
+                &[],
+            )
+            .is_ok(), "unavailable {key:?} must be disableable");
+        }
     }
 
     #[test]
@@ -8459,6 +9096,7 @@ unsafe fn handle_command(hwnd: HWND, id: u16) {
                     s.appearance.grok_accent = None;
                     s.appearance.copilot_accent = None;
                     s.appearance.usage_text_color = None;
+                    s.appearance.provider_monochrome = false;
                 }
             } else {
                 let initial = {
@@ -8568,7 +9206,7 @@ unsafe fn handle_command(hwnd: HWND, id: u16) {
                 if let Some(s) = state.as_mut() {
                     match id {
                         IDM_MODEL_CLAUDE_CODE => {
-                            if s.claude_code_available
+                            if s.provider_availability.claude_code_available
                                 && (s.show_codex || s.show_antigravity || !s.show_claude_code)
                             {
                                 s.show_claude_code = !s.show_claude_code;

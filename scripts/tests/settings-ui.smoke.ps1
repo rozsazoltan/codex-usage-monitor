@@ -56,6 +56,8 @@ public static class SettingsUISmokeNative {
     public static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")]
     public static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")]
     static extern bool EnumWindows(WindowCallback callback, IntPtr parameter);
     [DllImport("user32.dll", EntryPoint = "GetWindowTextW", CharSet = CharSet.Unicode)]
@@ -101,8 +103,9 @@ $snapshot = @{
 $controls = @{
     General = 'LanguageSelector'; Monitoring = 'Setting_show_codex'; Appearance = 'Appearance_palette'
     Placement = 'MonitorSelector'; Update = 'CheckForUpdates'; About = 'ThirdPartyNotices'
+    Experimental = 'Setting_allow_unlimited_providers'
 }
-$pages = @('General', 'Monitoring', 'Appearance', 'Placement', 'Update', 'About')
+$pages = @('General', 'Monitoring', 'Appearance', 'Placement', 'Update', 'About', 'Experimental')
 $timeoutMilliseconds = $TimeoutSeconds * 1000
 $results = [Collections.Generic.List[object]]::new()
 $script:smokeBackend = $null
@@ -193,6 +196,7 @@ function Receive-SmokeRequests {
                     $backend.Previews.Add($request)
                     $response = @{ v = 1; id = $request.id; ok = $true; revision = $backend.Revision;
                         state = (New-PreviewSnapshot $backend.State $request.changes) }
+                    $backend.LastPreviewResponse = $response
                     if ($backend.HoldNextPreview) {
                         $backend.HoldNextPreview = $false
                         $backend.HeldPreview = $response
@@ -279,6 +283,7 @@ function Wait-Page([Windows.Automation.AutomationElement]$Window, [Diagnostics.P
                     $condition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Version smoke-test')
                     $null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
                 }
+                Experimental { $control.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -in @([Windows.Automation.ToggleState]::On, [Windows.Automation.ToggleState]::Off) }
             }
             if ($ready) { return }
         }
@@ -373,6 +378,13 @@ function Wait-PreviewColor([Windows.Automation.AutomationElement]$Window,
         try { Show-SmokeControl $image 1500 } catch { $script:lastPreviewGate = "scroll-error:$($_.Exception.Message)"; Start-Sleep -Milliseconds 100; continue }
         $bounds = $image.Current.BoundingRectangle
         if ([double]::IsInfinity($bounds.Width)) { $script:lastPreviewGate = 'bad-bounds-after-scroll'; continue }
+        # Focus a real control rather than the non-focusable top-level UIA window
+        # so CopyFromScreen samples this smoke-owned window, not another app.
+        try { (Find-Control $Window 'NavigationAppearance').SetFocus() } catch {}
+        [SettingsUISmokeNative]::SetForegroundWindow([IntPtr]$Window.Current.NativeWindowHandle) | Out-Null
+        # UIA status changes when the bitmap is assigned; allow DWM to present
+        # that frame before sampling the desktop pixels.
+        Start-Sleep -Milliseconds 100
         $bitmap = [Drawing.Bitmap]::new([int][Math]::Ceiling($bounds.Width), [int][Math]::Ceiling($bounds.Height))
         $graphics = [Drawing.Graphics]::FromImage($bitmap)
         try {
@@ -401,6 +413,19 @@ function Wait-PreviewColor([Windows.Automation.AutomationElement]$Window,
             if ($treeIds.Count -ge 150) { break }
         }
     } catch { $treeIds = @("tree-dump-failed:$($_.Exception.Message)") }
+    if ($script:smokeBackend.Previews.Count -gt 0) {
+        $latest = $script:smokeBackend.Previews[$script:smokeBackend.Previews.Count - 1]
+        Write-Host "Preview failure diagnostic: lastChanges=$($latest.changes | ConvertTo-Json -Compress -Depth 4); savedTextColor=$($script:smokeBackend.State.settings.usage_text_color | ConvertTo-Json -Compress -Depth 4)"
+    }
+    $fixturePixel = '<no preview response>'
+    if ($script:smokeBackend.LastPreviewResponse) {
+        $data = $script:smokeBackend.LastPreviewResponse.state.widget_preview_image -replace '^data:image/bmp;base64,', ''
+        $stream = [IO.MemoryStream]::new([Convert]::FromBase64String($data))
+        $fixtureBitmap = [Drawing.Bitmap]::new($stream)
+        try { $fixturePixel = $fixtureBitmap.GetPixel(108, 6).ToArgb().ToString('X8') }
+        finally { $fixtureBitmap.Dispose(); $stream.Dispose() }
+    }
+    Write-Host "Preview response diagnostic: fixturePixelAtPercentage=$fixturePixel"
     throw "The widget bitmap preview did not reach color $Hex presence=$Present (last matches=$($script:lastPreviewMatches) bounds=$($script:lastPreviewBounds) gate=$($script:lastPreviewGate) firstStatus='$($script:lastPreviewStatus)' previewRequests=$($script:firstPreviewRequests)->$($script:smokeBackend.Previews.Count) heldPreview=$($null -ne $script:smokeBackend.HeldPreview) holdNext=$($script:smokeBackend.HoldNextPreview)). Keep the interactive smoke window unobscured. TreeIds=$($treeIds -join ',')"
 }
 
@@ -419,7 +444,7 @@ function Find-PickerRoot([Windows.Automation.AutomationElement]$Window, [Diagnos
         $title = switch ($Key) {
             'claude_accent' { 'Claude Code bar accent' }
             'codex_accent' { 'Codex bar accent' }
-            default { 'Provider mark and percentage color' }
+            default { 'Provider logo and percentage color' }
         }
         Assert ($picker.Current.Name -ceq "$title RGB color") 'The native picker has an unexpected accessible name.'
         return [Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($picker)
@@ -459,6 +484,34 @@ function Invoke-PickerAction([Windows.Automation.AutomationElement]$Root, [strin
     throw "The color picker stayed open after $Name."
 }
 
+function Enter-CodexDetail([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process) {
+    $pencil = Find-Control $Window 'EditProvider_show_codex'
+    Assert ($null -ne $pencil) 'Missing Codex pencil button.'
+    Show-SmokeControl $pencil
+    $pencil.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process 'opening the Codex appearance detail'
+        if ($null -ne (Find-Control $Window 'Color_codex_accent')) { return }
+        Start-Sleep -Milliseconds 50
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    throw 'Codex appearance detail did not render its accent input.'
+}
+
+function Exit-CodexDetail([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process) {
+    $back = Find-Control $Window 'ProviderDetailBack'
+    Assert ($null -ne $back) 'Missing detail Back button.'
+    Show-SmokeControl $back
+    $back.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process 'returning to the Appearance provider list'
+        if ($null -ne (Find-Control $Window 'EditProvider_show_codex')) { return }
+        Start-Sleep -Milliseconds 50
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    throw 'Appearance provider list did not return after Back.'
+}
+
 function Test-AppearanceDraftPreview([Windows.Automation.AutomationElement]$Window,
     [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
     foreach ($entry in @{
@@ -479,6 +532,8 @@ function Test-AppearanceDraftPreview([Windows.Automation.AutomationElement]$Wind
     }
     Wait-BitmapPreview $Window $Process | Out-Null
     Write-Host 'Appearance phase: default bitmap preview'
+    Wait-PreviewColor $Window $Process '#0F8F70'
+    Enter-CodexDetail $Window $Process
     Wait-PreviewColor $Window $Process '#0F8F70'
     $input = Find-Control $Window 'Color_codex_accent'
     # Preserve non-normalized casing across Cancel; accidentally committing the
@@ -505,6 +560,7 @@ function Test-AppearanceDraftPreview([Windows.Automation.AutomationElement]$Wind
     $input = Find-Control $Window 'Color_codex_accent'
     Assert ($input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '') 'Discard did not restore the saved default after picker use.'
     Wait-PreviewColor $Window $Process '#0F8F70'
+    Exit-CodexDetail $Window $Process
     Assert-NoUnexpectedRequests $Pipe
     Assert ($script:smokeBackend.Previews.Count -gt 0) 'Draft editing never requested an actual protocol-v1 preview.'
     Test-StaleBitmapPreview $Window $Pipe $Process
@@ -532,10 +588,16 @@ function Wait-BitmapPreview([Windows.Automation.AutomationElement]$Window, [Diag
 
 function Wait-SmokeCommit([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process, [int]$Before) {
     Assert-Running $Process 'saving the staged setting change'
-    $saveBar = Find-Control $Window 'SavePendingChanges'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $saveBar = $null
+    while ($null -eq $saveBar -and $clock.ElapsedMilliseconds -lt $timeoutMilliseconds) {
+        Assert-Running $Process 'showing the manual save action'
+        $saveBar = Find-Control $Window 'SavePendingChanges'
+        if ($null -eq $saveBar) { Start-Sleep -Milliseconds 20 }
+    }
     Assert ($null -ne $saveBar) 'Missing manual save button for the staged setting change.'
     $saveBar.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
-    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $clock.Restart()
     do {
         Assert-Running $Process 'acknowledging the authorized synthetic setting change'
         $condition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Saved. Changes are now in effect.')
@@ -552,6 +614,9 @@ function Wait-SmokeCommit([Windows.Automation.AutomationElement]$Window, [Diagno
 
 function Test-StaleBitmapPreview([Windows.Automation.AutomationElement]$Window,
     [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    Enter-CodexDetail $Window $Process
+    # Let the detail page's first render finish before holding the draft response.
+    Wait-PreviewColor $Window $Process '#0F8F70'
     $script:smokeBackend.HoldNextPreview = $true
     $input = Find-Control $Window 'Color_codex_accent'
     $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('#654321')
@@ -582,13 +647,14 @@ function Test-StaleBitmapPreview([Windows.Automation.AutomationElement]$Window,
     Assert ($script:smokeBackend.State.settings.codex_accent -eq $null) 'Preview responses mutated the canonical saved accent.'
     (Find-Control $Window 'DiscardColor_codex_accent').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
     Wait-PreviewColor $Window $Process '#0F8F70'
+    Exit-CodexDetail $Window $Process
     Assert-NoUnexpectedRequests $Pipe
 }
 
 function Test-UsageTextColor([Windows.Automation.AutomationElement]$Window,
     [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
     $input = Find-Control $Window 'Color_usage_text_color'
-    Assert ($null -ne $input) 'Missing provider mark and percentage color input.'
+    Assert ($null -ne $input) 'Missing provider logo and percentage color input.'
     $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('#aabbcc')
     Wait-PreviewColor $Window $Process '#AABBCC'
     $root = Open-ColorPicker $Window $Process 'usage_text_color'
@@ -696,6 +762,7 @@ function Request-WindowClose([IntPtr]$Window, [Diagnostics.Process]$Process) {
 function Test-DraftCloseCancellation([Windows.Automation.AutomationElement]$Window,
     [IntPtr]$Handle, [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process,
     [string]$Key = 'codex_accent') {
+    if ($Key -ceq 'codex_accent') { Enter-CodexDetail $Window $Process }
     $input = Find-Control $Window "Color_$Key"
     Assert ($null -ne $input) "Missing $Key draft input."
     $savedText = $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
@@ -726,10 +793,12 @@ function Test-DraftCloseCancellation([Windows.Automation.AutomationElement]$Wind
     Wait-Page $Window $Process 'General'
     foreach ($next in $pages) { Select-Page $Window $Process $next }
     Select-Page $Window $Process 'Appearance'
+    if ($Key -ceq 'codex_accent') { Enter-CodexDetail $Window $Process }
     $input = Find-Control $Window "Color_$Key"
     Assert ($null -ne $input -and $input.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq $savedText) 'Discarded draft returned after navigation.'
     Assert-NoUnexpectedRequests $Pipe
-    Write-Host "Canceled $Key draft close verified: draft discarded, same pipe reactivated General, all six pages navigated, window still usable."
+    if ($Key -ceq 'codex_accent') { Exit-CodexDetail $Window $Process }
+    Write-Host "Canceled $Key draft close verified: draft discarded, same pipe reactivated General, all pages navigated, window still usable."
 }
 
 function Open-Notices([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process) {

@@ -49,8 +49,15 @@ LOBEHUB/LOBE-ICONS
 Project URL: https://github.com/lobehub/lobe-icons
 License: MIT
 Attribution: The Claude and Codex/OpenAI provider logo paths used by Codex Usage
-come from Lobe Icons; see src/icons/providers. The MIT license applies to the
-icon source, not to the brand names or marks, which belong to their owners.
+come from Lobe Icons. The Antigravity, OpenCode, Cursor, Grok, and GitHub Copilot
+paths come from commit bcdb7c82792a854c2967f7328e11a30205ea584d at these source
+paths: src/Antigravity/components/Mono.tsx,
+src/OpenCode/components/Mono.tsx, src/Cursor/components/Mono.tsx,
+src/Grok/components/Mono.tsx, and src/GithubCopilot/components/Mono.tsx. The
+sources and generated assets are in src/icons/providers. The MIT license applies
+to the icon source, not to the brand names or marks, which belong to their
+respective owners. Codex Usage is not affiliated with or endorsed by these
+providers.
 
 MIT License
 

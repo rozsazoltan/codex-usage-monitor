@@ -2,7 +2,16 @@
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationCore, WindowsBase
 $IconDirectory = Join-Path $PSScriptRoot '..\src\icons\providers'
-foreach ($Provider in @(@{Name='claude'; Color='#D97757'}, @{Name='openai'; Color='#10A37F'})) {
+$Providers = @(
+    @{Name='claude'; Color='#D97757'},
+    @{Name='openai'; Color='#10A37F'},
+    @{Name='antigravity'; Color='#4285F4'},
+    @{Name='opencode'; Color='#5B8DEF'},
+    @{Name='cursor'; Color='#6E6E6E'},
+    @{Name='grok'; Color='#A8A8A8'},
+    @{Name='copilot'; Color='#A371F7'}
+)
+foreach ($Provider in $Providers) {
     [xml]$Svg = Get-Content -Raw -LiteralPath (Join-Path $IconDirectory ($Provider.Name + '.svg'))
     $Geometry = [Windows.Media.Geometry]::Parse($Svg.svg.path.d).Clone()
     $Geometry.Transform = [Windows.Media.ScaleTransform]::new(64.0 / 24, 64.0 / 24)

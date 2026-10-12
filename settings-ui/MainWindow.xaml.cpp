@@ -327,6 +327,17 @@ namespace winrt::SettingsUI::implementation
         }
         HIGHCONTRASTW contrast{ sizeof(contrast) };
         const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) && (contrast.dwFlags & HCF_HIGHCONTRASTON);
+        OSVERSIONINFOW iconVersion{ sizeof(iconVersion) };
+        using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+        auto ntdll = GetModuleHandleW(L"ntdll.dll");
+        auto getVersion = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"));
+        if (getVersion && getVersion(&iconVersion) == 0 && iconVersion.dwBuildNumber >= 22000)
+        {
+            auto chemistryIcon = FontIcon();
+            chemistryIcon.Glyph(L"\xF196");
+            chemistryIcon.FontFamily(Microsoft::UI::Xaml::Media::FontFamily(L"Segoe Fluent Icons"));
+            NavigationExperimental().Icon(chemistryIcon);
+        }
         if (highContrast)
         {
             SystemBackdrop(nullptr);
@@ -336,9 +347,6 @@ namespace winrt::SettingsUI::implementation
         else
         {
             OSVERSIONINFOW version{ sizeof(version) };
-            using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
-            auto ntdll = GetModuleHandleW(L"ntdll.dll");
-            auto getVersion = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"));
             if (getVersion && getVersion(&version) == 0 && version.dwBuildNumber < 22000)
             {
                 SystemBackdrop(nullptr);
@@ -1212,12 +1220,6 @@ namespace winrt::SettingsUI::implementation
         ++widgetPreviewGeneration_;
         ++widgetPreviewImageGeneration_;
         previewPending_ = true;
-        if (widgetPreviewStatus_) widgetPreviewStatus_.Text(L"Updating the sample from the widget…");
-        if (widgetPreviewImage_)
-        {
-            widgetPreviewImage_.Visibility(Visibility::Collapsed);
-            displayedWidgetPreviewBase64_.clear();
-        }
         if (previewTimer_) { previewTimer_.Stop(); previewTimer_.Start(); }
     }
     void MainWindow::SendWidgetPreviewIfIdle()
@@ -1323,6 +1325,7 @@ namespace winrt::SettingsUI::implementation
                 self->widgetPreviewImage_.Width((self->widgetPreviewWidthPx_ ? self->widgetPreviewWidthPx_ : bitmap.PixelWidth()) / scale);
                 self->widgetPreviewImage_.Height((self->widgetPreviewHeightPx_ ? self->widgetPreviewHeightPx_ : bitmap.PixelHeight()) / scale);
                 self->widgetPreviewImage_.Visibility(Visibility::Visible);
+                self->UpdatePreviewOverflow();
                 self->displayedWidgetPreviewBase64_ = displayKey;
                 self->widgetPreviewStatus_.Text(L"Sample values rendered by the widget.");
             }
@@ -1625,15 +1628,16 @@ namespace winrt::SettingsUI::implementation
         uninstallDescription_ = nullptr;
         checkForUpdatesButton_ = nullptr;
         PageTitle().Text(page == L"Update" ? L"Software update" : page);
-        PageEyebrow().Text(page == L"About" ? L"ABOUT CODEX USAGE" : page == L"Update" ? L"KEEPING CURRENT" : L"PREFERENCES");
+        PageEyebrow().Text(page == L"About" ? L"ABOUT CODEX USAGE" : page == L"Update" ? L"KEEPING CURRENT" : page == L"Experimental" ? L"TRY WITH CARE" : L"PREFERENCES");
         const std::map<std::wstring, std::wstring> summaries{
             {L"General",L"Manage startup, taskbar visibility, and language."}, {L"Monitoring",L"Choose providers and refresh options."},
             {L"Appearance",L"Choose the widget’s theme and visual settings."}, {L"Placement",L"Choose the display and taskbar position."},
             {L"About",L"A closer look at the app, how it works, and its project details."},
+            {L"Experimental",L"Opt in to experimental limits and extras."},
             {L"Update",L"See the current update status and install the latest available version."}};
         PageSummary().Text(summaries.at(page));
         hydrating_ = true;
-        if (page == L"General") BuildGeneral(); else if (page == L"Monitoring") BuildMonitoring(); else if (page == L"Appearance") { if (detailProvider_ >= 0 && detailProvider_ < 7) BuildProviderDetail(detailProvider_); else BuildAppearance(); } else if (page == L"Placement") BuildPlacement(); else if (page == L"Update") BuildUpdate(); else BuildAbout();
+        if (page == L"General") BuildGeneral(); else if (page == L"Monitoring") BuildMonitoring(); else if (page == L"Appearance") { if (detailProvider_ >= 0 && detailProvider_ < 7) BuildProviderDetail(detailProvider_); else BuildAppearance(); } else if (page == L"Placement") BuildPlacement(); else if (page == L"Update") BuildUpdate(); else if (page == L"Experimental") BuildExperimental(); else BuildAbout();
         hydrating_ = false;
     }
 
@@ -1658,7 +1662,7 @@ namespace winrt::SettingsUI::implementation
         toggle(L"startup", L"Start with Windows", L"Open the widget when you sign in.");
         toggle(L"widget_visible", L"Show the taskbar widget", L"Keep the live usage view visible in your taskbar.");
         toggle(L"show_tray_icon", L"Show the Windows notification-area icon", L"Show or hide Codex Usage’s separate icon beside the Windows clock.");
-        toggle(L"show_provider_icon", L"Show provider marks inside the widget", L"Show or hide the small provider icons in the usage widget; this does not affect the Windows notification-area icon.");
+        toggle(L"show_provider_icon", L"Show provider logos inside the widget", L"Show or hide the small provider logos in the usage widget; this does not affect the Windows notification-area icon.");
         auto languageRow = StackPanel(); languageRow.Spacing(8); languageRow.Children().Append(Label(L"Language"));
         auto languages = ComboBox(); Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(languages, L"Language"); Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(languages, L"LanguageSelector"); languages.MinWidth(230); languages.HorizontalAlignment(HorizontalAlignment::Left);
         if (state_ && state_.HasKey(L"languages")) for (auto const& value : state_.GetNamedArray(L"languages"))
@@ -1694,10 +1698,18 @@ namespace winrt::SettingsUI::implementation
         add(L"show_cursor",L"Cursor",L"Monitor your Cursor usage.",Bool(L"show_cursor"),false);
         add(L"show_grok",L"Grok",L"Monitor your Grok usage.",Bool(L"show_grok"),false);
         add(L"show_copilot",L"Copilot",L"Monitor your GitHub Copilot usage.",Bool(L"show_copilot"),false);
-        auto note=Label(L"At least one provider must stay enabled.",12);note.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());p.Children().Append(note);providers.Child(p);PageHost().Children().Append(providers);
+        auto note=Label(L"At least one provider must stay enabled.",12);note.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());p.Children().Append(note);
+        auto personalizeFooter = StackPanel(); personalizeFooter.Orientation(Orientation::Horizontal); personalizeFooter.Spacing(8);
+        auto personalizeNote = Label(L"Want to personalize the appearance?", 12);
+        personalizeNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        personalizeNote.VerticalAlignment(VerticalAlignment::Center);
+        auto personalizeLink = HyperlinkButton(); personalizeLink.Content(box_value(L"Open Appearance settings"));
+        personalizeLink.Click([this](auto const&, auto const&) { NavigateTo(L"Appearance"); });
+        personalizeFooter.Children().Append(personalizeNote); personalizeFooter.Children().Append(personalizeLink);
+        p.Children().Append(personalizeFooter); providers.Child(p);PageHost().Children().Append(providers);
         auto widgetCard = Card(); auto widgetSettings = StackPanel(); widgetSettings.Spacing(14);
         widgetSettings.Children().Append(Label(L"Widget contents", 19));
-        widgetSettings.Children().Append(Label(L"Choose what appears in the taskbar widget. Keep at least one usage value visible; provider marks alone do not count.", 12));
+         widgetSettings.Children().Append(Label(L"Choose what appears in the taskbar widget. Keep at least one usage value visible; provider logos alone do not count.", 12));
         auto addWidgetToggle = [this, &widgetSettings](std::wstring const& key, std::wstring const& title, std::wstring const& detail)
         {
             auto copy = StackPanel(); copy.Spacing(3); copy.Children().Append(Label(title));
@@ -1898,7 +1910,18 @@ namespace winrt::SettingsUI::implementation
         group.Children().Append(row); parent.Children().Append(group);
     }
 
-    void MainWindow::BuildAppearance()
+    void MainWindow::UpdatePreviewOverflow()
+    {
+        if (!previewOverflowWarning_ || !widgetPreviewImage_ || !appearancePreviewCard_) return;
+        const auto stack = appearancePreviewCard_.Child().try_as<StackPanel>();
+        const bool tooWide = stack && widgetPreviewImage_.Visibility() == Visibility::Visible &&
+            widgetPreviewImage_.ActualWidth() > 0 && stack.ActualWidth() > 0 &&
+            widgetPreviewImage_.ActualWidth() > stack.ActualWidth();
+        const bool show = tooWide && Bool(L"allow_unlimited_providers");
+        previewOverflowWarning_.Visibility(show ? Visibility::Visible : Visibility::Collapsed);
+    }
+
+    void MainWindow::BuildPreviewCard()
     {
         auto previewCard = Card();
         auto previewStack = StackPanel(); previewStack.Spacing(10);
@@ -1920,51 +1943,106 @@ namespace winrt::SettingsUI::implementation
         widgetPreviewStatus_.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(widgetPreviewStatus_, L"WidgetPreviewStatus");
         previewStack.Children().Append(widgetPreviewStatus_);
+        previewOverflowWarning_ = Label(L"The full preview needs a bigger window to fit. Widen the Settings window to see every provider.", 12);
+        previewOverflowWarning_.Foreground(Application::Current().Resources().Lookup(box_value(L"SystemFillColorCautionBrush")).as<Media::Brush>());
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(previewOverflowWarning_, L"PreviewOverflowWarning");
+        previewOverflowWarning_.Visibility(Visibility::Collapsed);
+        previewOverflowWarning_.TextWrapping(TextWrapping::Wrap);
+        previewStack.Children().Append(previewOverflowWarning_);
+        previewStack.SizeChanged([this](auto const&, auto const&) { UpdatePreviewOverflow(); });
         previewCard.Child(previewStack); PageHost().Children().Append(previewCard);
         appearancePreviewCard_ = previewCard;
         ScheduleWidgetPreview();
         UpdateWidgetPreview(state_);
+    }
+
+    void MainWindow::BuildAppearance()
+    {
+        BuildPreviewCard();
 
         auto providersCard = Card(); auto providers = StackPanel(); providers.Spacing(10);
         providers.Children().Append(Label(L"Providers", 19));
         auto providersNote = Label(L"Edit each provider's widget appearance separately.", 12);
         providersNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
         providers.Children().Append(providersNote);
-        int providerRowIndex = 0;
-        for (auto const& meta : ProviderAppearanceMeta())
+        auto providerTiles = Grid(); providerTiles.ColumnSpacing(12); providerTiles.RowSpacing(12);
         {
-            auto rowGrid = Grid();
+            auto singleColumn = ColumnDefinition(); singleColumn.Width(GridLength{ 1, GridUnitType::Star });
+            providerTiles.ColumnDefinitions().Append(singleColumn);
+        }
+        const auto allProviders = ProviderAppearanceMeta();
+        for (int metaIndex = 0; metaIndex < static_cast<int>(allProviders.size()); ++metaIndex)
+        {
+            const auto& meta = allProviders[static_cast<size_t>(metaIndex)];
+            if (!Bool(meta.enable)) continue;
+            auto tile = Grid();
             auto starColumn = ColumnDefinition(); starColumn.Width(GridLength{ 1, GridUnitType::Star });
             auto autoColumn = ColumnDefinition(); autoColumn.Width(GridLength{ 1, GridUnitType::Auto });
-            rowGrid.ColumnDefinitions().Append(starColumn); rowGrid.ColumnDefinitions().Append(autoColumn);
+            tile.ColumnDefinitions().Append(starColumn); tile.ColumnDefinitions().Append(autoColumn);
             auto providerName = Label(meta.name); providerName.VerticalAlignment(VerticalAlignment::Center);
             Grid::SetColumn(providerName, 0);
             auto editProvider = Button(); editProvider.Content(SymbolIcon(Symbol::Edit));
             Grid::SetColumn(editProvider, 1);
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(editProvider, meta.name + L" appearance settings");
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(editProvider, std::wstring(L"EditProvider_") + meta.enable);
-            const int tappedProvider = providerRowIndex;
-            editProvider.Click([this, tappedProvider](auto const&, auto const&)
+            editProvider.Click([this, metaIndex](auto const&, auto const&)
             {
-                detailProvider_ = tappedProvider;
+                detailProvider_ = metaIndex;
                 RenderPage(L"Appearance");
                 if (pageScroll_) pageScroll_.ScrollToVerticalOffset(0);
             });
-            rowGrid.Children().Append(providerName); rowGrid.Children().Append(editProvider);
-            providers.Children().Append(rowGrid);
-            ++providerRowIndex;
+            tile.Children().Append(providerName); tile.Children().Append(editProvider);
+            providerTiles.Children().Append(tile);
         }
+        providerTiles.SizeChanged([](auto const& sender, auto const&)
+        {
+            auto grid = sender.as<Grid>();
+            const auto width = grid.ActualWidth();
+            const int cols = width >= 900 ? 3 : width >= 560 ? 2 : 1;
+            grid.ColumnDefinitions().Clear();
+            for (int c = 0; c < cols; ++c)
+            {
+                auto def = ColumnDefinition();
+                def.Width(GridLength{ 1, GridUnitType::Star });
+                grid.ColumnDefinitions().Append(def);
+            }
+            const int count = static_cast<int>(grid.Children().Size());
+            const int rows = count > 0 ? (count + cols - 1) / cols : 0;
+            grid.RowDefinitions().Clear();
+            for (int r = 0; r < rows; ++r)
+            {
+                auto rowDef = RowDefinition();
+                rowDef.Height(GridLength{ 1, GridUnitType::Auto });
+                grid.RowDefinitions().Append(rowDef);
+            }
+            for (int i = 0; i < count; ++i)
+            {
+                auto child = grid.Children().GetAt(static_cast<uint32_t>(i)).as<FrameworkElement>();
+                Grid::SetRow(child, i / cols);
+                Grid::SetColumn(child, i % cols);
+            }
+        });
+        providers.Children().Append(providerTiles);
+        auto providersFooter = StackPanel(); providersFooter.Orientation(Orientation::Horizontal); providersFooter.Spacing(4);
+        auto providersFooterNote = Label(L"Only enabled providers can be personalized here.", 12);
+        providersFooterNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        providersFooterNote.VerticalAlignment(VerticalAlignment::Center);
+        auto providersFooterLink = HyperlinkButton(); providersFooterLink.Content(box_value(L"Choose your providers"));
+        providersFooterLink.Click([this](auto const&, auto const&) { NavigateTo(L"Monitoring"); });
+        providersFooter.Children().Append(providersFooterNote); providersFooter.Children().Append(providersFooterLink);
+        providers.Children().Append(providersFooter);
         providersCard.Child(providers); PageHost().Children().Append(providersCard);
 
         auto styleCard = Card();
         auto style = StackPanel(); style.Spacing(16);
         style.Children().Append(Label(L"Widget style", 19));
 
+        auto styleCombos = Grid(); styleCombos.ColumnSpacing(12); styleCombos.RowSpacing(16);
         auto theme = ComboBox();
         auto bars = ComboBox();
         auto thickness = ComboBox();
         auto fontSize = ComboBox();
-        auto addCombo = [this](StackPanel const& parent, ComboBox const& combo, std::wstring const& title,
+        auto addCombo = [this](Panel const& parent, ComboBox const& combo, std::wstring const& title,
             std::wstring const& key, std::vector<std::pair<std::wstring, std::wstring>> const& values)
         {
             auto group = StackPanel(); group.Spacing(6); group.Children().Append(Label(title));
@@ -1985,10 +2063,26 @@ namespace winrt::SettingsUI::implementation
             });
             group.Children().Append(combo); parent.Children().Append(group);
         };
-        addCombo(style, theme, L"Theme", L"palette", {{L"system",L"Follow Windows"},{L"high_contrast_dark",L"Dark"},{L"high_contrast_light",L"Light"}});
-        addCombo(style, bars, L"Progress bars", L"bar_style", {{L"continuous",L"Continuous"},{L"segmented",L"Segmented"}});
-        addCombo(style, thickness, L"Bar thickness", L"bar_thickness", {{L"standard",L"Standard"},{L"slim",L"Slim"}});
-        addCombo(style, fontSize, L"Text size", L"font_size", {{L"standard",L"Standard"},{L"large",L"Large"}});
+        addCombo(styleCombos, theme, L"Theme", L"palette", {{L"system",L"Follow Windows"},{L"high_contrast_dark",L"Dark"},{L"high_contrast_light",L"Light"}});
+        addCombo(styleCombos, bars, L"Progress bars", L"bar_style", {{L"continuous",L"Continuous"},{L"segmented",L"Segmented"}});
+        addCombo(styleCombos, thickness, L"Bar thickness", L"bar_thickness", {{L"standard",L"Standard"},{L"slim",L"Slim"}});
+        addCombo(styleCombos, fontSize, L"Text size", L"font_size", {{L"standard",L"Standard"},{L"large",L"Large"}});
+        styleCombos.SizeChanged([styleCombos](auto const& sender, auto const&) mutable
+        {
+            const auto width = sender.as<Grid>().ActualWidth();
+            const int columns = width >= 900 ? 3 : width >= 560 ? 2 : 1;
+            styleCombos.ColumnDefinitions().Clear(); styleCombos.RowDefinitions().Clear();
+            for (int c = 0; c < columns; ++c) styleCombos.ColumnDefinitions().Append(ColumnDefinition());
+            const uint32_t childCount = styleCombos.Children().Size();
+            const int rows = static_cast<int>((childCount + static_cast<uint32_t>(columns) - 1) / static_cast<uint32_t>(columns));
+            for (int r = 0; r < rows; ++r) styleCombos.RowDefinitions().Append(RowDefinition());
+            for (uint32_t i = 0; i < childCount; ++i)
+            {
+                Grid::SetColumn(styleCombos.Children().GetAt(i).as<FrameworkElement>(), static_cast<int>(i) % columns);
+                Grid::SetRow(styleCombos.Children().GetAt(i).as<FrameworkElement>(), static_cast<int>(i) / columns);
+            }
+        });
+        style.Children().Append(styleCombos);
         auto labelSizeGroup = StackPanel(); labelSizeGroup.Spacing(6);
         labelSizeGroup.Children().Append(Label(L"Usage window label size"));
         auto labelSizeNote = Label(L"Sets the 5-hour and 7-day labels in the widget using normal weight.", 12);
@@ -2011,6 +2105,7 @@ namespace winrt::SettingsUI::implementation
                 SetValue(L"window_label_font_size", JsonValue::CreateNumberValue(unbox_value<int32_t>(control.SelectedItem().as<ComboBoxItem>().Tag())));
         });
         labelSizeGroup.Children().Append(labelSize); style.Children().Append(labelSizeGroup);
+        AddAccentColorRow(style, L"usage_text_color", L"Provider logo and percentage color");
 
         // The live preview now leads the page; see the top of BuildAppearance.
 
@@ -2030,46 +2125,6 @@ namespace winrt::SettingsUI::implementation
         }
         style.Children().Append(buttons); styleCard.Child(style); PageHost().Children().Append(styleCard);
 
-        auto marksCard = Card(); auto marks = StackPanel(); marks.Spacing(14);
-        marks.Children().Append(Label(L"Provider marks", 19));
-        auto marksNote = Label(L"Show or hide each provider’s mark and percentage in the widget. Provider marks alone do not count toward the visible usage value.", 12);
-        marksNote.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
-        marks.Children().Append(marksNote);
-        for (auto const& [markKey, markTitle] : std::array<std::pair<std::wstring, std::wstring>, 7>{{
-            {L"show_claude_icon",L"Claude Code mark"},{L"show_codex_icon",L"Codex mark"},
-            {L"show_antigravity_icon",L"Antigravity mark"},{L"show_opencode_icon",L"OpenCode mark"},
-            {L"show_cursor_icon",L"Cursor mark"},{L"show_grok_icon",L"Grok mark"},
-            {L"show_copilot_icon",L"Copilot mark"}}})
-        {
-            auto copy = StackPanel(); copy.Spacing(3); copy.Children().Append(Label(markTitle));
-            auto markToggle = ToggleSwitch(); SetSwitchContent(markToggle);
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(markToggle, markTitle);
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(markToggle, std::wstring(L"Setting_") + markKey);
-            markToggle.IsOn(State().GetNamedBoolean(markKey, true));
-            markToggle.Toggled([this, markKey](auto const& sender, auto const&)
-            {
-                auto control = sender.as<ToggleSwitch>();
-                if (hydrating_) return;
-                SetValue(markKey, JsonValue::CreateBooleanValue(control.IsOn()));
-            });
-            marks.Children().Append(ToggleRow(copy, markToggle));
-        }
-        marksCard.Child(marks); PageHost().Children().Append(marksCard);
-
-        auto colorsCard = Card(); auto colors = StackPanel(); colors.Spacing(12);
-        colors.Children().Append(Label(L"Widget colors", 19));
-        colors.Children().Append(Label(L"Progress-bar accents stay provider-specific. The shared text color applies to provider marks and usage percentages.", 12));
-        colors.Children().Append(Label(L"Progress-bar accents", 14));
-        for (auto const& [key, title] : std::array<std::pair<std::wstring, std::wstring>, 8>{{
-            {L"claude_accent",L"Claude Code bar accent"},{L"codex_accent",L"Codex bar accent"},
-            {L"antigravity_accent",L"Antigravity bar accent"},{L"opencode_accent",L"OpenCode bar accent"},
-            {L"cursor_accent",L"Cursor bar accent"},{L"grok_accent",L"Grok bar accent"},
-            {L"copilot_accent",L"Copilot bar accent"},
-            {L"usage_text_color",L"Provider mark and percentage color"}}})
-        {
-            AddAccentColorRow(colors, key, title);
-        }
-        colorsCard.Child(colors); PageHost().Children().Append(colorsCard);
         if (pageScroll_ && pageScroll_.VerticalOffset() > 8)
         {
             auto weak = get_weak();
@@ -2089,9 +2144,12 @@ namespace winrt::SettingsUI::implementation
             return;
         }
         const auto& meta = metas[static_cast<size_t>(provider)];
-        auto card = Card(); auto stack = StackPanel(); stack.Spacing(12);
-        auto back = Button(); back.Content(box_value(L"Back"));
-        back.HorizontalAlignment(HorizontalAlignment::Left);
+        BuildPreviewCard();
+        auto titleCard = Card();
+        auto titleRow = StackPanel(); titleRow.Orientation(Orientation::Horizontal); titleRow.Spacing(12);
+        titleRow.VerticalAlignment(VerticalAlignment::Center);
+        auto back = Button(); back.Content(SymbolIcon(Symbol::Back));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(back, L"Back to providers");
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(back, L"ProviderDetailBack");
         back.Click([this](auto const&, auto const&)
         {
@@ -2099,8 +2157,12 @@ namespace winrt::SettingsUI::implementation
             RenderPage(L"Appearance");
             if (pageScroll_) pageScroll_.ScrollToVerticalOffset(0);
         });
-        stack.Children().Append(back);
-        stack.Children().Append(Label(meta.name, 19));
+        titleRow.Children().Append(back);
+        titleRow.Children().Append(Label(meta.name, 19));
+        titleCard.Child(titleRow);
+        appearanceDetailTitleCard_ = titleCard;
+        PageHost().Children().Append(titleCard);
+        auto card = Card(); auto stack = StackPanel(); stack.Spacing(12);
         auto enableCopy = StackPanel(); enableCopy.Spacing(3); enableCopy.Children().Append(Label(L"Show in widget"));
         auto enableToggle = ToggleSwitch(); SetSwitchContent(enableToggle);
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(enableToggle, meta.name);
@@ -2113,9 +2175,9 @@ namespace winrt::SettingsUI::implementation
             SetValue(meta.enable, JsonValue::CreateBooleanValue(control.IsOn()));
         });
         stack.Children().Append(ToggleRow(enableCopy, enableToggle));
-        auto iconCopy = StackPanel(); iconCopy.Spacing(3); iconCopy.Children().Append(Label(L"Provider mark"));
+        auto iconCopy = StackPanel(); iconCopy.Spacing(3); iconCopy.Children().Append(Label(L"Provider logo"));
         auto iconToggle = ToggleSwitch(); SetSwitchContent(iconToggle);
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(iconToggle, meta.name + L" mark");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(iconToggle, meta.name + L" logo");
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(iconToggle, std::wstring(L"Setting_") + meta.icon);
         iconToggle.IsOn(State().GetNamedBoolean(meta.icon, true));
         iconToggle.Toggled([this, meta](auto const& sender, auto const&)
@@ -2133,6 +2195,7 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::ClearStickyPreview()
     {
         appearancePreviewFloating_ = false;
+        appearanceTitleFloating_ = false;
         appearancePreviewFloatOffset_ = 0;
         if (appearancePreviewCard_)
         {
@@ -2141,6 +2204,13 @@ namespace winrt::SettingsUI::implementation
                 StickyPreviewHost().Children().RemoveAt(index);
             appearancePreviewCard_ = nullptr;
         }
+        if (appearanceDetailTitleCard_)
+        {
+            uint32_t index{};
+            if (StickyPreviewHost().Children().IndexOf(appearanceDetailTitleCard_, index))
+                StickyPreviewHost().Children().RemoveAt(index);
+            appearanceDetailTitleCard_ = nullptr;
+        }
         if (appearancePreviewPlaceholder_)
         {
             uint32_t placeholderIndex{};
@@ -2148,44 +2218,84 @@ namespace winrt::SettingsUI::implementation
                 PageHost().Children().RemoveAt(placeholderIndex);
             appearancePreviewPlaceholder_ = nullptr;
         }
+        if (appearanceDetailTitlePlaceholder_)
+        {
+            uint32_t placeholderIndex{};
+            if (PageHost().Children().IndexOf(appearanceDetailTitlePlaceholder_, placeholderIndex))
+                PageHost().Children().RemoveAt(placeholderIndex);
+            appearanceDetailTitlePlaceholder_ = nullptr;
+        }
         StickyPreviewHost().Visibility(Visibility::Collapsed);
     }
 
     void MainWindow::UpdateStickyPreview()
     {
-        if (closed_ || page_ != L"Appearance" || !appearancePreviewCard_ || !pageScroll_) return;
+        if (closed_ || page_ != L"Appearance" || !pageScroll_) return;
         try
         {
-            if (!appearancePreviewFloating_)
+            if (appearancePreviewCard_ && !appearancePreviewFloating_ && pageScroll_.VerticalOffset() > 8)
             {
-                if (pageScroll_.VerticalOffset() <= 8) return;
                 Windows::Foundation::Point origin{ 0, 0 };
                 const auto top = appearancePreviewCard_.TransformToVisual(pageScroll_).TransformPoint(origin).Y;
-                if (top > 0) return;
-                uint32_t index{};
-                if (!PageHost().Children().IndexOf(appearancePreviewCard_, index)) return;
-                const auto cardHeight = appearancePreviewCard_.ActualHeight();
-                const auto cardMargin = appearancePreviewCard_.Margin();
-                PageHost().Children().RemoveAt(index);
-                if (cardHeight > 0)
+                if (top <= 0)
                 {
-                    auto placeholder = Controls::Border();
-                    placeholder.Height(cardHeight);
-                    placeholder.Margin(cardMargin);
-                    placeholder.Background(nullptr);
-                    PageHost().Children().InsertAt(index, placeholder);
-                    appearancePreviewPlaceholder_ = placeholder;
+                    uint32_t index{};
+                    if (PageHost().Children().IndexOf(appearancePreviewCard_, index))
+                    {
+                        const auto cardHeight = appearancePreviewCard_.ActualHeight();
+                        const auto cardMargin = appearancePreviewCard_.Margin();
+                        PageHost().Children().RemoveAt(index);
+                        if (cardHeight > 0)
+                        {
+                            auto placeholder = Controls::Border();
+                            placeholder.Height(cardHeight);
+                            placeholder.Margin(cardMargin);
+                            placeholder.Background(nullptr);
+                            PageHost().Children().InsertAt(index, placeholder);
+                            appearancePreviewPlaceholder_ = placeholder;
+                        }
+                        StickyPreviewHost().Children().Append(appearancePreviewCard_);
+                        StickyPreviewHost().Visibility(Visibility::Visible);
+                        appearancePreviewCard_.Background(Application::Current().Resources().Lookup(box_value(L"SolidBackgroundFillColorBaseBrush")).as<Media::Brush>());
+                        appearancePreviewFloating_ = true;
+                        appearancePreviewFloatOffset_ = pageScroll_.VerticalOffset();
+                    }
                 }
-                StickyPreviewHost().Children().Append(appearancePreviewCard_);
-                StickyPreviewHost().Visibility(Visibility::Visible);
-                appearancePreviewCard_.Background(Application::Current().Resources().Lookup(box_value(L"SolidBackgroundFillColorBaseBrush")).as<Media::Brush>());
-                appearancePreviewFloating_ = true;
-                appearancePreviewFloatOffset_ = pageScroll_.VerticalOffset();
             }
-            else if (pageScroll_.VerticalOffset() <= appearancePreviewFloatOffset_ - 32)
+            if (appearanceDetailTitleCard_ && !appearanceTitleFloating_ && pageScroll_.VerticalOffset() > 8)
+            {
+                Windows::Foundation::Point origin{ 0, 0 };
+                const auto top = appearanceDetailTitleCard_.TransformToVisual(pageScroll_).TransformPoint(origin).Y;
+                if (top <= 0)
+                {
+                    uint32_t index{};
+                    if (PageHost().Children().IndexOf(appearanceDetailTitleCard_, index))
+                    {
+                        const auto cardHeight = appearanceDetailTitleCard_.ActualHeight();
+                        const auto cardMargin = appearanceDetailTitleCard_.Margin();
+                        PageHost().Children().RemoveAt(index);
+                        if (cardHeight > 0)
+                        {
+                            auto placeholder = Controls::Border();
+                            placeholder.Height(cardHeight);
+                            placeholder.Margin(cardMargin);
+                            placeholder.Background(nullptr);
+                            PageHost().Children().InsertAt(index, placeholder);
+                            appearanceDetailTitlePlaceholder_ = placeholder;
+                        }
+                        StickyPreviewHost().Children().Append(appearanceDetailTitleCard_);
+                        StickyPreviewHost().Visibility(Visibility::Visible);
+                        appearanceTitleFloating_ = true;
+                    }
+                }
+            }
+            if ((appearancePreviewFloating_ || appearanceTitleFloating_) &&
+                pageScroll_.VerticalOffset() <= appearancePreviewFloatOffset_ - 32)
             {
                 uint32_t index{};
-                if (StickyPreviewHost().Children().IndexOf(appearancePreviewCard_, index))
+                if (appearanceTitleFloating_ && appearanceDetailTitleCard_ && StickyPreviewHost().Children().IndexOf(appearanceDetailTitleCard_, index))
+                    StickyPreviewHost().Children().RemoveAt(index);
+                if (appearancePreviewFloating_ && appearancePreviewCard_ && StickyPreviewHost().Children().IndexOf(appearancePreviewCard_, index))
                     StickyPreviewHost().Children().RemoveAt(index);
                 if (appearancePreviewPlaceholder_)
                 {
@@ -2194,10 +2304,28 @@ namespace winrt::SettingsUI::implementation
                         PageHost().Children().RemoveAt(placeholderIndex);
                     appearancePreviewPlaceholder_ = nullptr;
                 }
-                PageHost().Children().InsertAt(0, appearancePreviewCard_);
-                appearancePreviewCard_.Background(Application::Current().Resources().Lookup(box_value(L"CardBackgroundFillColorDefaultBrush")).as<Media::Brush>());
+                if (appearanceDetailTitlePlaceholder_)
+                {
+                    uint32_t placeholderIndex{};
+                    if (PageHost().Children().IndexOf(appearanceDetailTitlePlaceholder_, placeholderIndex))
+                        PageHost().Children().RemoveAt(placeholderIndex);
+                    appearanceDetailTitlePlaceholder_ = nullptr;
+                }
+                if (appearancePreviewFloating_ && appearancePreviewCard_)
+                {
+                    PageHost().Children().InsertAt(0, appearancePreviewCard_);
+                    appearancePreviewCard_.Background(Application::Current().Resources().Lookup(box_value(L"CardBackgroundFillColorDefaultBrush")).as<Media::Brush>());
+                }
+                if (appearanceTitleFloating_ && appearanceDetailTitleCard_)
+                {
+                    if (PageHost().Children().Size() >= 1)
+                        PageHost().Children().InsertAt(1, appearanceDetailTitleCard_);
+                    else
+                        PageHost().Children().Append(appearanceDetailTitleCard_);
+                }
                 StickyPreviewHost().Visibility(Visibility::Collapsed);
                 appearancePreviewFloating_ = false;
+                appearanceTitleFloating_ = false;
                 appearancePreviewFloatOffset_ = 0;
             }
         }
@@ -2208,6 +2336,31 @@ namespace winrt::SettingsUI::implementation
     {
         auto card=Card();auto stack=StackPanel();stack.Spacing(16);stack.Children().Append(Label(L"Taskbar placement",19));stack.Children().Append(Label(L"Choose the display where the widget should appear. The widget stays aligned with the taskbar.",13));auto monitors=ComboBox();Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(monitors,L"Monitor device");Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(monitors,L"MonitorSelector");monitors.MinWidth(250);monitors.MaxWidth(520);monitors.HorizontalAlignment(HorizontalAlignment::Left);auto automatic=ComboBoxItem();automatic.Content(box_value(L"Automatic (primary display)"));automatic.Tag(box_value(L""));monitors.Items().Append(automatic);if(state_&&state_.HasKey(L"monitors"))for(auto const& v:state_.GetNamedArray(L"monitors")){auto m=v.GetObject();auto device=m.GetNamedString(L"device",L"");auto item=ComboBoxItem();item.Content(box_value(std::wstring(m.GetNamedBoolean(L"primary",false)?L"Primary display · ":L"Display · ")+device));item.Tag(box_value(device));monitors.Items().Append(item);}monitors.SelectedIndex(0);auto current=Text(L"monitor_device");if(state_&&State().HasKey(L"monitor_device")&&State().GetNamedValue(L"monitor_device").ValueType()==JsonValueType::String)current=std::wstring(State().GetNamedString(L"monitor_device").c_str());for(uint32_t i=0;i<monitors.Items().Size();++i)if(std::wstring(unbox_value<hstring>(monitors.Items().GetAt(i).as<ComboBoxItem>().Tag()).c_str())==current)monitors.SelectedIndex(i);monitors.SelectionChanged([this](auto const&sender,auto const&){auto control=sender.as<ComboBox>();if(!hydrating_&&control.SelectedItem()){auto val=unbox_value<hstring>(control.SelectedItem().as<ComboBoxItem>().Tag());SetValue(L"monitor_device",val.empty()?JsonValue::CreateNullValue():JsonValue::CreateStringValue(val));}});stack.Children().Append(monitors);
          auto sideCopy=StackPanel();sideCopy.Spacing(3);sideCopy.Children().Append(Label(L"Anchor to the left"));auto sideDetail=Label(L"Place the widget at the left edge of the taskbar.",12);sideDetail.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());sideCopy.Children().Append(sideDetail);auto side=ToggleSwitch();Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(side,L"Anchor to the left");Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(side,L"Setting_anchor_left");SetSwitchContent(side);side.IsOn(Bool(L"anchor_left"));side.Toggled([this](auto const&sender,auto const&){auto control=sender.as<ToggleSwitch>();SetValue(L"anchor_left",JsonValue::CreateBooleanValue(control.IsOn()));});stack.Children().Append(ToggleRow(sideCopy,side));auto reset=Button();reset.Content(box_value(L"Reset position"));Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(reset,L"ResetPlacement");reset.HorizontalAlignment(HorizontalAlignment::Left);reset.Click([this](auto const&,auto const&){Action(L"reset_position");});stack.Children().Append(reset);card.Child(stack);PageHost().Children().Append(card);
+    }
+
+    void MainWindow::NavigateTo(std::wstring const& page)
+    {
+        for (auto const& item : Navigation().MenuItems()) if (auto nav = item.try_as<NavigationViewItem>()) { if (std::wstring(unbox_value<hstring>(nav.Tag()).c_str()) == page) { Navigation().SelectedItem(item); return; } }
+        for (auto const& item : Navigation().FooterMenuItems()) if (auto nav = item.try_as<NavigationViewItem>()) { if (std::wstring(unbox_value<hstring>(nav.Tag()).c_str()) == page) { Navigation().SelectedItem(item); return; } }
+    }
+
+    void MainWindow::BuildExperimental()
+    {
+        auto card = Card(); auto stack = StackPanel(); stack.Spacing(12);
+        stack.Children().Append(Label(L"Experimental", 19));
+        stack.Children().Append(Label(L"Try upcoming ideas early. These options may change or disappear in a later version.", 13));
+        auto copy = StackPanel(); copy.Spacing(3);
+        copy.Children().Append(Label(L"Allow unlimited providers"));
+        auto detail = Label(L"Normally at most 3 providers can stay enabled at once. Enabling irrelevantly many providers is not needed, but the option is here if you want it.", 12);
+        detail.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+        copy.Children().Append(detail);
+        auto toggle = ToggleSwitch();
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle, L"Allow unlimited providers");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(toggle, L"Setting_allow_unlimited_providers");
+        SetSwitchContent(toggle); toggle.IsOn(Bool(L"allow_unlimited_providers"));
+        toggle.Toggled([this](auto const& sender, auto const&) { auto control = sender.as<ToggleSwitch>(); SetValue(L"allow_unlimited_providers", JsonValue::CreateBooleanValue(control.IsOn())); });
+        stack.Children().Append(ToggleRow(copy, toggle));
+        card.Child(stack); PageHost().Children().Append(card);
     }
 
     void MainWindow::BuildAbout()

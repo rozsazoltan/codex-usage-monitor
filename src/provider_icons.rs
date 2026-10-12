@@ -14,6 +14,11 @@ pub const RIGHT_MARGIN: i32 = 5;
 pub enum Provider {
     Claude,
     Codex,
+    Antigravity,
+    OpenCode,
+    Cursor,
+    Grok,
+    Copilot,
 }
 
 pub fn codex_color(is_dark: bool) -> Color {
@@ -25,9 +30,22 @@ pub fn draw(hdc: HDC, x: i32, y: i32, size: i32, provider: Provider, tint: Optio
     // embedded 64px artwork to the current monitor's DPI without disk access.
     static CLAUDE: OnceLock<isize> = OnceLock::new();
     static CODEX: OnceLock<isize> = OnceLock::new();
+    static ANTIGRAVITY: OnceLock<isize> = OnceLock::new();
+    static OPENCODE: OnceLock<isize> = OnceLock::new();
+    static CURSOR: OnceLock<isize> = OnceLock::new();
+    static GROK: OnceLock<isize> = OnceLock::new();
+    static COPILOT: OnceLock<isize> = OnceLock::new();
     let (cache, png): (&OnceLock<isize>, &[u8]) = match provider {
         Provider::Claude => (&CLAUDE, include_bytes!("icons/providers/claude.png")),
         Provider::Codex => (&CODEX, include_bytes!("icons/providers/openai.png")),
+        Provider::Antigravity => (
+            &ANTIGRAVITY,
+            include_bytes!("icons/providers/antigravity.png"),
+        ),
+        Provider::OpenCode => (&OPENCODE, include_bytes!("icons/providers/opencode.png")),
+        Provider::Cursor => (&CURSOR, include_bytes!("icons/providers/cursor.png")),
+        Provider::Grok => (&GROK, include_bytes!("icons/providers/grok.png")),
+        Provider::Copilot => (&COPILOT, include_bytes!("icons/providers/copilot.png")),
     };
     let handle = *cache.get_or_init(|| unsafe {
         CreateIconFromResourceEx(png, true, 0x00030000, 64, 64, LR_DEFAULTCOLOR)
@@ -143,7 +161,15 @@ mod tests {
             let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
             let old = SelectObject(dc, bitmap);
             let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), 256);
-            for provider in [Provider::Claude, Provider::Codex] {
+            for provider in [
+                Provider::Claude,
+                Provider::Codex,
+                Provider::Antigravity,
+                Provider::OpenCode,
+                Provider::Cursor,
+                Provider::Grok,
+                Provider::Copilot,
+            ] {
                 pixels.fill(0);
                 draw(dc, 0, 0, 16, provider, Some([255, 0, 255]));
                 let _ = GdiFlush();

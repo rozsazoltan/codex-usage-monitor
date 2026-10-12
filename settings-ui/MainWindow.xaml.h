@@ -68,6 +68,10 @@ namespace winrt::SettingsUI::implementation
         void BuildPlacement();
         void BuildAbout();
         void BuildUpdate();
+        void BuildExperimental();
+        void NavigateTo(std::wstring const& page);
+        void BuildPreviewCard();
+        void UpdatePreviewOverflow();
         winrt::Windows::Data::Json::JsonObject Setting(std::wstring const& key);
         bool Bool(std::wstring const& key);
         std::wstring Text(std::wstring const& key);
@@ -86,7 +90,11 @@ namespace winrt::SettingsUI::implementation
         winrt::Microsoft::UI::Xaml::Controls::TextBlock widgetPreviewStatus_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Border appearancePreviewCard_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Border appearancePreviewPlaceholder_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::Border appearanceDetailTitleCard_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::Border appearanceDetailTitlePlaceholder_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBlock previewOverflowWarning_{ nullptr };
         bool appearancePreviewFloating_{};
+        bool appearanceTitleFloating_{};
         double appearancePreviewFloatOffset_{};
         winrt::Microsoft::UI::Xaml::Controls::ScrollViewer pageScroll_{ nullptr };
         winrt::event_token pageScrollViewToken_{};

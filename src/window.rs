@@ -102,6 +102,7 @@ struct AppState {
     show_cursor: bool,
     show_grok: bool,
     show_copilot: bool,
+    allow_unlimited_providers: bool,
     show_tray_icon: bool,
     show_provider_icons: bool,
     show_session_window: bool,
@@ -735,6 +736,8 @@ struct SettingsFile {
     show_grok: bool,
     #[serde(default = "default_show_new_provider")]
     show_copilot: bool,
+    #[serde(default)]
+    allow_unlimited_providers: bool,
     #[serde(default = "default_show_usage_window")]
     show_session_window: bool,
     #[serde(default = "default_show_usage_window")]
@@ -764,10 +767,11 @@ impl Default for SettingsFile {
             show_claude_code: false,
             show_codex: true,
             show_antigravity: false,
-            show_opencode: true,
-            show_cursor: true,
-            show_grok: true,
-            show_copilot: true,
+            show_opencode: false,
+            show_cursor: false,
+            show_grok: false,
+            show_copilot: false,
+            allow_unlimited_providers: false,
             show_session_window: true,
             show_weekly_window: true,
             alert_threshold_percent: 0,
@@ -965,6 +969,7 @@ fn persist_state_settings() -> Result<(), String> {
             show_cursor: s.show_cursor,
             show_grok: s.show_grok,
             show_copilot: s.show_copilot,
+            allow_unlimited_providers: s.allow_unlimited_providers,
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
             alert_threshold_percent: s.alert_threshold_percent,
@@ -3126,6 +3131,7 @@ pub fn run() {
                 show_cursor: settings.show_cursor,
                 show_grok: settings.show_grok,
                 show_copilot: settings.show_copilot,
+                allow_unlimited_providers: settings.allow_unlimited_providers,
                 show_tray_icon: settings.show_tray_icon,
                 show_provider_icons: settings.show_provider_icons,
                 show_session_window: settings.show_session_window,
@@ -3829,28 +3835,32 @@ fn paint_content(
             model_usage_width(row_bar_segment_count(active_models), text_width, appearance)
                 + sc(MODEL_RIGHT_MARGIN);
         let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
-            if appearance.show_provider_icon {
-                provider_icons::draw(
-                    hdc,
-                    icon_x,
-                    icon_y,
-                    icon_size,
-                    Provider::Claude,
-                    appearance.usage_text_color,
-                );
+        for (enabled, show_icon, provider) in [
+            (show_claude_code, appearance.show_claude_icon, Provider::Claude),
+            (show_codex, appearance.show_codex_icon, Provider::Codex),
+            (
+                show_antigravity,
+                appearance.show_antigravity_icon,
+                Provider::Antigravity,
+            ),
+            (show_opencode, appearance.show_opencode_icon, Provider::OpenCode),
+            (show_cursor, appearance.show_cursor_icon, Provider::Cursor),
+            (show_grok, appearance.show_grok_icon, Provider::Grok),
+            (show_copilot, appearance.show_copilot_icon, Provider::Copilot),
+        ] {
+            if enabled {
+                if appearance.show_provider_icon && show_icon {
+                    provider_icons::draw(
+                        hdc,
+                        icon_x,
+                        icon_y,
+                        icon_size,
+                        provider,
+                        appearance.usage_text_color,
+                    );
+                }
+                icon_x += model_width;
             }
-            icon_x += model_width;
-        }
-        if show_codex && appearance.show_provider_icon {
-            provider_icons::draw(
-                hdc,
-                icon_x,
-                icon_y,
-                icon_size,
-                Provider::Codex,
-                appearance.usage_text_color,
-            );
         }
 
         if show_session_window {
@@ -5142,7 +5152,7 @@ fn settings_snapshot() -> serde_json::Value {
             "show_claude_code":s.show_claude_code,"show_codex":s.show_codex,
             "show_antigravity":s.show_antigravity,"show_opencode":s.show_opencode,
             "show_cursor":s.show_cursor,"show_grok":s.show_grok,
-            "show_copilot":s.show_copilot,"show_session_window":s.show_session_window,
+            "show_copilot":s.show_copilot,"allow_unlimited_providers":s.allow_unlimited_providers,"show_session_window":s.show_session_window,
             "show_weekly_window":s.show_weekly_window,"poll_interval_ms":s.poll_interval_ms,
             "adaptive_refresh":s.adaptive_refresh,"alert_threshold_percent":s.alert_threshold_percent,
             "palette":s.appearance.palette,"bar_style":s.appearance.bar_style,
@@ -5561,6 +5571,7 @@ struct SettingsCandidate {
     show_cursor: bool,
     show_grok: bool,
     show_copilot: bool,
+    allow_unlimited_providers: bool,
     show_session_window: bool,
     show_weekly_window: bool,
     poll_interval_ms: u32,
@@ -5588,6 +5599,7 @@ impl SettingsCandidate {
             show_cursor: settings.show_cursor,
             show_grok: settings.show_grok,
             show_copilot: settings.show_copilot,
+            allow_unlimited_providers: settings.allow_unlimited_providers,
             show_session_window: settings.show_session_window,
             show_weekly_window: settings.show_weekly_window,
             poll_interval_ms: settings.poll_interval_ms,
@@ -5614,6 +5626,7 @@ impl SettingsCandidate {
             show_cursor: state.show_cursor,
             show_grok: state.show_grok,
             show_copilot: state.show_copilot,
+            allow_unlimited_providers: state.allow_unlimited_providers,
             show_session_window: state.show_session_window,
             show_weekly_window: state.show_weekly_window,
             poll_interval_ms: state.poll_interval_ms,
@@ -5712,6 +5725,9 @@ fn validate_settings_changes(
             Key::ShowCursor => candidate.show_cursor = setting_value(change.value.clone())?,
             Key::ShowGrok => candidate.show_grok = setting_value(change.value.clone())?,
             Key::ShowCopilot => candidate.show_copilot = setting_value(change.value.clone())?,
+            Key::AllowUnlimitedProviders => {
+                candidate.allow_unlimited_providers = setting_value(change.value.clone())?
+            }
             Key::ShowSessionWindow => {
                 candidate.show_session_window = setting_value(change.value.clone())?
             }
@@ -5820,6 +5836,18 @@ fn validate_settings_changes(
     {
         return Err(invalid_setting(
             "At least one provider must remain enabled.",
+        ));
+    }
+    let enabled_providers = candidate.show_claude_code as u8
+        + candidate.show_codex as u8
+        + candidate.show_antigravity as u8
+        + candidate.show_opencode as u8
+        + candidate.show_cursor as u8
+        + candidate.show_grok as u8
+        + candidate.show_copilot as u8;
+    if enabled_providers > 3 && !candidate.allow_unlimited_providers {
+        return Err(invalid_setting(
+            "At most 3 providers can stay enabled at once. Enable more on the Experimental page.",
         ));
     }
     if !candidate.show_session_window && !candidate.show_weekly_window {
@@ -6039,6 +6067,7 @@ fn apply_settings_batch(
         app_state.show_cursor = candidate.show_cursor;
         app_state.show_grok = candidate.show_grok;
         app_state.show_copilot = candidate.show_copilot;
+        app_state.allow_unlimited_providers = candidate.allow_unlimited_providers;
         app_state.show_session_window = candidate.show_session_window;
         app_state.show_weekly_window = candidate.show_weekly_window;
         app_state.poll_interval_ms = candidate.poll_interval_ms;
@@ -6830,6 +6859,38 @@ mod tests {
         };
         let kept = normalize_settings(one_on);
         assert!(kept.show_grok && !kept.show_codex);
+    }
+
+    #[test]
+    fn provider_cap_rejects_fourth_provider_unless_lifted() {
+        use serde_json::json;
+        let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
+        assert!(current.show_codex);
+        let enable_more = [Key::ShowOpenCode, Key::ShowCursor, Key::ShowGrok].map(|key| {
+            settings_ui::Change {
+                key,
+                value: json!(true),
+            }
+        });
+        assert!(validate_settings_changes(&current, &enable_more, false, &[]).is_err());
+        let lifted = validate_settings_changes(
+            &current,
+            &[settings_ui::Change {
+                key: Key::AllowUnlimitedProviders,
+                value: json!(true),
+            }],
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(lifted.allow_unlimited_providers);
+        let candidate = validate_settings_changes(&lifted, &enable_more, false, &[]).unwrap();
+        assert!(
+            candidate.show_codex
+                && candidate.show_opencode
+                && candidate.show_cursor
+                && candidate.show_grok
+        );
     }
 
     #[test]

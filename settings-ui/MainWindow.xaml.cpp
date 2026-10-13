@@ -261,6 +261,7 @@ namespace winrt::SettingsUI::implementation
                 args.Handled(true);
             }
         });
+        Navigation().KeyboardAcceleratorPlacementMode(Input::KeyboardAcceleratorPlacementMode::Hidden);
         Navigation().KeyboardAccelerators().Append(developmentShortcut);
 #endif
         previewTimer_ = dispatcher_.CreateTimer();

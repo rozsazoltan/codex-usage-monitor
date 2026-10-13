@@ -97,6 +97,8 @@ Treat this file as a credential: it stores the cookie in plain text. Do not comm
 
 The monitor reads local credentials for enabled providers and sends authenticated HTTPS usage requests directly to their services. OAuth or session credentials are sent to the relevant provider; there is no Quota Usage backend, analytics, telemetry, or project-file upload. Update checks and downloads contact GitHub. Requests may use an environment-configured proxy, so use only proxies and certificate authorities you trust.
 
+At startup, enabled providers whose credentials are unavailable are switched off and the updated selection is saved before polling begins. Sign in and enable them again in Settings when ready. Debug-only Development overrides remain temporary and do not change this saved selection.
+
 - Claude Code credentials come from `~/.claude/.credentials.json`, `CLAUDE_CONFIG_DIR` on Windows, or a WSL fallback. Codex credentials come from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`.
 - Expired Claude Code, Codex, or Grok sessions may trigger a background refresh through the owning CLI. The monitor does not directly rewrite their credential files. For expired Antigravity credentials, reopen Antigravity and sign in.
 - Local preferences and state include provider selection, appearance, language, polling, placement, visibility, quota-row options, alert thresholds, notification deduplication keys, and the last update-check time.

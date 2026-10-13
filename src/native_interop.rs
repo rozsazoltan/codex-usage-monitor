@@ -374,6 +374,56 @@ unsafe fn restore_window(hwnd: HWND, old: WindowSnapshot) -> bool {
     style && ex_style && parent && positioned && topmost_cleared
 }
 
+/// Clear incompatible constant-alpha state before retrying a per-pixel update.
+pub fn reset_layered_surface(hwnd: HWND) -> bool {
+    unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return false;
+        }
+        let parent = GetParent(hwnd).unwrap_or_default();
+        if !parent.is_invalid() {
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() {
+                return false;
+            }
+            let old = WindowSnapshot {
+                parent,
+                style: GetWindowLongW(hwnd, GWL_STYLE),
+                ex_style: GetWindowLongW(hwnd, GWL_EXSTYLE),
+                rect,
+                visible: IsWindowVisible(hwnd).as_bool(),
+            };
+            let mut point = POINT { x: rect.left, y: rect.top };
+            if !ScreenToClient(parent, &mut point).as_bool() {
+                return false;
+            }
+            let position = WindowPosition {
+                x: rect.left, y: rect.top,
+                width: rect.right - rect.left, height: rect.bottom - rect.top,
+            };
+            // Resetting the layered style on an Explorer child may be refused.
+            // The existing popup-to-child transition resets it while top-level.
+            if !set_window_mode(hwnd, None, position)
+                || !set_window_mode(hwnd, Some(parent), WindowPosition {
+                    x: point.x, y: point.y, ..position
+                })
+            {
+                let _ = restore_window(hwnd, old);
+                return false;
+            }
+            return true;
+        }
+        let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as i32));
+        if GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED.0 as i32 != 0 {
+            return false;
+        }
+        let expected = style | WS_EX_LAYERED.0 as i32;
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, expected);
+        GetWindowLongW(hwnd, GWL_EXSTYLE) == expected
+    }
+}
+
 /// Change between an embedded child window and a floating popup, placing it in
 /// the coordinate space of its new parent. Native failures restore the prior
 /// parent, styles, rectangle, z-order, and visibility.
@@ -754,6 +804,21 @@ mod attachment_tests {
                 }
             ));
             assert_eq!(GetParent(child).unwrap(), parent);
+            update_test_layered_surface(child).unwrap();
+            let style_before = GetWindowLongW(child, GWL_STYLE);
+            let extended_style_before = GetWindowLongW(child, GWL_EXSTYLE);
+            let mut rect_before = RECT::default();
+            GetWindowRect(child, &mut rect_before).unwrap();
+            SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
+            assert!(update_test_layered_surface(child).is_err());
+            assert!(reset_layered_surface(child));
+            update_test_layered_surface(child).unwrap();
+            assert_eq!(GetParent(child).unwrap(), parent);
+            assert_eq!(GetWindowLongW(child, GWL_STYLE), style_before);
+            assert_eq!(GetWindowLongW(child, GWL_EXSTYLE), extended_style_before);
+            let mut rect_after = RECT::default();
+            GetWindowRect(child, &mut rect_after).unwrap();
+            assert_eq!(rect_after, rect_before);
             let dc = CreateCompatibleDC(None);
             let info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {

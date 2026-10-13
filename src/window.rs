@@ -1019,6 +1019,28 @@ fn load_settings_from_paths(
         })
 }
 
+fn disable_unavailable_startup_providers(
+    settings: &mut SettingsFile,
+    availability: poller::ProviderAvailability,
+) -> bool {
+    let mut changed = false;
+    for (enabled, available) in [
+        (&mut settings.show_claude_code, availability.claude_code_available),
+        (&mut settings.show_codex, availability.codex_available),
+        (&mut settings.show_antigravity, availability.antigravity_available),
+        (&mut settings.show_opencode, availability.opencode_available),
+        (&mut settings.show_cursor, availability.cursor_available),
+        (&mut settings.show_grok, availability.grok_available),
+        (&mut settings.show_copilot, availability.copilot_available),
+    ] {
+        if *enabled && !available {
+            *enabled = false;
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     // Preserve the pre-existing widget-icon preference on legacy settings.
     if !settings.show_provider_icons {
@@ -3206,6 +3228,9 @@ pub fn run() {
 
         let provider_availability = poller::provider_availability();
         let mut settings = load_settings(provider_availability.claude_code_available);
+        if disable_unavailable_startup_providers(&mut settings, provider_availability) {
+            save_settings(&settings);
+        }
         let startup_monitors = native_interop::find_monitors();
         let startup_taskbars = native_interop::find_taskbars();
         let startup_legacy_taskbar_devices: Vec<_> = startup_taskbars
@@ -3884,7 +3909,7 @@ fn render_layered() {
             AlphaFormat: 1, // AC_SRC_ALPHA
         };
 
-        let _ = UpdateLayeredWindow(
+        let rendered = UpdateLayeredWindow(
             hwnd,
             screen_dc,
             None,
@@ -3895,6 +3920,20 @@ fn render_layered() {
             Some(&blend),
             ULW_ALPHA,
         );
+        if let Err(error) = rendered {
+            diagnose::log_error("widget layered surface update failed; resetting surface", error);
+            // SetLayeredWindowAttributes locks out per-pixel updates until the
+            // layered style is reset. Recover without changing attachment or
+            // desired visibility, and retry with the already-rendered bitmap.
+            if native_interop::reset_layered_surface(hwnd) {
+                if let Err(error) = UpdateLayeredWindow(
+                    hwnd, screen_dc, None, Some(&sz), mem_dc, Some(&pt_src),
+                    COLORREF(0), Some(&blend), ULW_ALPHA,
+                ) {
+                    diagnose::log_error("widget layered surface recovery failed", error);
+                }
+            }
+        }
 
         // Cleanup
         SelectObject(mem_dc, old_bmp);
@@ -9517,6 +9556,31 @@ mod tests {
         assert!(changed);
         assert!(!settings.show_claude_code);
         assert!(settings.show_codex);
+    }
+
+    #[test]
+    fn startup_disables_unavailable_providers_without_fallback() {
+        let mut settings = SettingsFile {
+            show_claude_code: true,
+            show_codex: true,
+            show_antigravity: true,
+            show_opencode: true,
+            show_cursor: true,
+            show_grok: true,
+            show_copilot: true,
+            ..SettingsFile::default()
+        };
+        let mut availability = poller::ProviderAvailability::default();
+        availability.codex_available = true;
+        assert!(disable_unavailable_startup_providers(&mut settings, availability));
+        assert!(settings.show_codex);
+        assert!(!settings.show_claude_code && !settings.show_cursor && !settings.show_copilot);
+        assert!(!settings.show_antigravity && !settings.show_opencode && !settings.show_grok);
+        assert!(!disable_unavailable_startup_providers(&mut settings, availability));
+        assert!(disable_unavailable_startup_providers(
+            &mut settings, poller::ProviderAvailability::default()
+        ));
+        assert!(!settings.show_codex);
     }
 
     #[test]

@@ -27,6 +27,11 @@ AGENTS.md
 # Local WinGet manifest generation output
 /manifests/
 
-
 # APM dependencies
 apm_modules/
+
+# Deepwork session state (git-local)
+.slim/deepwork/
+
+# Planning
+.planning

@@ -21,6 +21,15 @@ centered within the nearest monitor's work area.
 - To run: the shared **Windows App Runtime 1.8, x64**, at least the servicing
   level required by the pinned Windows App SDK. This project does not install it.
 
+The scripts use `QUOTA_SETTINGS_MSBUILD` to select a nonstandard full MSBuild
+path when automatic discovery is insufficient; `CODEX_SETTINGS_MSBUILD` remains
+supported as a fallback for existing environments. `QUOTA_SETTINGS_PAYLOAD`
+selects a prebuilt payload for a Rust release build, and
+`QUOTA_SETTINGS_SKIP_NATIVE_BUILD=1` opts out of native builds for Rust-only debug
+work. The corresponding `CODEX_SETTINGS_PAYLOAD` and
+`CODEX_SETTINGS_SKIP_NATIVE_BUILD` variables remain supported when their new
+`QUOTA_SETTINGS_*` variables are unset.
+
 Pinned NuGet packages:
 
 - `Microsoft.WindowsAppSDK` **1.8.260921001** (stable 1.8 servicing release).
@@ -120,7 +129,7 @@ Rebuild and publish the complete five-file payload rather than copying individua
 files. A mixed EXE/XBF/PRI can fail XAML connection-ID binding with
 `E_NOINTERFACE` (`0x80004002`) and still exit with code 0, without an Application
 Error/WER crash record. Startup diagnostics, when emitted by the companion, are
-written to `%LOCALAPPDATA%\CodexUsage-SettingsUI-startup.log`, with a `%TEMP%`
+written to `%LOCALAPPDATA%\QuotaUsage-SettingsUI-startup.log`, with a `%TEMP%`
 fallback. A settings window that opens successfully but crashes on close is a
 separate lifecycle failure; the smoke test checks that path explicitly.
 
@@ -131,7 +140,7 @@ separate lifecycle failure; the smoke test checks that path explicitly.
   Framework 4.8.09221. MIDL/MIDLRT, C++/WinRT projection generation, the net472
   XAML compiler, native linker and PRI generation all ran successfully.
 - The five-file portable directory launched from an unrelated working directory.
-  A real `Codex Usage` settings window had a nonzero HWND. UI Automation selected
+  A real `Quota Usage` settings window had a nonzero HWND. UI Automation selected
   all five pages and verified their principal controls against a synthetic
   protocol snapshot; the companion sent the expected initial `get` request.
 - A safe UI Automation interaction emitted the expected `show_codex=false` set

@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ICON_DIR = ROOT / "src" / "icons"
 REDESIGN_DIR = ICON_DIR / "redesign"
-GITHUB_ICON = ROOT / ".github" / "codex-usage-icon.png"
+GITHUB_ICON = ROOT / ".github" / "quota-usage-monitor-icon.png"
 
 
 def get_powershell() -> str:
@@ -28,15 +28,15 @@ def main() -> None:
 
     for size in (16, 32, 48, 256):
         (ICON_DIR / f"{size}x{size}.png").write_bytes(
-            (REDESIGN_DIR / f"codex-usage-meter-{size}.png").read_bytes()
+            (REDESIGN_DIR / f"quota-usage-monitor-{size}.png").read_bytes()
         )
     (ICON_DIR / "icon.ico").write_bytes(
-        (REDESIGN_DIR / "codex-usage-meter.ico").read_bytes()
+        (REDESIGN_DIR / "quota-usage-monitor.ico").read_bytes()
     )
     GITHUB_ICON.parent.mkdir(parents=True, exist_ok=True)
-    GITHUB_ICON.write_bytes((REDESIGN_DIR / "codex-usage-meter-256.png").read_bytes())
+    GITHUB_ICON.write_bytes((REDESIGN_DIR / "quota-usage-monitor-256.png").read_bytes())
 
-    svg_source = (REDESIGN_DIR / "codex-usage-meter.svg").read_text(encoding="utf-8")
+    svg_source = (REDESIGN_DIR / "quota-usage-monitor.svg").read_text(encoding="utf-8")
     dimensions = 'width="1024" height="1024"'
     if svg_source.count(dimensions) != 1:
         raise RuntimeError("Unexpected root dimensions in the approved meter SVG")

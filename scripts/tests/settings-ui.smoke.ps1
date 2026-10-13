@@ -1139,7 +1139,7 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
         NoticesHWND = $null; ExitCode = $null; Error = $null
     }
     try {
-        $pipeName = "CodexUsage.Settings.Smoke.$PID.$([Guid]::NewGuid().ToString('N'))"
+        $pipeName = "QuotaUsage.Settings.Smoke.$PID.$([Guid]::NewGuid().ToString('N'))"
         $options = [IO.Pipes.PipeOptions]::Asynchronous -bor [IO.Pipes.PipeOptions]::CurrentUserOnly
         $pipe = [IO.Pipes.NamedPipeServerStream]::new($pipeName, [IO.Pipes.PipeDirection]::InOut, 1,
             [IO.Pipes.PipeTransmissionMode]::Byte, $options, 65536, 65536)
@@ -1279,7 +1279,7 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
         Write-Host "Failure stack: $($_.ScriptStackTrace)"
         if ($null -ne $process -and $process.HasExited) { Write-Host "Companion exit: $(Get-ExitDescription $process)" }
         if ($null -ne $process -and $process.HasExited) { $result.ExitCode = Get-ExitDescription $process }
-        $diagnostic = Join-Path $profileDirectory 'CodexUsage-SettingsUI-startup.log'
+        $diagnostic = Join-Path $profileDirectory 'QuotaUsage-SettingsUI-startup.log'
         if (Test-Path -LiteralPath $diagnostic -PathType Leaf) {
             Write-Host "Startup diagnostic: $([IO.File]::ReadAllText($diagnostic).Trim())"
             [IO.File]::Delete($diagnostic)

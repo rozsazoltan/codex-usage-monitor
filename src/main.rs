@@ -32,7 +32,7 @@ fn main() {
     match uninstaller::is_uninstall_in_progress() {
         Ok(true) => {
             uninstaller::show_startup_info(
-                "An uninstall is already in progress. Please wait for it to finish before starting Codex Usage again.",
+                "An uninstall is already in progress. Please wait for it to finish before starting Quota Usage again.",
             );
             return;
         }
@@ -90,7 +90,7 @@ fn set_app_user_model_id() {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 
-    let app_id: Vec<u16> = "com.datarose.codexusage\0".encode_utf16().collect();
+    let app_id: Vec<u16> = "com.datarose.quotausage\0".encode_utf16().collect();
     let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(app_id.as_ptr())) };
 }
 
@@ -136,9 +136,9 @@ mod tests {
 
     #[test]
     fn recognizes_version_flags_among_other_arguments() {
-        assert!(version_requested(&args(&["codex-usage.exe", "-v"])));
+        assert!(version_requested(&args(&["quota-usage.exe", "-v"])));
         assert!(version_requested(&args(&[
-            "codex-usage.exe",
+            "quota-usage.exe",
             "--diagnose",
             "--version"
         ])));
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn does_not_match_partial_or_executable_name_flags() {
         assert!(!version_requested(&args(&[
-            "codex-usage.exe",
+            "quota-usage.exe",
             "--verbose",
             "-version"
         ])));

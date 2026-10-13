@@ -73,6 +73,7 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="App.xaml.h" />
     <ClInclude Include="MainWindow.xaml.h" />
+    <ClInclude Include="NativeLocalization.h" />
     <ClInclude Include="Resources.h" />
     <ClCompile Include="pch.cpp"><PrecompiledHeader>Create</PrecompiledHeader></ClCompile>
     <ClCompile Include="App.xaml.cpp" />

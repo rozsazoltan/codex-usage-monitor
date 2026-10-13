@@ -16,11 +16,11 @@ if ($DurationMinutes -lt 1 -or $IntervalSeconds -lt 1) {
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
-if (-not ('CodexUsage.ResourceMetrics' -as [type])) {
+if (-not ('QuotaUsage.ResourceMetrics' -as [type])) {
     Add-Type @'
 using System;
 using System.Runtime.InteropServices;
-namespace CodexUsage {
+namespace QuotaUsage {
     public static class ResourceMetrics {
         [DllImport("user32.dll")]
         public static extern uint GetGuiResources(IntPtr process, uint flags);
@@ -39,8 +39,8 @@ while ([DateTimeOffset]::UtcNow -lt $Deadline) {
         PrivateMB = [Math]::Round($Process.PrivateMemorySize64 / 1MB, 3)
         WorkingSetMB = [Math]::Round($Process.WorkingSet64 / 1MB, 3)
         Handles = $Process.HandleCount
-        GdiObjects = [CodexUsage.ResourceMetrics]::GetGuiResources($Process.Handle, 0)
-        UserObjects = [CodexUsage.ResourceMetrics]::GetGuiResources($Process.Handle, 1)
+        GdiObjects = [QuotaUsage.ResourceMetrics]::GetGuiResources($Process.Handle, 0)
+        UserObjects = [QuotaUsage.ResourceMetrics]::GetGuiResources($Process.Handle, 1)
     })
     Start-Sleep -Seconds $IntervalSeconds
 }

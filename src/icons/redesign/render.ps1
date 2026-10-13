@@ -52,8 +52,8 @@ function Get-PngBytes {
 
 $sizes = @(16, 24, 32, 48, 64, 128, 256, 1024)
 $renderSize = $script:CanvasSize * $script:Supersample
-$svgPath = Join-Path $PSScriptRoot 'codex-usage-meter.svg'
-$renderPath = Join-Path $PSScriptRoot 'codex-usage-meter-render.png'
+$svgPath = Join-Path $PSScriptRoot 'quota-usage-monitor.svg'
+$renderPath = Join-Path $PSScriptRoot 'quota-usage-monitor-render.png'
 $edgeProfile = Join-Path $PSScriptRoot ".edge-profile-$PID"
 $svgUri = [System.Uri]::new((Resolve-Path -LiteralPath $svgPath).Path).AbsoluteUri
 $edge = Get-EdgeExecutable
@@ -98,7 +98,7 @@ try {
         $bytes = Get-PngBytes $sourceBitmap $size
         $pngs[$size] = $bytes
         [System.IO.File]::WriteAllBytes(
-            (Join-Path $PSScriptRoot "codex-usage-meter-$size.png"),
+            (Join-Path $PSScriptRoot "quota-usage-monitor-$size.png"),
             $bytes
         )
     }
@@ -107,7 +107,7 @@ try {
 
     # PNG-compressed frames support alpha cleanly at every size on Windows 10/11.
     $icoSizes = @(16, 24, 32, 48, 64, 128, 256)
-    $icoPath = Join-Path $PSScriptRoot 'codex-usage-meter.ico'
+    $icoPath = Join-Path $PSScriptRoot 'quota-usage-monitor.ico'
     $stream = [System.IO.File]::Create($icoPath)
     $writer = [System.IO.BinaryWriter]::new($stream)
     $writer.Write([UInt16]0)

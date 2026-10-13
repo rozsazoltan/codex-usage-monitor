@@ -96,6 +96,7 @@ struct AppState {
     copilot_weekly_percent: f64,
     copilot_weekly_text: String,
     provider_availability: poller::ProviderAvailability,
+    development_overrides: [DevelopmentOverride; 7],
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -136,6 +137,22 @@ struct AppState {
 
     widget_visible: bool,
     settings_pane_open: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct DevelopmentOverride {
+    enabled: bool,
+    force_available: bool,
+    session_percent: Option<f64>,
+    weekly_percent: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderDisplay {
+    session_percent: f64,
+    session_text: String,
+    weekly_percent: f64,
+    weekly_text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -293,10 +310,12 @@ const RELAUNCH_THROTTLE_SECS: u64 = 10;
 const RELAUNCH_BACKOFF_SECS: u64 = 30;
 /// Environment flag set on a relaunched child so it waits for the previous
 /// instance's single-instance mutex instead of exiting immediately.
-const ENV_RELAUNCH: &str = "CODEX_USAGE_RELAUNCH";
+const ENV_RELAUNCH: &str = "QUOTA_USAGE_RELAUNCH";
+const LEGACY_ENV_RELAUNCH: &str = "CODEX_USAGE_RELAUNCH";
 /// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
 /// the child so it can detect a relaunch storm.
-const ENV_LAST_RELAUNCH_UNIX: &str = "CODEX_USAGE_LAST_RELAUNCH_UNIX";
+const ENV_LAST_RELAUNCH_UNIX: &str = "QUOTA_USAGE_LAST_RELAUNCH_UNIX";
+const LEGACY_ENV_LAST_RELAUNCH_UNIX: &str = "CODEX_USAGE_LAST_RELAUNCH_UNIX";
 
 /// Relaunch the widget as a fresh process after explorer.exe has restarted.
 ///
@@ -313,6 +332,7 @@ fn relaunch_self() {
     // us: that signals the shell is crash-looping, not a one-off restart.
     let now = now_unix_secs();
     let last = std::env::var(ENV_LAST_RELAUNCH_UNIX)
+        .or_else(|_| std::env::var(LEGACY_ENV_LAST_RELAUNCH_UNIX))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
@@ -332,6 +352,8 @@ fn relaunch_self() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match std::process::Command::new(exe)
         .args(&args)
+        .env_remove(LEGACY_ENV_RELAUNCH)
+        .env_remove(LEGACY_ENV_LAST_RELAUNCH_UNIX)
         .env(ENV_RELAUNCH, "1")
         .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
         .spawn()
@@ -535,8 +557,8 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-const SETTINGS_DIR: &str = "CodexUsage";
-const LEGACY_SETTINGS_DIR: &str = "ClaudeCodeUsageMonitor";
+const SETTINGS_DIR: &str = "QuotaUsage";
+const LEGACY_SETTINGS_DIRS: [&str; 2] = ["CodexUsage", "ClaudeCodeUsageMonitor"];
 
 fn appdata_path(directory: &str) -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
@@ -547,8 +569,8 @@ fn settings_path() -> PathBuf {
     appdata_path(SETTINGS_DIR)
 }
 
-fn legacy_settings_path() -> PathBuf {
-    appdata_path(LEGACY_SETTINGS_DIR)
+fn legacy_settings_paths() -> [PathBuf; 2] {
+    LEGACY_SETTINGS_DIRS.map(appdata_path)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -597,10 +619,10 @@ enum ProviderSpacing {
 impl ProviderSpacing {
     fn scaled_gap(self) -> i32 {
         sc(match self {
-            Self::None => 0,
-            Self::Small => 2,
-            Self::Normal => 5,
-            Self::Large => 9,
+            Self::None => 2,
+            Self::Small => 4,
+            Self::Normal => 7,
+            Self::Large => 11,
         })
     }
 }
@@ -643,7 +665,29 @@ impl ProviderId {
 }
 
 fn default_provider_order() -> [ProviderId; 7] {
+    [
+        ProviderId::Claude,
+        ProviderId::Codex,
+        ProviderId::Antigravity,
+        ProviderId::Copilot,
+        ProviderId::Cursor,
+        ProviderId::Grok,
+        ProviderId::OpenCode,
+    ]
+}
+
+// Keep sparse older settings files on their historical values; Appearance::default
+// defines the current defaults for new installs and explicit appearance resets.
+fn legacy_default_provider_order() -> [ProviderId; 7] {
     ProviderId::ALL
+}
+
+fn legacy_default_provider_spacing() -> ProviderSpacing {
+    ProviderSpacing::Small
+}
+
+fn legacy_default_provider_monochrome() -> bool {
+    false
 }
 
 fn valid_provider_order(order: &[ProviderId; 7]) -> bool {
@@ -666,12 +710,13 @@ struct Appearance {
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
+    #[serde(default = "legacy_default_provider_spacing")]
     provider_spacing: ProviderSpacing,
-    #[serde(default = "default_provider_order")]
+    #[serde(default = "legacy_default_provider_order")]
     provider_order: [ProviderId; 7],
     #[serde(default)]
     provider_icon_position: ProviderIconPosition,
-    #[serde(default)]
+    #[serde(default = "legacy_default_provider_monochrome")]
     provider_monochrome: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_accent: Option<[u8; 3]>,
@@ -709,10 +754,10 @@ impl Default for Appearance {
             bar_style: BarStyle::default(),
             bar_thickness: BarThickness::default(),
             font_size: FontSize::default(),
-            provider_spacing: ProviderSpacing::default(),
+            provider_spacing: ProviderSpacing::Normal,
             provider_order: default_provider_order(),
             provider_icon_position: ProviderIconPosition::default(),
-            provider_monochrome: false,
+            provider_monochrome: true,
             claude_accent: None,
             codex_accent: None,
             antigravity_accent: None,
@@ -913,8 +958,12 @@ fn default_show_usage_window() -> bool {
 
 fn load_settings(claude_code_available: bool) -> SettingsFile {
     let current_path = settings_path();
-    let legacy_path = legacy_settings_path();
-    let (settings, migrated) = load_settings_from_paths(&current_path, &legacy_path)
+    let legacy_paths = legacy_settings_paths();
+    let (settings, migrated) = load_settings_from_paths(
+        &current_path,
+        &legacy_paths[0],
+        &legacy_paths[1],
+    )
         .unwrap_or_else(|| (SettingsFile::default(), false));
     let settings = normalize_settings(settings);
     let (settings, claude_auto_disabled) =
@@ -922,11 +971,7 @@ fn load_settings(claude_code_available: bool) -> SettingsFile {
     if migrated || claude_auto_disabled {
         save_settings(&settings);
         if migrated {
-            diagnose::log(format!(
-                "migrated settings from {} to {}",
-                legacy_path.display(),
-                current_path.display()
-            ));
+            diagnose::log(format!("migrated legacy settings to {}", current_path.display()));
         }
         if claude_auto_disabled {
             diagnose::log(
@@ -951,18 +996,23 @@ fn apply_claude_code_availability(
 
 fn load_settings_from_paths(
     current_path: &std::path::Path,
-    legacy_path: &std::path::Path,
+    codex_legacy_path: &std::path::Path,
+    claude_legacy_path: &std::path::Path,
 ) -> Option<(SettingsFile, bool)> {
     if let Ok(content) = std::fs::read_to_string(current_path) {
-        return serde_json::from_str(&content)
-            .ok()
-            .map(|settings| (settings, false));
+        if let Ok(settings) = serde_json::from_str(&content) {
+            return Some((settings, false));
+        }
     }
 
-    let content = std::fs::read_to_string(legacy_path).ok()?;
-    serde_json::from_str(&content)
-        .ok()
-        .map(|settings| (settings, true))
+    [codex_legacy_path, claude_legacy_path]
+        .into_iter()
+        .find_map(|path| {
+            let content = std::fs::read_to_string(path).ok()?;
+            serde_json::from_str(&content)
+                .ok()
+                .map(|settings| (settings, true))
+        })
 }
 
 fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
@@ -1445,11 +1495,26 @@ fn toggle_widget_visibility(hwnd: HWND) {
     };
     save_state_settings();
     if new_visible {
-        position_at_taskbar();
-        set_widget_visibility(hwnd, true);
+        recover_widget_visibility(hwnd);
         render_layered();
     } else {
         set_widget_visibility(hwnd, false);
+    }
+}
+
+fn recover_widget_visibility(hwnd: HWND) {
+    // An explicit Show request must resolve the live attachment, not just move
+    // using a cached Explorer HWND. It must also restore a minimized popup:
+    // WS_VISIBLE remains set while minimized, so the routine visibility guard
+    // intentionally does not suffice here.
+    let placement = refresh_monitor_selection(hwnd);
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    // Showing can restore the old normal rectangle; apply the resolved placement
+    // afterwards without changing z-order or activating the widget.
+    if placement.reposition {
+        position_at_taskbar_without_save();
     }
 }
 
@@ -2229,14 +2294,14 @@ fn confirm_and_begin_uninstall(hwnd: HWND) {
         show_info_message(
             hwnd,
             if chinese {
-                "卸载 Codex Usage"
+                "卸载 Quota Usage"
             } else {
-                "Uninstall Codex Usage"
+                "Uninstall Quota Usage"
             },
             if chinese {
-                "请使用以下命令卸载 Codex Usage：\n\nwinget uninstall --id rozsazoltan.codexusage --exact"
+                "请使用以下命令卸载 Quota Usage：\n\nwinget uninstall --id rozsazoltan.codexusage --exact"
             } else {
-                "To uninstall Codex Usage, run this command:\n\nwinget uninstall --id rozsazoltan.codexusage --exact"
+                "To uninstall Quota Usage, run this command:\n\nwinget uninstall --id rozsazoltan.codexusage --exact"
             },
         );
         return;
@@ -2265,14 +2330,14 @@ fn confirm_and_begin_uninstall(hwnd: HWND) {
         }
     };
     let title = if chinese {
-        "卸载 Codex Usage"
+        "卸载 Quota Usage"
     } else {
-        "Uninstall Codex Usage"
+        "Uninstall Quota Usage"
     };
     let prompt = if chinese {
-        format!("确定卸载 Codex Usage？\n\n检测到：{kind_name}。此操作无法撤销。")
+        format!("确定卸载 Quota Usage？\n\n检测到：{kind_name}。此操作无法撤销。")
     } else {
-        format!("Uninstall Codex Usage?\n\nDetected: {kind_name}. This action cannot be undone.")
+        format!("Uninstall Quota Usage?\n\nDetected: {kind_name}. This action cannot be undone.")
     };
     let (title_wide, prompt_wide) = (
         native_interop::wide_str(title),
@@ -2345,26 +2410,30 @@ fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor)
 fn apply_language_to_state(state: &mut AppState, language_override: Option<LanguageId>) {
     state.language_override = language_override;
     state.language = localization::resolve_language(language_override);
-    set_window_title(state.hwnd.to_hwnd(), state.language.strings());
     refresh_usage_texts(state);
 }
 
 fn update_language_change() -> bool {
-    let mut state = lock_state();
-    let Some(app_state) = state.as_mut() else {
-        return false;
+    let (hwnd, strings) = {
+        let mut state = lock_state();
+        let Some(app_state) = state.as_mut() else {
+            return false;
+        };
+
+        if app_state.language_override.is_some() {
+            return false;
+        }
+
+        let new_language = localization::detect_system_language();
+        if new_language == app_state.language {
+            return false;
+        }
+
+        apply_language_to_state(app_state, None);
+        (app_state.hwnd.to_hwnd(), app_state.language.strings())
     };
-
-    if app_state.language_override.is_some() {
-        return false;
-    }
-
-    let new_language = localization::detect_system_language();
-    if new_language == app_state.language {
-        return false;
-    }
-
-    apply_language_to_state(app_state, None);
+    // SetWindowTextW synchronously re-enters wnd_proc, which also locks STATE.
+    set_window_title(hwnd, strings);
     true
 }
 
@@ -2554,18 +2623,18 @@ fn begin_winget_update(hwnd: HWND) {
 }
 
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const STARTUP_REGISTRY_KEY: &str = "CodexUsage";
-const LEGACY_STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
+const STARTUP_REGISTRY_KEY: &str = "QuotaUsage";
+const LEGACY_STARTUP_REGISTRY_KEYS: [&str; 2] = ["CodexUsage", "ClaudeCodeUsageMonitor"];
 
 /// Returns true only if the startup registry value points to this executable.
 fn is_startup_enabled() -> bool {
-    let Some(reg_value) = read_startup_value(STARTUP_REGISTRY_KEY) else {
-        return false;
-    };
     let Some(current_exe) = current_exe_path_string() else {
         return false;
     };
-    startup_command_matches(&reg_value, &current_exe)
+    std::iter::once(STARTUP_REGISTRY_KEY)
+        .chain(LEGACY_STARTUP_REGISTRY_KEYS)
+        .filter_map(read_startup_value)
+        .any(|value| startup_command_matches(&value, &current_exe))
 }
 
 fn startup_command_matches(value: &str, exe: &str) -> bool {
@@ -2659,24 +2728,40 @@ fn delete_startup_value(key: &str) {
 }
 
 fn migrate_legacy_startup_entry() {
-    let legacy_exists = read_startup_value(LEGACY_STARTUP_REGISTRY_KEY).is_some();
-    let current_exists = read_startup_value(STARTUP_REGISTRY_KEY).is_some();
-    if !legacy_exists {
+    let Some(current_exe) = current_exe_path_string() else {
+        return;
+    };
+    let current_value = read_startup_value(STARTUP_REGISTRY_KEY);
+    let current_matches = current_value
+        .as_deref()
+        .is_some_and(|value| startup_command_matches(value, &current_exe));
+    let matching_legacy_keys = LEGACY_STARTUP_REGISTRY_KEYS
+        .iter()
+        .copied()
+        .filter(|key| {
+            read_startup_value(key)
+                .as_deref()
+                .is_some_and(|value| startup_command_matches(value, &current_exe))
+        })
+        .collect::<Vec<_>>();
+    if matching_legacy_keys.is_empty() {
         return;
     }
 
-    if should_write_migrated_startup(legacy_exists, current_exists) {
+    // Never overwrite another command registered under the new product name.
+    if current_value.is_none() && !current_matches {
         set_startup_enabled(true);
     }
 
-    if read_startup_value(STARTUP_REGISTRY_KEY).is_some() {
-        delete_startup_value(LEGACY_STARTUP_REGISTRY_KEY);
-        diagnose::log("migrated legacy startup registry entry to CodexUsage");
+    if read_startup_value(STARTUP_REGISTRY_KEY)
+        .as_deref()
+        .is_some_and(|value| startup_command_matches(value, &current_exe))
+    {
+        for key in matching_legacy_keys {
+            delete_startup_value(&key);
+        }
+        diagnose::log("migrated legacy startup registry entry to QuotaUsage");
     }
-}
-
-fn should_write_migrated_startup(legacy_exists: bool, current_exists: bool) -> bool {
-    legacy_exists && !current_exists
 }
 
 fn set_startup_enabled(enable: bool) {
@@ -2719,9 +2804,23 @@ fn set_startup_enabled(enable: bool) {
                 );
             }
         } else {
-            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(key_name.as_ptr()));
-            let legacy_key_name = native_interop::wide_str(LEGACY_STARTUP_REGISTRY_KEY);
-            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(legacy_key_name.as_ptr()));
+            if let Some(executable) = current_exe_path_string() {
+                if read_startup_value(STARTUP_REGISTRY_KEY)
+                    .as_deref()
+                    .is_some_and(|value| startup_command_matches(value, &executable))
+                {
+                    let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(key_name.as_ptr()));
+                }
+                for legacy_key in LEGACY_STARTUP_REGISTRY_KEYS {
+                    if read_startup_value(legacy_key)
+                        .as_deref()
+                        .is_some_and(|value| startup_command_matches(value, &executable))
+                    {
+                        let legacy_key_name = native_interop::wide_str(legacy_key);
+                        let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(legacy_key_name.as_ptr()));
+                    }
+                }
+            }
         }
 
         let _ = RegCloseKey(hkey);
@@ -3030,28 +3129,38 @@ pub fn run() {
     // Single-instance guard: silently exit if another instance is running.
     // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
     // wait for the previous instance to release the mutex, then take over.
-    let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
-    let mutex_name = native_interop::wide_str("Global\\CodexUsage");
-    let _mutex = unsafe {
-        let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
+    let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok()
+        || std::env::var(LEGACY_ENV_RELAUNCH).is_ok();
+    // Hold both the current and historical mutex names so pre-rebrand and
+    // current processes continue to exclude each other during upgrades.
+    let mut mutexes = Vec::new();
+    for name in [
+        "Global\\QuotaUsage",
+        "Global\\CodexUsage",
+        "Global\\ClaudeCodeUsageMonitor",
+    ] {
+        let mutex_name = native_interop::wide_str(name);
+        let handle = unsafe { CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr())) };
         match handle {
-            Ok(h) => {
-                if GetLastError() == ERROR_ALREADY_EXISTS {
+            Ok(handle) => {
+                if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
                     if is_relaunch {
-                        diagnose::log("relaunch: waiting for previous instance to exit");
-                        let wait_result = WaitForSingleObject(h, 10_000);
+                        diagnose::log(format!("relaunch: waiting for previous instance on {name}"));
+                        let wait_result = unsafe { WaitForSingleObject(handle, 10_000) };
                         if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
                             diagnose::log(format!(
-                                "startup aborted: previous instance did not exit cleanly ({wait_result:?})"
+                                "startup aborted: previous instance did not release {name} ({wait_result:?})"
                             ));
                             return;
                         }
                     } else {
-                        diagnose::log("startup aborted: another instance is already running");
+                        diagnose::log(format!(
+                            "startup aborted: another instance owns {name}"
+                        ));
                         return;
                     }
                 }
-                h
+                mutexes.push(handle);
             }
             Err(error) => {
                 diagnose::log_error(
@@ -3061,11 +3170,12 @@ pub fn run() {
                 return;
             }
         }
-    };
+    }
+    let _mutexes = mutexes;
 
     migrate_legacy_startup_entry();
 
-    let class_name = native_interop::wide_str("CodexUsage");
+    let class_name = native_interop::wide_str("QuotaUsage");
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
@@ -3210,6 +3320,7 @@ pub fn run() {
                 copilot_weekly_percent: 0.0,
                 copilot_weekly_text: "--".to_string(),
                 provider_availability,
+                development_overrides: [DevelopmentOverride::default(); 7],
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -3265,7 +3376,7 @@ pub fn run() {
         // The taskbar widget becomes a WS_CHILD window after attachment and
         // therefore no longer receives Explorer's top-level broadcasts. Keep
         // a hidden top-level window alive to relay TaskbarCreated promptly.
-        let broadcast_title = native_interop::wide_str("Codex Usage taskbar monitor");
+        let broadcast_title = native_interop::wide_str("Quota Usage taskbar monitor");
         let broadcast_hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -3394,55 +3505,57 @@ fn update_quota_tooltips() {
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + label_width
                 + sc(LABEL_RIGHT_MARGIN);
+            let display: [ProviderDisplay; 7] =
+                std::array::from_fn(|index| provider_display(s, ProviderId::ALL[index]));
             let tooltip_providers = [
                 (
                     0,
                     s.show_claude_code,
                     "Claude Code",
-                    &s.session_text,
-                    &s.weekly_text,
+                    &display[0].session_text,
+                    &display[0].weekly_text,
                 ),
                 (
                     1,
                     s.show_codex,
                     "Codex",
-                    &s.codex_session_text,
-                    &s.codex_weekly_text,
+                    &display[1].session_text,
+                    &display[1].weekly_text,
                 ),
                 (
                     2,
                     s.show_antigravity,
                     "Antigravity",
-                    &s.antigravity_session_text,
-                    &s.antigravity_weekly_text,
+                    &display[2].session_text,
+                    &display[2].weekly_text,
                 ),
                 (
                     3,
                     s.show_opencode,
                     "OpenCode",
-                    &s.opencode_session_text,
-                    &s.opencode_weekly_text,
+                    &display[3].session_text,
+                    &display[3].weekly_text,
                 ),
                 (
                     4,
                     s.show_cursor,
                     "Cursor",
-                    &s.cursor_session_text,
-                    &s.cursor_weekly_text,
+                    &display[4].session_text,
+                    &display[4].weekly_text,
                 ),
                 (
                     5,
                     s.show_grok,
                     "Grok",
-                    &s.grok_session_text,
-                    &s.grok_weekly_text,
+                    &display[5].session_text,
+                    &display[5].weekly_text,
                 ),
                 (
                     6,
                     s.show_copilot,
                     "Copilot",
-                    &s.copilot_session_text,
-                    &s.copilot_weekly_text,
+                    &display[6].session_text,
+                    &display[6].weekly_text,
                 ),
             ];
             for provider_id in s.appearance.provider_order {
@@ -3555,52 +3668,56 @@ fn render_layered() {
     ) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.hwnd,
-                s.is_dark,
-                s.embedded,
-                s.language,
-                s.appearance,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
-                s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
-                s.antigravity_weekly_text.clone(),
-                s.opencode_session_percent,
-                s.opencode_session_text.clone(),
-                s.opencode_weekly_percent,
-                s.opencode_weekly_text.clone(),
-                s.cursor_session_percent,
-                s.cursor_session_text.clone(),
-                s.cursor_weekly_percent,
-                s.cursor_weekly_text.clone(),
-                s.grok_session_percent,
-                s.grok_session_text.clone(),
-                s.grok_weekly_percent,
-                s.grok_weekly_text.clone(),
-                s.copilot_session_percent,
-                s.copilot_session_text.clone(),
-                s.copilot_weekly_percent,
-                s.copilot_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-                s.show_opencode,
-                s.show_cursor,
-                s.show_grok,
-                s.show_copilot,
-                s.show_provider_icons,
-                s.show_session_window,
-                s.show_weekly_window,
-            ),
+            Some(s) => {
+                let display: [ProviderDisplay; 7] =
+                    std::array::from_fn(|index| provider_display(s, ProviderId::ALL[index]));
+                (
+                    s.hwnd,
+                    s.is_dark,
+                    s.embedded,
+                    s.language,
+                    s.appearance,
+                    s.language.strings(),
+                    display[0].session_percent,
+                    display[0].session_text.clone(),
+                    display[0].weekly_percent,
+                    display[0].weekly_text.clone(),
+                    display[1].session_percent,
+                    display[1].session_text.clone(),
+                    display[1].weekly_percent,
+                    display[1].weekly_text.clone(),
+                    display[2].session_percent,
+                    display[2].session_text.clone(),
+                    display[2].weekly_percent,
+                    display[2].weekly_text.clone(),
+                    display[3].session_percent,
+                    display[3].session_text.clone(),
+                    display[3].weekly_percent,
+                    display[3].weekly_text.clone(),
+                    display[4].session_percent,
+                    display[4].session_text.clone(),
+                    display[4].weekly_percent,
+                    display[4].weekly_text.clone(),
+                    display[5].session_percent,
+                    display[5].session_text.clone(),
+                    display[5].weekly_percent,
+                    display[5].weekly_text.clone(),
+                    display[6].session_percent,
+                    display[6].session_text.clone(),
+                    display[6].weekly_percent,
+                    display[6].weekly_text.clone(),
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    s.show_opencode,
+                    s.show_cursor,
+                    s.show_grok,
+                    s.show_copilot,
+                    s.show_provider_icons,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                )
+            }
             None => return,
         }
     };
@@ -5318,6 +5435,152 @@ fn show_settings_menu(hwnd: HWND) {
     }
 }
 
+fn effective_provider_availability(state: &AppState) -> poller::ProviderAvailability {
+    let mut availability = state.provider_availability;
+    #[cfg(debug_assertions)]
+    for provider in ProviderId::ALL {
+        let development = state.development_overrides[provider.index()];
+        if !development.enabled || !development.force_available {
+            continue;
+        }
+        match provider {
+            ProviderId::Claude => availability.claude_code_available = true,
+            ProviderId::Codex => availability.codex_available = true,
+            ProviderId::Antigravity => availability.antigravity_available = true,
+            ProviderId::OpenCode => availability.opencode_available = true,
+            ProviderId::Cursor => availability.cursor_available = true,
+            ProviderId::Grok => availability.grok_available = true,
+            ProviderId::Copilot => availability.copilot_available = true,
+        }
+    }
+    availability
+}
+
+fn development_override_json(override_state: DevelopmentOverride) -> serde_json::Value {
+    use serde_json::json;
+    if cfg!(debug_assertions) {
+        json!({
+            "enabled": override_state.enabled,
+            "force_available": override_state.force_available,
+            "session_percent": override_state.session_percent,
+            "weekly_percent": override_state.weekly_percent,
+        })
+    } else {
+        json!({
+            "enabled": false,
+            "force_available": false,
+            "session_percent": null,
+            "weekly_percent": null,
+        })
+    }
+}
+
+fn development_overrides_snapshot(state: &AppState) -> serde_json::Value {
+    use serde_json::json;
+    let overrides = state.development_overrides;
+    json!({
+        "claude": development_override_json(overrides[ProviderId::Claude.index()]),
+        "codex": development_override_json(overrides[ProviderId::Codex.index()]),
+        "antigravity": development_override_json(overrides[ProviderId::Antigravity.index()]),
+        "opencode": development_override_json(overrides[ProviderId::OpenCode.index()]),
+        "cursor": development_override_json(overrides[ProviderId::Cursor.index()]),
+        "grok": development_override_json(overrides[ProviderId::Grok.index()]),
+        "copilot": development_override_json(overrides[ProviderId::Copilot.index()]),
+    })
+}
+
+fn provider_availability_json(availability: poller::ProviderAvailability) -> serde_json::Value {
+    serde_json::json!({
+        "claude_code_available": availability.claude_code_available,
+        "codex_available": availability.codex_available,
+        "antigravity_available": availability.antigravity_available,
+        "opencode_available": availability.opencode_available,
+        "cursor_available": availability.cursor_available,
+        "grok_available": availability.grok_available,
+        "copilot_available": availability.copilot_available,
+    })
+}
+
+fn provider_display(state: &AppState, provider: ProviderId) -> ProviderDisplay {
+    let (session_percent, session_text, weekly_percent, weekly_text) = match provider {
+        ProviderId::Claude => (
+            state.session_percent,
+            state.session_text.as_str(),
+            state.weekly_percent,
+            state.weekly_text.as_str(),
+        ),
+        ProviderId::Codex => (
+            state.codex_session_percent,
+            state.codex_session_text.as_str(),
+            state.codex_weekly_percent,
+            state.codex_weekly_text.as_str(),
+        ),
+        ProviderId::Antigravity => (
+            state.antigravity_session_percent,
+            state.antigravity_session_text.as_str(),
+            state.antigravity_weekly_percent,
+            state.antigravity_weekly_text.as_str(),
+        ),
+        ProviderId::OpenCode => (
+            state.opencode_session_percent,
+            state.opencode_session_text.as_str(),
+            state.opencode_weekly_percent,
+            state.opencode_weekly_text.as_str(),
+        ),
+        ProviderId::Cursor => (
+            state.cursor_session_percent,
+            state.cursor_session_text.as_str(),
+            state.cursor_weekly_percent,
+            state.cursor_weekly_text.as_str(),
+        ),
+        ProviderId::Grok => (
+            state.grok_session_percent,
+            state.grok_session_text.as_str(),
+            state.grok_weekly_percent,
+            state.grok_weekly_text.as_str(),
+        ),
+        ProviderId::Copilot => (
+            state.copilot_session_percent,
+            state.copilot_session_text.as_str(),
+            state.copilot_weekly_percent,
+            state.copilot_weekly_text.as_str(),
+        ),
+    };
+    let mut display = ProviderDisplay {
+        session_percent,
+        session_text: session_text.to_string(),
+        weekly_percent,
+        weekly_text: weekly_text.to_string(),
+    };
+    #[cfg(not(debug_assertions))]
+    let _ = provider;
+    #[cfg(debug_assertions)]
+    {
+        let development = state.development_overrides[provider.index()];
+        if development.enabled {
+            if let Some(percent) = development.session_percent {
+                display.session_percent = percent;
+                display.session_text = development_percentage_text(percent, state.language);
+            }
+            if let Some(percent) = development.weekly_percent {
+                display.weekly_percent = percent;
+                display.weekly_text = development_percentage_text(percent, state.language);
+            }
+        }
+    }
+    display
+}
+
+#[cfg(debug_assertions)]
+fn development_percentage_text(percent: f64, language: LanguageId) -> String {
+    let shown = if language == LanguageId::SimplifiedChinese {
+        poller::remaining_percentage(percent)
+    } else {
+        percent
+    };
+    format!("{shown:.0}%")
+}
+
 fn settings_snapshot() -> serde_json::Value {
     use serde_json::json;
     let startup = is_startup_enabled();
@@ -5338,7 +5601,13 @@ fn settings_snapshot() -> serde_json::Value {
     let grok = custom_color(s.appearance.grok_accent, grok_accent_color());
     let copilot = custom_color(s.appearance.copilot_accent, copilot_accent_color());
     let candidate = SettingsCandidate::from_app_state(s, startup);
-    let preview = widget_preview_image(&candidate, s.language, s.is_dark);
+    let preview = widget_preview_image_with_development(
+        &candidate,
+        s.language,
+        s.is_dark,
+        &s.development_overrides,
+    );
+    let availability = effective_provider_availability(s);
     json!({
         "widget_preview_image":preview.as_ref().map(|image| image.0.as_str()),
         "widget_preview_width":preview.as_ref().map(|image| image.1),
@@ -5380,13 +5649,16 @@ fn settings_snapshot() -> serde_json::Value {
             "monitor_device":s.monitor_device,"anchor_left":s.anchor_left
         },
         "effective_language":s.language.code(),
-        "claude_code_available":s.provider_availability.claude_code_available,
-        "codex_available":s.provider_availability.codex_available,
-        "antigravity_available":s.provider_availability.antigravity_available,
-        "opencode_available":s.provider_availability.opencode_available,
-        "cursor_available":s.provider_availability.cursor_available,
-        "grok_available":s.provider_availability.grok_available,
-        "copilot_available":s.provider_availability.copilot_available,
+        "claude_code_available":availability.claude_code_available,
+        "codex_available":availability.codex_available,
+        "antigravity_available":availability.antigravity_available,
+        "opencode_available":availability.opencode_available,
+        "cursor_available":availability.cursor_available,
+        "grok_available":availability.grok_available,
+        "copilot_available":availability.copilot_available,
+        "credential_availability":provider_availability_json(s.provider_availability),
+        "development_enabled":cfg!(debug_assertions),
+        "development_overrides":development_overrides_snapshot(s),
         "effective_appearance":{"dark":dark,"claude_accent":[claude.r,claude.g,claude.b],"codex_accent":[codex.r,codex.g,codex.b],"antigravity_accent":[antigravity.r,antigravity.g,antigravity.b],"opencode_accent":[opencode.r,opencode.g,opencode.b],"cursor_accent":[cursor.r,cursor.g,cursor.b],"grok_accent":[grok.r,grok.g,grok.b],"copilot_accent":[copilot.r,copilot.g,copilot.b]},
         "update_busy":matches!(s.update_status, UpdateStatus::Checking | UpdateStatus::Applying),
         "update_available":update_available(&s.update_status),
@@ -5402,7 +5674,7 @@ fn preview_settings_snapshot(
     changes: &[settings_ui::Change],
 ) -> Result<serde_json::Value, SettingsApplyError> {
     let snapshot = settings_snapshot();
-    let (current, availability, language, system_dark) = {
+    let (current, availability, language, system_dark, development_overrides) = {
         let state = lock_state();
         let s = state
             .as_ref()
@@ -5412,9 +5684,10 @@ fn preview_settings_snapshot(
                 s,
                 snapshot["settings"]["startup"].as_bool().unwrap_or(false),
             ),
-            s.provider_availability,
+            effective_provider_availability(s),
             s.language,
             s.is_dark,
+            s.development_overrides,
         )
     };
     let monitors = snapshot["monitors"]
@@ -5426,7 +5699,7 @@ fn preview_settings_snapshot(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    draft_settings_snapshot(
+    draft_settings_snapshot_with_development(
         snapshot,
         &current,
         changes,
@@ -5434,10 +5707,33 @@ fn preview_settings_snapshot(
         &monitors,
         language,
         system_dark,
+        &development_overrides,
     )
 }
 
+#[cfg(test)]
 fn draft_settings_snapshot(
+    snapshot: serde_json::Value,
+    current: &SettingsCandidate,
+    changes: &[settings_ui::Change],
+    availability: poller::ProviderAvailability,
+    monitors: &[String],
+    language: LanguageId,
+    system_dark: bool,
+) -> Result<serde_json::Value, SettingsApplyError> {
+    draft_settings_snapshot_with_development(
+        snapshot,
+        current,
+        changes,
+        availability,
+        monitors,
+        language,
+        system_dark,
+        &[DevelopmentOverride::default(); 7],
+    )
+}
+
+fn draft_settings_snapshot_with_development(
     mut snapshot: serde_json::Value,
     current: &SettingsCandidate,
     changes: &[settings_ui::Change],
@@ -5445,6 +5741,7 @@ fn draft_settings_snapshot(
     monitors: &[String],
     language: LanguageId,
     system_dark: bool,
+    development_overrides: &[DevelopmentOverride; 7],
 ) -> Result<serde_json::Value, SettingsApplyError> {
     let candidate =
         validate_settings_changes_with_availability(current, changes, availability, monitors)?;
@@ -5455,7 +5752,12 @@ fn draft_settings_snapshot(
             language
         }
     });
-    let preview = widget_preview_image(&candidate, language, system_dark);
+    let preview = widget_preview_image_with_development(
+        &candidate,
+        language,
+        system_dark,
+        development_overrides,
+    );
     snapshot["widget_preview_image"] =
         serde_json::json!(preview.as_ref().map(|image| image.0.as_str()));
     snapshot["widget_preview_width"] = serde_json::json!(preview.as_ref().map(|image| image.1));
@@ -5466,10 +5768,53 @@ fn draft_settings_snapshot(
 
 /// Paint deterministic sample quotas through the real widget renderer into an
 /// isolated top-down DIB. No window handles or live quota state are involved.
+fn preview_provider_display(
+    override_state: DevelopmentOverride,
+    language: LanguageId,
+    session_text: &str,
+    weekly_text: &str,
+) -> ProviderDisplay {
+    let mut display = ProviderDisplay {
+        session_percent: 18.0,
+        session_text: session_text.to_string(),
+        weekly_percent: 42.0,
+        weekly_text: weekly_text.to_string(),
+    };
+    #[cfg(debug_assertions)]
+    if override_state.enabled {
+        if let Some(percent) = override_state.session_percent {
+            display.session_percent = percent;
+            display.session_text = development_percentage_text(percent, language);
+        }
+        if let Some(percent) = override_state.weekly_percent {
+            display.weekly_percent = percent;
+            display.weekly_text = development_percentage_text(percent, language);
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (override_state, language);
+    display
+}
+
+#[cfg(test)]
 fn widget_preview_image(
     candidate: &SettingsCandidate,
     language: LanguageId,
     system_dark: bool,
+) -> Option<(String, i32, i32)> {
+    widget_preview_image_with_development(
+        candidate,
+        language,
+        system_dark,
+        &[DevelopmentOverride::default(); 7],
+    )
+}
+
+fn widget_preview_image_with_development(
+    candidate: &SettingsCandidate,
+    language: LanguageId,
+    system_dark: bool,
+    development_overrides: &[DevelopmentOverride; 7],
 ) -> Option<(String, i32, i32)> {
     let appearance = candidate.appearance;
     let width = total_widget_width_for(
@@ -5540,6 +5885,14 @@ fn widget_preview_image(
                 format!("42% · 3{}", strings.day_suffix),
             )
         };
+        let preview_values: [ProviderDisplay; 7] = std::array::from_fn(|index| {
+            preview_provider_display(
+                development_overrides[index],
+                language,
+                &session,
+                &weekly,
+            )
+        });
         paint_content(
             dc,
             width,
@@ -5552,34 +5905,34 @@ fn widget_preview_image(
             &track,
             language,
             strings,
-            18.0,
-            &session,
-            42.0,
-            &weekly,
-            18.0,
-            &session,
-            42.0,
-            &weekly,
-            18.0,
-            &session,
-            42.0,
-            &weekly,
-            18.0,
-            &session,
-            42.0,
-            &weekly,
-            18.0,
-            &session,
-            42.0,
-            &weekly,
-            18.0,
-            &session,
-            42.0,
-            &weekly,
-            18.0,
-            &session,
-            42.0,
-            &weekly,
+            preview_values[0].session_percent,
+            &preview_values[0].session_text,
+            preview_values[0].weekly_percent,
+            &preview_values[0].weekly_text,
+            preview_values[1].session_percent,
+            &preview_values[1].session_text,
+            preview_values[1].weekly_percent,
+            &preview_values[1].weekly_text,
+            preview_values[2].session_percent,
+            &preview_values[2].session_text,
+            preview_values[2].weekly_percent,
+            &preview_values[2].weekly_text,
+            preview_values[3].session_percent,
+            &preview_values[3].session_text,
+            preview_values[3].weekly_percent,
+            &preview_values[3].weekly_text,
+            preview_values[4].session_percent,
+            &preview_values[4].session_text,
+            preview_values[4].weekly_percent,
+            &preview_values[4].weekly_text,
+            preview_values[5].session_percent,
+            &preview_values[5].session_text,
+            preview_values[5].weekly_percent,
+            &preview_values[5].weekly_text,
+            preview_values[6].session_percent,
+            &preview_values[6].session_text,
+            preview_values[6].weekly_percent,
+            &preview_values[6].weekly_text,
             candidate.show_claude_code,
             candidate.show_codex,
             candidate.show_antigravity,
@@ -5691,6 +6044,30 @@ fn handle_settings_requests(hwnd: HWND) {
             let _ = pending.reply.try_send(reply);
             continue;
         }
+        let development_result = match &pending.request.operation {
+            Operation::DevelopmentOverride {
+                provider,
+                enabled,
+                force_available,
+                session_percent,
+                weekly_percent,
+            } => Some(apply_development_override(
+                *provider,
+                *enabled,
+                *force_available,
+                *session_percent,
+                *weekly_percent,
+            )),
+            Operation::DevelopmentReset => Some(reset_development_overrides()),
+            _ => None,
+        };
+        if let Some(result) = development_result {
+            let state = settings_snapshot();
+            settings_ui::publish(state.clone());
+            let reply = settings_reply(pending.request.id, settings_ui::revision(), state, result);
+            let _ = pending.reply.try_send(reply);
+            continue;
+        }
         refresh_settings_availability();
         SETTINGS_SAVE_ERROR.with(|slot| slot.borrow_mut().take());
         let result = match pending.request.operation {
@@ -5719,6 +6096,9 @@ fn handle_settings_requests(hwnd: HWND) {
                             Err(SettingsApplyError::new("save_failed", message))
                         })
                 }),
+            Operation::DevelopmentOverride { .. } | Operation::DevelopmentReset => {
+                unreachable!("development operations are handled before settings updates")
+            }
         };
         let state = settings_snapshot();
         settings_ui::publish(state.clone());
@@ -5775,6 +6155,73 @@ fn setting_value<T: serde::de::DeserializeOwned>(
 ) -> Result<T, SettingsApplyError> {
     serde_json::from_value(value)
         .map_err(|error| invalid_setting(format!("Invalid setting value: {error}")))
+}
+
+fn apply_development_override(
+    provider: settings_ui::DevelopmentProvider,
+    enabled: bool,
+    force_available: bool,
+    session_percent: Option<f64>,
+    weekly_percent: Option<f64>,
+) -> Result<(), SettingsApplyError> {
+    #[cfg(debug_assertions)]
+    {
+        for percent in [session_percent, weekly_percent].into_iter().flatten() {
+            if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+                return Err(invalid_setting(
+                    "Development quota percentages must be between 0 and 100.",
+                ));
+            }
+        }
+        let mut state = lock_state();
+        let app_state = state
+            .as_mut()
+            .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
+        app_state.development_overrides[provider.index()] = DevelopmentOverride {
+            enabled,
+            force_available,
+            session_percent,
+            weekly_percent,
+        };
+        drop(state);
+        render_layered();
+        Ok(())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (
+            provider,
+            enabled,
+            force_available,
+            session_percent,
+            weekly_percent,
+        );
+        Err(SettingsApplyError::new(
+            "development_disabled",
+            "Development overrides are available only in debug builds.",
+        ))
+    }
+}
+
+fn reset_development_overrides() -> Result<(), SettingsApplyError> {
+    #[cfg(debug_assertions)]
+    {
+        let mut state = lock_state();
+        let app_state = state
+            .as_mut()
+            .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
+        app_state.development_overrides = [DevelopmentOverride::default(); 7];
+        drop(state);
+        render_layered();
+        Ok(())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        Err(SettingsApplyError::new(
+            "development_disabled",
+            "Development overrides are available only in debug builds.",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6216,7 +6663,7 @@ fn apply_settings_batch(
             .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
         (
             SettingsCandidate::from_app_state(app_state, startup),
-            app_state.provider_availability,
+            effective_provider_availability(app_state),
             app_state.effective_monitor_device.clone(),
             app_state.pending_monitor_device.clone(),
             app_state.embedded,
@@ -6361,7 +6808,7 @@ fn apply_settings_batch(
         }
     }
 
-    let (reconfigure_poll, show_widget) = {
+    let (reconfigure_poll, show_widget, language_title) = {
         let mut state = lock_state();
         let Some(app_state) = state.as_mut() else {
             drop(state);
@@ -6446,9 +6893,16 @@ fn apply_settings_batch(
                 SystemTime::now(),
             );
         }
-        (reconfigure_poll, candidate.widget_visible)
+        (
+            reconfigure_poll,
+            candidate.widget_visible,
+            language_changed.then(|| app_state.language.strings()),
+        )
     };
 
+    if let Some(strings) = language_title {
+        set_window_title(hwnd, strings);
+    }
     if reconfigure_poll {
         let interval = lock_state()
             .as_ref()
@@ -6462,13 +6916,10 @@ fn apply_settings_batch(
         position_at_taskbar_without_save();
     }
     if current.widget_visible != candidate.widget_visible {
-        unsafe {
-            if show_widget {
-                position_at_taskbar_without_save();
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            } else {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
+        if show_widget {
+            recover_widget_visibility(hwnd);
+        } else {
+            set_widget_visibility(hwnd, false);
         }
     } else if monitor_changed && show_widget {
         // Reparenting can leave a child window hidden on some shell/taskbar
@@ -6626,50 +7077,54 @@ fn paint(hdc: HDC, hwnd: HWND) {
     ) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.is_dark,
-                s.appearance,
-                s.language,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
-                s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
-                s.antigravity_weekly_text.clone(),
-                s.opencode_session_percent,
-                s.opencode_session_text.clone(),
-                s.opencode_weekly_percent,
-                s.opencode_weekly_text.clone(),
-                s.cursor_session_percent,
-                s.cursor_session_text.clone(),
-                s.cursor_weekly_percent,
-                s.cursor_weekly_text.clone(),
-                s.grok_session_percent,
-                s.grok_session_text.clone(),
-                s.grok_weekly_percent,
-                s.grok_weekly_text.clone(),
-                s.copilot_session_percent,
-                s.copilot_session_text.clone(),
-                s.copilot_weekly_percent,
-                s.copilot_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-                s.show_opencode,
-                s.show_cursor,
-                s.show_grok,
-                s.show_copilot,
-                s.show_provider_icons,
-                s.show_session_window,
-                s.show_weekly_window,
-            ),
+            Some(s) => {
+                let display: [ProviderDisplay; 7] =
+                    std::array::from_fn(|index| provider_display(s, ProviderId::ALL[index]));
+                (
+                    s.is_dark,
+                    s.appearance,
+                    s.language,
+                    s.language.strings(),
+                    display[0].session_percent,
+                    display[0].session_text.clone(),
+                    display[0].weekly_percent,
+                    display[0].weekly_text.clone(),
+                    display[1].session_percent,
+                    display[1].session_text.clone(),
+                    display[1].weekly_percent,
+                    display[1].weekly_text.clone(),
+                    display[2].session_percent,
+                    display[2].session_text.clone(),
+                    display[2].weekly_percent,
+                    display[2].weekly_text.clone(),
+                    display[3].session_percent,
+                    display[3].session_text.clone(),
+                    display[3].weekly_percent,
+                    display[3].weekly_text.clone(),
+                    display[4].session_percent,
+                    display[4].session_text.clone(),
+                    display[4].weekly_percent,
+                    display[4].weekly_text.clone(),
+                    display[5].session_percent,
+                    display[5].session_text.clone(),
+                    display[5].weekly_percent,
+                    display[5].weekly_text.clone(),
+                    display[6].session_percent,
+                    display[6].session_text.clone(),
+                    display[6].weekly_percent,
+                    display[6].weekly_text.clone(),
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    s.show_opencode,
+                    s.show_cursor,
+                    s.show_grok,
+                    s.show_copilot,
+                    s.show_provider_icons,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                )
+            }
             None => return,
         }
     };
@@ -7246,14 +7701,18 @@ mod tests {
         assert!(a.show_provider_icon && a.show_percentage && a.show_bar && a.show_reset_time);
         assert_eq!(a.usage_text_color, None);
         assert_eq!(a.window_label_font_size, 9);
-        assert_eq!(a.provider_spacing, ProviderSpacing::Small);
+        assert_eq!(a.provider_spacing, ProviderSpacing::Normal);
+        assert_eq!(a.provider_order, default_provider_order());
+        assert!(a.provider_monochrome);
         let mut previous_settings = serde_json::to_value(SettingsFile::default()).unwrap();
-        previous_settings["appearance"]
-            .as_object_mut()
-            .unwrap()
-            .remove("provider_spacing");
+        let previous_appearance = previous_settings["appearance"].as_object_mut().unwrap();
+        previous_appearance.remove("provider_spacing");
+        previous_appearance.remove("provider_order");
+        previous_appearance.remove("provider_monochrome");
         let previous: SettingsFile = serde_json::from_value(previous_settings).unwrap();
         assert_eq!(previous.appearance.provider_spacing, ProviderSpacing::Small);
+        assert_eq!(previous.appearance.provider_order, legacy_default_provider_order());
+        assert!(!previous.appearance.provider_monochrome);
         let settings = SettingsFile {
             appearance: Appearance {
                 show_provider_icon: false,
@@ -7270,7 +7729,7 @@ mod tests {
         assert_eq!(loaded.appearance, settings.appearance);
         assert_eq!(
             serde_json::to_value(settings).unwrap()["appearance"]["provider_spacing"],
-            "small"
+            "normal"
         );
         let old_icons =
             normalize_settings(serde_json::from_str(r#"{"show_provider_icons":false}"#).unwrap());
@@ -7488,10 +7947,10 @@ mod tests {
 
         let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
         let presets = [
-            (ProviderSpacing::None, "none", 0),
-            (ProviderSpacing::Small, "small", 2),
-            (ProviderSpacing::Normal, "normal", 5),
-            (ProviderSpacing::Large, "large", 9),
+            (ProviderSpacing::None, "none", 2),
+            (ProviderSpacing::Small, "small", 4),
+            (ProviderSpacing::Normal, "normal", 7),
+            (ProviderSpacing::Large, "large", 11),
         ];
         for (preset, wire_value, pixels) in presets {
             let candidate = validate_settings_changes(
@@ -7634,7 +8093,9 @@ mod tests {
             assert!(a.show_provider_icon && a.show_percentage && a.show_bar && a.show_reset_time);
             assert_eq!(a.window_label_font_size, 9);
             assert_eq!(a.usage_text_color, None);
-            assert_eq!(a.provider_spacing, ProviderSpacing::Small);
+            assert_eq!(a.provider_spacing, ProviderSpacing::Normal);
+            assert_eq!(a.provider_order, default_provider_order());
+            assert!(a.provider_monochrome);
         }
     }
 
@@ -8687,16 +9148,18 @@ mod tests {
     #[test]
     fn loads_legacy_settings_when_new_path_is_missing() {
         let base = std::env::temp_dir().join(format!(
-            "codex-usage-settings-test-{}-{}",
+            "quota-usage-settings-test-{}-{}",
             std::process::id(),
             now_unix_secs()
         ));
-        let current = base.join("CodexUsage").join("settings.json");
-        let legacy = base.join("ClaudeCodeUsageMonitor").join("settings.json");
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, test_settings_json("zh-CN")).unwrap();
+        let current = base.join("QuotaUsage").join("settings.json");
+        let codex_legacy = base.join("CodexUsage").join("settings.json");
+        let claude_legacy = base.join("ClaudeCodeUsageMonitor").join("settings.json");
+        std::fs::create_dir_all(claude_legacy.parent().unwrap()).unwrap();
+        std::fs::write(&claude_legacy, test_settings_json("zh-CN")).unwrap();
 
-        let (settings, migrated) = load_settings_from_paths(&current, &legacy).unwrap();
+        let (settings, migrated) =
+            load_settings_from_paths(&current, &codex_legacy, &claude_legacy).unwrap();
 
         assert!(migrated);
         assert_eq!(settings.tray_offset, 321);
@@ -8713,18 +9176,22 @@ mod tests {
     #[test]
     fn new_settings_take_precedence_over_legacy_settings() {
         let base = std::env::temp_dir().join(format!(
-            "codex-usage-settings-precedence-test-{}-{}",
+            "quota-usage-settings-precedence-test-{}-{}",
             std::process::id(),
             now_unix_secs()
         ));
-        let current = base.join("CodexUsage").join("settings.json");
-        let legacy = base.join("ClaudeCodeUsageMonitor").join("settings.json");
+        let current = base.join("QuotaUsage").join("settings.json");
+        let codex_legacy = base.join("CodexUsage").join("settings.json");
+        let claude_legacy = base.join("ClaudeCodeUsageMonitor").join("settings.json");
         std::fs::create_dir_all(current.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(codex_legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(claude_legacy.parent().unwrap()).unwrap();
         std::fs::write(&current, test_settings_json("en")).unwrap();
-        std::fs::write(&legacy, test_settings_json("zh-CN")).unwrap();
+        std::fs::write(&codex_legacy, test_settings_json("fr")).unwrap();
+        std::fs::write(&claude_legacy, test_settings_json("zh-CN")).unwrap();
 
-        let (settings, migrated) = load_settings_from_paths(&current, &legacy).unwrap();
+        let (settings, migrated) =
+            load_settings_from_paths(&current, &codex_legacy, &claude_legacy).unwrap();
 
         assert!(!migrated);
         assert_eq!(settings.language.as_deref(), Some("en"));
@@ -8732,11 +9199,38 @@ mod tests {
     }
 
     #[test]
-    fn startup_migration_only_writes_when_legacy_exists_without_current_entry() {
-        assert!(should_write_migrated_startup(true, false));
-        assert!(!should_write_migrated_startup(false, false));
-        assert!(!should_write_migrated_startup(true, true));
-        assert!(!should_write_migrated_startup(false, true));
+    fn codex_settings_take_precedence_over_the_older_claude_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "quota-usage-settings-legacy-precedence-test-{}-{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let current = base.join("QuotaUsage").join("settings.json");
+        let codex_legacy = base.join("CodexUsage").join("settings.json");
+        let claude_legacy = base.join("ClaudeCodeUsageMonitor").join("settings.json");
+        std::fs::create_dir_all(codex_legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(claude_legacy.parent().unwrap()).unwrap();
+        std::fs::write(&codex_legacy, test_settings_json("fr")).unwrap();
+        std::fs::write(&claude_legacy, test_settings_json("zh-CN")).unwrap();
+
+        let (settings, migrated) =
+            load_settings_from_paths(&current, &codex_legacy, &claude_legacy).unwrap();
+
+        assert!(migrated);
+        assert_eq!(settings.language.as_deref(), Some("fr"));
+        assert!(codex_legacy.exists());
+        assert!(claude_legacy.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn startup_commands_match_only_exact_paths_for_migration() {
+        let executable = r"C:\Users\user\AppData\Local\Programs\QuotaUsage\quota-usage.exe";
+        assert!(startup_command_matches(&format!("\"{executable}\""), executable));
+        assert!(!startup_command_matches(
+            r"C:\Old\quota-usage.exe",
+            executable
+        ));
     }
 
     #[test]
@@ -8798,10 +9292,10 @@ mod tests {
 
     #[test]
     fn startup_recognizes_quoted_commands_and_legacy_unquoted_paths() {
-        let path = r"C:\Program Files\Codex Usage\codex-usage.exe";
+        let path = r"C:\Program Files\Quota Usage\quota-usage.exe";
         assert!(startup_command_matches(&format!("\"{path}\""), path));
         assert!(startup_command_matches(path, path));
-        assert!(!startup_command_matches(r"C:\Other\codex-usage.exe", path));
+        assert!(!startup_command_matches(r"C:\Other\quota-usage.exe", path));
     }
 
     #[test]
@@ -9206,7 +9700,7 @@ unsafe fn handle_command(hwnd: HWND, id: u16) {
                 if let Some(s) = state.as_mut() {
                     match id {
                         IDM_MODEL_CLAUDE_CODE => {
-                            if s.provider_availability.claude_code_available
+                            if effective_provider_availability(s).claude_code_available
                                 && (s.show_codex || s.show_antigravity || !s.show_claude_code)
                             {
                                 s.show_claude_code = !s.show_claude_code;
@@ -9266,11 +9760,15 @@ unsafe fn handle_command(hwnd: HWND, id: u16) {
                 IDM_LANG_PORTUGUESE_BRAZIL => Some(LanguageId::PortugueseBrazil),
                 _ => None,
             };
-            {
+            let language_title = {
                 let mut state = lock_state();
-                if let Some(s) = state.as_mut() {
+                state.as_mut().map(|s| {
                     apply_language_to_state(s, language_override);
-                }
+                    (s.hwnd.to_hwnd(), s.language.strings())
+                })
+            };
+            if let Some((hwnd, strings)) = language_title {
+                set_window_title(hwnd, strings);
             }
             save_state_settings();
             render_layered();

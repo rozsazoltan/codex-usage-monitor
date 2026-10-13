@@ -1,6 +1,7 @@
 #pragma once
 #include "MainWindow.g.h"
 #include <atomic>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -8,13 +9,22 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <winrt/Microsoft.UI.Dispatching.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
+#include <winrt/Microsoft.UI.Xaml.Input.h>
+#include <winrt/Microsoft.UI.Xaml.Shapes.h>
 #include <winrt/Windows.Data.Json.h>
 
 namespace winrt::SettingsUI::implementation
 {
+    struct AppearancePresetPreviewJob
+    {
+        winrt::Windows::Data::Json::JsonObject changes{ nullptr };
+        uint32_t cardIndex{};
+    };
+
     struct MainWindow : MainWindowT<MainWindow>
     {
         MainWindow();
@@ -50,12 +60,19 @@ namespace winrt::SettingsUI::implementation
         void SendWidgetPreviewIfIdle();
         void UpdateWidgetPreview(winrt::Windows::Data::Json::JsonObject const& snapshot);
         winrt::fire_and_forget LoadWidgetPreview(std::wstring imageBase64, uint64_t generation);
+        winrt::fire_and_forget LoadPresetPreview(std::wstring imageBase64, uint64_t generation, uint32_t index);
+        void ApplyAppearancePreset(winrt::Windows::Data::Json::JsonObject const& target);
+        void SendNextPresetPreviewIfIdle();
+        void BuildAppearancePresets();
         void OnWindowClosing(Microsoft::UI::Windowing::AppWindow const&,
             Microsoft::UI::Windowing::AppWindowClosingEventArgs const& args);
         void SetValue(std::wstring const& key, winrt::Windows::Data::Json::IJsonValue const& value);
         void Action(std::wstring const& action);
         void ShowMessage(std::wstring const& text, bool error = false);
         void UpdateProviderAvailability();
+        void UpdateWidgetPageAvailability();
+        void AddWidgetHiddenWarning();
+        void AppendWidgetDependentCard(Microsoft::UI::Xaml::Controls::Border const& card);
         void UpdateAboutControls();
         void UpdateUpdateIndicator();
         void UpdateTitleBarLayout();
@@ -65,6 +82,13 @@ namespace winrt::SettingsUI::implementation
         void BuildGeneral();
         void BuildMonitoring();
         void BuildAppearance();
+        void BeginProviderReorder(Microsoft::UI::Xaml::Controls::Border const& tile,
+            Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void MoveProviderReorder(Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void EndProviderReorder(Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void UpdateProviderDropIndicator(winrt::Windows::Foundation::Point const& point);
+        void CancelProviderReorder();
+        void PersistProviderOrder();
         void BuildProviderDetail(int provider);
         void AddAccentColorRow(Microsoft::UI::Xaml::Controls::StackPanel const& parent,
             std::wstring const& key, std::wstring const& title);
@@ -89,8 +113,23 @@ namespace winrt::SettingsUI::implementation
         winrt::Windows::Data::Json::JsonObject flightChanges_{ nullptr };
         winrt::Windows::Data::Json::JsonObject pendingChanges_{ nullptr };
         std::vector<winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch> providerToggles_;
+        std::vector<winrt::Microsoft::UI::Xaml::Controls::ContentControl> widgetDependentCards_;
         winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch providerDetailEnableToggle_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch widgetVisibilityToggle_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::ComboBox providerIconPositionSelector_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::GridView providerOrderGrid_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::Canvas providerOrderOverlay_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Shapes::Rectangle providerInsertionIndicator_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::Border providerDraggedTile_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Input::Pointer providerPointer_{ nullptr };
+        std::vector<std::wstring> providerFullOrder_;
+        std::optional<int> providerDragOriginalIndex_;
+        std::optional<int> providerDropIndex_;
+        winrt::Windows::Foundation::Point providerPressPoint_{};
+        uint32_t providerPointerId_{};
+        int providerDragProviderIndex_{ -1 };
+        bool providerPointerPressed_{};
+        bool providerDragActive_{};
         winrt::Microsoft::UI::Xaml::Controls::Image widgetPreviewImage_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock widgetPreviewStatus_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Border appearancePreviewCard_{ nullptr };
@@ -200,6 +239,17 @@ namespace winrt::SettingsUI::implementation
         uint32_t widgetPreviewDpi_{ 96 };
         std::wstring latestWidgetPreviewBase64_;
         std::wstring displayedWidgetPreviewBase64_;
+        std::vector<winrt::Microsoft::UI::Xaml::Controls::Image> appearancePresetImages_;
+        std::vector<winrt::Microsoft::UI::Xaml::Controls::TextBlock> appearancePresetStatuses_;
+        std::vector<std::pair<std::wstring, winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch>> appearancePresetToggles_;
+        std::vector<std::pair<std::wstring, winrt::Microsoft::UI::Xaml::Controls::ComboBox>> appearancePresetCombos_;
+        std::vector<std::pair<std::wstring, winrt::Microsoft::UI::Xaml::Controls::TextBox>> appearancePresetColorInputs_;
+        std::vector<AppearancePresetPreviewJob> appearancePresetPreviewJobs_;
+        size_t appearancePresetPreviewNext_{};
+        uint64_t appearancePresetGeneration_{};
+        uint64_t appearancePresetFlightGeneration_{};
+        uint32_t appearancePresetFlightIndex_{};
+        bool presetPreviewInFlight_{};
         winrt::event_token closingToken_{};
         std::thread ioThread_;
         std::atomic<HANDLE> pipeHandle_{ INVALID_HANDLE_VALUE };

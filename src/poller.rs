@@ -1037,7 +1037,6 @@ fn fetch_antigravity_usage_from_endpoint(
     Ok(UsageData {
         session,
         weekly,
-        weekly_label: None,
     })
 }
 
@@ -1361,30 +1360,19 @@ fn poll_opencode() -> Result<UsageData, PollError> {
         .as_ref()
         .map(opencode_section_from_window)
         .unwrap_or_default();
-    // The long-window label ("7d"/"30d") travels with the selected section;
-    // the widget renders it next to the weekly value once P6 wires the new
-    // providers into the rows.
-    let (weekly, weekly_label) = select_opencode_long_window(&usage);
+    let weekly = select_opencode_long_window(&usage);
 
-    Ok(UsageData {
-        session,
-        weekly,
-        weekly_label,
-    })
+    Ok(UsageData { session, weekly })
 }
 
-fn select_opencode_long_window(usage: &OpenCodeDashboardUsage) -> (UsageSection, Option<String>) {
+fn select_opencode_long_window(usage: &OpenCodeDashboardUsage) -> UsageSection {
     match (&usage.weekly, &usage.monthly) {
-        (Some(weekly), Some(monthly)) if monthly.usage_percent > weekly.usage_percent => (
-            opencode_section_from_window(monthly),
-            Some("30d".to_string()),
-        ),
-        (Some(weekly), _) => (opencode_section_from_window(weekly), Some("7d".to_string())),
-        (None, Some(monthly)) => (
-            opencode_section_from_window(monthly),
-            Some("30d".to_string()),
-        ),
-        (None, None) => (UsageSection::default(), None),
+        (Some(weekly), Some(monthly)) if monthly.usage_percent > weekly.usage_percent => {
+            opencode_section_from_window(monthly)
+        }
+        (Some(weekly), _) => opencode_section_from_window(weekly),
+        (None, Some(monthly)) => opencode_section_from_window(monthly),
+        (None, None) => UsageSection::default(),
     }
 }
 
@@ -1889,11 +1877,9 @@ fn cursor_usage_from_summary(response: CursorUsageSummaryResponse) -> Option<Usa
             })
             .unwrap_or_default()
     };
-    // Cursor reports plain resort windows with no pool label.
     Some(UsageData {
         session: section(plan.auto_percent_used.or(plan.total_percent_used)),
         weekly: section(plan.api_percent_used),
-        weekly_label: None,
     })
 }
 
@@ -2112,15 +2098,13 @@ fn grok_usage_from_billing(response: GrokBillingResponse) -> Option<UsageData> {
     // `creditUsagePercent`. That is 0% spent.
     let percentage = config.credit_usage_percent.or(resets_at.map(|_| 0.0))?;
     // Grok spends one pool per billing period and has no five-hour window, so
-    // the pool lands in `weekly`, which is what tray badges read. The label
-    // ("week"/"month") travels alongside for the widget rows.
+    // the pool lands in `weekly`, which is what tray badges read.
     Some(UsageData {
         session: UsageSection::default(),
         weekly: UsageSection {
             percentage: percentage.clamp(0.0, 100.0),
             resets_at,
         },
-        weekly_label: Some("week".to_string()),
     })
 }
 
@@ -3071,15 +3055,13 @@ fn copilot_usage_from_user(response: CopilotUserResponse) -> Option<UsageData> {
     };
 
     // Copilot spends one pool per calendar month and has no short window, so
-    // the pool lands in `weekly`, which is what tray badges read. The "30d"
-    // label travels alongside for the widget rows.
+    // the pool lands in `weekly`, which is what tray badges read.
     Some(UsageData {
         session: UsageSection::default(),
         weekly: UsageSection {
             percentage: pool,
             resets_at,
         },
-        weekly_label: Some("30d".to_string()),
     })
 }
 
@@ -3151,7 +3133,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(data.weekly.percentage, 25.0);
-        assert_eq!(data.weekly_label.as_deref(), Some("30d"));
         assert_eq!(
             data.weekly.resets_at,
             Some(UNIX_EPOCH + Duration::from_secs(1_793_491_200))
@@ -3522,7 +3503,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_selects_most_constrained_long_window_with_label() {
+    fn opencode_selects_most_constrained_long_window() {
         let usage = OpenCodeDashboardUsage {
             weekly: Some(OpenCodeUsageWindow {
                 usage_percent: 40.0,
@@ -3534,9 +3515,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (section, label) = select_opencode_long_window(&usage);
+        let section = select_opencode_long_window(&usage);
         assert_eq!(section.percentage, 70.0);
-        assert_eq!(label.as_deref(), Some("30d"));
 
         let usage = OpenCodeDashboardUsage {
             weekly: Some(OpenCodeUsageWindow {
@@ -3549,13 +3529,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (section, label) = select_opencode_long_window(&usage);
+        let section = select_opencode_long_window(&usage);
         assert_eq!(section.percentage, 80.0);
-        assert_eq!(label.as_deref(), Some("7d"));
 
-        let (section, label) = select_opencode_long_window(&OpenCodeDashboardUsage::default());
+        let section = select_opencode_long_window(&OpenCodeDashboardUsage::default());
         assert_eq!(section.percentage, 0.0);
-        assert_eq!(label, None);
     }
 
     #[test]
@@ -3794,7 +3772,6 @@ mod tests {
             serde_json::from_str(CURSOR_USAGE_SUMMARY_FIXTURE).unwrap();
         let data = cursor_usage_from_summary(response).unwrap();
         assert_eq!(data.session.percentage, 12.5);
-        assert_eq!(data.weekly_label, None);
         assert_eq!(data.weekly.percentage, 3.0);
         assert!(data.session.resets_at.is_some());
         assert_eq!(data.session.resets_at, data.weekly.resets_at);
@@ -4099,7 +4076,6 @@ mod tests {
 
         let data = grok_usage_from_billing(response).unwrap();
         assert_eq!(data.weekly.percentage, 42.5);
-        assert_eq!(data.weekly_label.as_deref(), Some("week"));
         assert!(data.weekly.resets_at.is_some());
         // Grok has no five-hour window, so nothing claims the session slot.
         assert_eq!(data.session.percentage, 0.0);
@@ -4528,7 +4504,6 @@ mod tests {
             antigravity_usage_from_summary(response).expect("Gemini quota should be selected");
 
         assert!((usage.weekly.percentage - 0.695705).abs() < 0.000001);
-        assert_eq!(usage.weekly_label, None);
         assert!((usage.session.percentage - 4.17425).abs() < 0.000001);
         assert!(usage.weekly.resets_at.is_some());
         assert!(usage.session.resets_at.is_some());

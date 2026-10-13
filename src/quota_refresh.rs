@@ -217,7 +217,6 @@ mod tests {
                 percentage: weekly,
                 resets_at: None,
             },
-            weekly_label: None,
         }
     }
     #[test]

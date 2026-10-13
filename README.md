@@ -1,10 +1,6 @@
-# Codex Usage
+# Quota Usage Monitor
 
-A portable Windows taskbar widget for monitoring usage limits and reset times across **Claude Code, Codex, Antigravity, OpenCode Go, Cursor, Grok Build, and GitHub Copilot**. Configure it through a **native Windows settings GUI**, with a live appearance preview and separate logo and color controls for each provider.
-
-Developed by [Zoltán Rózsa](https://datarose.net).
-
-**Thanks to [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) for the inspiration and README structure.** This independently maintained derivative of [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor) has its own native settings interface and is licensed under AGPL v3 or later.
+Quota Usage Monitor is a lightweight, portable, easy-to-use, customizable, open-source Windows taskbar widget for monitoring usage limits and reset times across **Claude Code, Codex, Antigravity, OpenCode Go, Cursor, Grok Build, GitHub Copilot, and other providers**. Configure it through a **native Windows settings GUI**, with a live appearance preview and separate logo and color controls for each provider.
 
 ## Features
 
@@ -25,23 +21,23 @@ Developed by [Zoltán Rózsa](https://datarose.net).
 
 ### Portable download
 
-Download `codex-usage.exe` from the [latest release](https://github.com/rozsazoltan/codex-usage-monitor/releases/latest) and run it where you saved it. No application installer is needed.
+Download `quota-usage.exe` from the [latest release](https://github.com/rozsazoltan/quota-usage-monitor/releases/latest) and run it where you saved it. No application installer is needed. Releases also include a byte-identical `codex-usage.exe` compatibility alias and checksum so older updater versions can transition to the new asset name.
 
-The executable embeds the native settings companion, but not the shared Windows App Runtime. Opening Settings extracts or verifies the companion under `%LOCALAPPDATA%\CodexUsage\SettingsPayloads\<version>-<content-hash>`. This cache is separate from preferences; the downloaded executable stays in place. Version and updater/uninstaller CLI modes do not extract the companion.
+The executable embeds the native settings companion, but not the shared Windows App Runtime. Opening Settings extracts or verifies the companion under `%LOCALAPPDATA%\QuotaUsage\SettingsPayloads\<version>-<content-hash>`. This cache is separate from preferences; the downloaded executable stays in place. Version and updater/uninstaller CLI modes do not extract the companion.
 
 ### Scoop and marcosnils/bin
 
-With Scoop installed, install [`marcosnils/bin`](https://github.com/marcosnils/bin) from its extras bucket, then use `bin` to install Codex Usage:
+With Scoop installed, install [`marcosnils/bin`](https://github.com/marcosnils/bin) from its extras bucket, then use `bin` to install Quota Usage:
 
 ```powershell
 scoop bucket add extras
 scoop install extras/bin
-bin install github.com/rozsazoltan/codex-usage-monitor
+bin install github.com/rozsazoltan/quota-usage-monitor
 ```
 
 ## Usage
 
-Start `codex-usage.exe`. Right-click the widget or notification-area icon to open its menu, then choose **Settings**. Left-click the tray icon to hide or show the widget.
+Start `quota-usage.exe`. Right-click the widget or notification-area icon to open its menu, then choose **Settings**. Left-click the tray icon to hide or show the widget.
 
 In **Monitoring**, choose the providers to display. Codex is enabled by default; newly added providers are off. Normally, at least one and at most three providers must be enabled. **Experimental** offers an override for the upper limit; enabling more providers can make the widget too wide for the taskbar.
 
@@ -52,15 +48,15 @@ Grok Build and GitHub Copilot show their quota pool on the long-window row, with
 Print the version from the executable's folder:
 
 ```powershell
-.\codex-usage.exe --version
-# Also supported: .\codex-usage.exe -v
+.\quota-usage.exe --version
+# Also supported: .\quota-usage.exe -v
 ```
 
 ### Update and remove
 
 The app checks for updates once per normal startup. To check manually, open **About** and choose **Check for updates**. When an update is available, an **Update** page appears above About with a blue dot; choose **Install update** there or in About.
 
-Choose **Uninstall Codex Usage** in About to remove the app. Preferences are kept unless you choose to remove them in the second confirmation. A portable copy removes its executable and matching startup entries, not its containing folder; a managed installation also removes its shortcuts and uninstall registration.
+Choose **Uninstall Quota Usage** in About to remove the app. Preferences are kept unless you choose to remove them in the second confirmation. A portable copy removes its executable and matching startup entries, not its containing folder; a managed installation also removes its shortcuts and uninstall registration.
 
 For an installation managed by `bin`, use `bin remove <binary>`, replacing `<binary>` with the installed binary name, to remove its package entry too.
 
@@ -97,7 +93,7 @@ Treat this file as a credential: it stores the cookie in plain text. Do not comm
 
 ## Data and privacy
 
-The monitor reads local credentials for enabled providers and sends authenticated HTTPS usage requests directly to their services. OAuth or session credentials are sent to the relevant provider; there is no Codex Usage backend, analytics, telemetry, or project-file upload. Update checks and downloads contact GitHub. Requests may use an environment-configured proxy, so use only proxies and certificate authorities you trust.
+The monitor reads local credentials for enabled providers and sends authenticated HTTPS usage requests directly to their services. OAuth or session credentials are sent to the relevant provider; there is no Quota Usage backend, analytics, telemetry, or project-file upload. Update checks and downloads contact GitHub. Requests may use an environment-configured proxy, so use only proxies and certificate authorities you trust.
 
 - Claude Code credentials come from `~/.claude/.credentials.json`, `CLAUDE_CONFIG_DIR` on Windows, or a WSL fallback. Codex credentials come from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`.
 - Expired Claude Code, Codex, or Grok sessions may trigger a background refresh through the owning CLI. The monitor does not directly rewrite their credential files. For expired Antigravity credentials, reopen Antigravity and sign in.
@@ -107,15 +103,15 @@ The monitor reads local credentials for enabled providers and sends authenticate
 ## Troubleshooting
 
 - **Settings will not open:** install or repair the x64 Windows App Runtime 1.8 at the required servicing level. The app reports this prerequisite but does not silently install it.
-- **Settings payload verification fails:** close all Codex Usage instances, delete only the affected version folder under `%LOCALAPPDATA%\CodexUsage\SettingsPayloads`, then restart. Leave preferences and the shared runtime intact. Junction/reparse-point cache directories are unsupported.
+- **Settings payload verification fails:** close all Quota Usage instances, delete only the affected version folder under `%LOCALAPPDATA%\QuotaUsage\SettingsPayloads`, then restart. Leave preferences and the shared runtime intact. Junction/reparse-point cache directories are unsupported.
 - **Missing quota data or rejected credentials:** sign in again with the affected provider, then choose **Refresh** from the app menu. Claude Desktop authentication cannot replace Claude Code CLI sign-in.
 - **The app does not start or the widget is missing:** run this command from the executable's folder:
 
   ```powershell
-  .\codex-usage.exe --diagnose
+  .\quota-usage.exe --diagnose
   ```
 
-  The diagnostic log is `%TEMP%\codex-usage.log`. Review and redact sensitive information before sharing it.
+  The diagnostic log is `%TEMP%\quota-usage.log`. Review and redact sensitive information before sharing it.
 
 ## Build from source
 
@@ -126,7 +122,7 @@ cargo run
 cargo test
 ```
 
-Debug builds and tests automatically restore, build, publish, and embed the native settings companion. For Rust-only work, explicitly set `CODEX_SETTINGS_SKIP_NATIVE_BUILD=1`; settings then use the `settings-ui/bin/portable` fallback.
+Debug builds and tests automatically restore, build, publish, and embed the native settings companion. For Rust-only work, explicitly set `QUOTA_SETTINGS_SKIP_NATIVE_BUILD=1`; settings then use the `settings-ui/bin/portable` fallback. The legacy `CODEX_SETTINGS_SKIP_NATIVE_BUILD` variable remains supported as a fallback.
 
 ### Portable release
 
@@ -138,16 +134,32 @@ Install PowerShell 7.2+, Rust's x64 MSVC toolchain, Visual Studio 2022 C++ Build
 ./scripts/build-release.ps1 -MSBuild 'D:\program\vs-buildtools\2022\MSBuild\Current\Bin\MSBuild.exe'
 ```
 
-The script rebuilds native XAML with full VS MSBuild, runs `PublishPortable`, packages the declared runtime files, validates the payload through Rust tests, and builds `target/release/codex-usage.exe`. Do not use `dotnet build`. The payload excludes the shared Windows App Runtime, symbols, WebView2, and the build toolchain.
+The script rebuilds native XAML with full VS MSBuild, runs `PublishPortable`, packages the declared runtime files, validates the payload through Rust tests, and builds `target/release/quota-usage.exe`. Do not use `dotnet build`. The payload excludes the shared Windows App Runtime, symbols, WebView2, and the build toolchain.
 
-With `CODEX_SETTINGS_PAYLOAD` set, `build.rs` embeds the pre-generated payload without restoring packages or accessing the network. A plain `cargo build --release` fails unless that variable points to a generated directory containing `manifest.json` and `payload.bin`. Use the release script and rerun it after native changes. GitHub releases contain the portable executable and its SHA-256 checksum.
+With `QUOTA_SETTINGS_PAYLOAD` set, `build.rs` embeds the pre-generated payload without restoring packages or accessing the network. A plain `cargo build --release` fails unless that variable points to a generated directory containing `manifest.json` and `payload.bin`. Use the release script and rerun it after native changes. The legacy `CODEX_SETTINGS_PAYLOAD` variable remains supported when the new variable is unset. Set `QUOTA_SETTINGS_MSBUILD` to select a nonstandard Visual Studio MSBuild path; `CODEX_SETTINGS_MSBUILD` remains supported as a legacy fallback. GitHub releases contain checksums for both the new portable executable and the legacy alias.
+
+### Release version policy
+
+Releases use CalVer in the form `YYYY.M.patch`, with a **numeric, unpadded month** (for example, `2026.1.0`, not `2026.01.0`; Cargo requires valid SemVer). Do not edit the package version manually or enter a version when starting a release.
+
+The **Prepare release version** workflow updates only the root package versions in `Cargo.toml` and `Cargo.lock` on the default branch. It runs after branch pushes (but acts only on the default branch), daily to catch a UTC month rollover even when there are no commits, and can be dispatched on the default branch to repair a stale version. It selects the next patch from valid `vYYYY.M.patch` Git tags for the current UTC month: patch `0` if none exist, otherwise one above the highest patch. Legacy SemVer tags and tags for other months do not affect the calculation. The workflow commits the prepared files with `GITHUB_TOKEN`; because such pushes do not start another workflow run, the daily schedule is also the rollover safeguard. The default branch must allow the workflow's GitHub Actions bot to push these version commits.
+
+To publish, use **Release → Run workflow** on the default branch after version preparation has committed. The workflow takes no version input, verifies that the committed Cargo files match the next available CalVer, builds the checked-out commit, then creates the matching `vYYYY.M.patch` tag and GitHub Release only after the build succeeds. A stale version fails with instructions to run version preparation first. Pushing a `v*` tag remains supported, but the tag must exactly match the Cargo version and point to the checked-out commit; legacy or mismatched tags are rejected. Release and preparation runs share a concurrency lock, and reruns skip an already published release.
+
+If a valid tag was created but its release was not published, rerun the failed **Release** workflow after fixing the cause; do not move or force-delete the tag. For a tag-push run, rerun that tag's run. If a manual dispatch created the tag before failing, rerun that manual run on the default branch: recovery is allowed only when the manifest-matching tag points to the exact checked-out commit, and an existing release is skipped. If the tagged commit cannot be released, keep the tag, run **Prepare release version** on the default branch to advance to the next patch, and publish that version instead.
 
 ## Contributing and community
 
-Fork the repository, make a focused change, and open a pull request. Run the relevant Rust tests; for native settings changes, follow the build and smoke-test instructions in [settings-ui/BUILDING.md](settings-ui/BUILDING.md). Report reproducible problems through [GitHub Issues](https://github.com/rozsazoltan/codex-usage-monitor/issues), without credentials or unredacted diagnostic logs.
+Fork the repository, make a focused change, and open a pull request. Run the relevant Rust tests; for native settings changes, follow the build and smoke-test instructions in [settings-ui/BUILDING.md](settings-ui/BUILDING.md). Report reproducible problems through [GitHub Issues](https://github.com/rozsazoltan/quota-usage-monitor/issues), without credentials or unredacted diagnostic logs.
+
+## Acknowledgments
+
+Developed by [Zoltán Rózsa](https://datarose.net).
+
+Quota Usage is an independently maintained derivative of [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor), preserving its Codex provider and upstream lineage. Thanks to [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) for the original inspiration and README structure. Quota Usage has its own native settings interface.
+
+Provider icon sources include [Lobe Icons](https://github.com/lobehub/lobe-icons). Required upstream MIT copyright and license texts are preserved in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt). Provider names and logos belong to their respective owners; this project is not affiliated with or endorsed by them or the upstream maintainers.
 
 ## License
 
 Licensed under the [GNU Affero General Public License v3 or later](LICENSE).
-
-Special thanks to **[CodeZeno](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)** and its contributors. The source lineage also includes [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor), and provider icon sources include [Lobe Icons](https://github.com/lobehub/lobe-icons). Required upstream MIT copyright and license texts are preserved in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt). Provider names and logos belong to their respective owners; this project is not affiliated with or endorsed by them or the upstream maintainers.

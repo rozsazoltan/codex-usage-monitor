@@ -6,4 +6,4 @@ The Claude and OpenAI logo paths are from [Lobe Icons](https://github.com/lobehu
 - `src/Grok/components/Mono.tsx`
 - `src/GithubCopilot/components/Mono.tsx`
 
-Lobe Icons is licensed under MIT (see `LICENSE`). The SVG sources are retained here. `scripts/generate-provider-icons.ps1` renders the seven colored PNG resources using Windows WPF; they are embedded in the executable, so no external icon files are needed at runtime. Brand names and marks belong to their respective owners; Codex Usage is not affiliated with or endorsed by those providers.
+Lobe Icons is licensed under MIT (see `LICENSE`). The SVG sources are retained here. `scripts/generate-provider-icons.ps1` renders the seven colored PNG resources using Windows WPF; they are embedded in the executable, so no external icon files are needed at runtime. Brand names and marks belong to their respective owners; Quota Usage is not affiliated with or endorsed by those providers.

@@ -1,26 +1,28 @@
-Codex Usage
+Quota Usage Monitor
 THIRD-PARTY NOTICES
 
-Codex Usage is a lightweight, portable Windows quota-usage monitor. It reads
-existing sign-in credentials for locally installed Codex and Claude Code tools
-and sends usage requests directly to provider services. No separate API key is
-needed; existing CLI sign-ins provide the credentials.
+Quota Usage is a lightweight, portable, easy-to-use, customizable, open-source
+usage monitor for Claude, Codex, and many other providers. It reads existing
+sign-in credentials and sends usage requests directly to provider services. No
+separate API key is needed when existing provider sign-ins supply credentials.
 
 PROJECT LICENSE
 
-Codex Usage is licensed under the GNU Affero General Public License, version 3
-(AGPL v3). See LICENSE in the Codex Usage repository. This project license is
-separate from the third-party notices below; these notices do not change the
-license of Codex Usage.
+Quota Usage is licensed under the GNU Affero General Public License, version 3
+(AGPL v3). See LICENSE in the Quota Usage Monitor repository. This project
+license is separate from the third-party notices below; these notices do not
+change the license of Quota Usage.
+
+THIRD-PARTY LICENSES AND NOTICES
 
 UPSTREAM-RAY/CODEX-USAGE-MONITOR
 
 Project URL: https://github.com/upstream-ray/codex-usage-monitor
 License: MIT
 Attribution: Primary inspiration and source base for this independently
-maintained fork, originally based on version v1.10. Thanks to Craig Constable
-and the upstream contributors. This project is not affiliated with or endorsed
-by the upstream maintainers or OpenAI.
+maintained fork. Thanks to Craig Constable and the upstream contributors.
+This project is not affiliated with or endorsed by the upstream maintainers
+or OpenAI.
 
 MIT License
 
@@ -48,7 +50,7 @@ LOBEHUB/LOBE-ICONS
 
 Project URL: https://github.com/lobehub/lobe-icons
 License: MIT
-Attribution: The Claude and Codex/OpenAI provider logo paths used by Codex Usage
+Attribution: The Claude and Codex/OpenAI provider logo paths used by Quota Usage
 come from Lobe Icons. The Antigravity, OpenCode, Cursor, Grok, and GitHub Copilot
 paths come from commit bcdb7c82792a854c2967f7328e11a30205ea584d at these source
 paths: src/Antigravity/components/Mono.tsx,
@@ -56,7 +58,7 @@ src/OpenCode/components/Mono.tsx, src/Cursor/components/Mono.tsx,
 src/Grok/components/Mono.tsx, and src/GithubCopilot/components/Mono.tsx. The
 sources and generated assets are in src/icons/providers. The MIT license applies
 to the icon source, not to the brand names or marks, which belong to their
-respective owners. Codex Usage is not affiliated with or endorsed by these
+respective owners. Quota Usage is not affiliated with or endorsed by these
 providers.
 
 MIT License
@@ -81,15 +83,71 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+ALGESTEN/UREQ
+
+Project URL: https://github.com/algesten/ureq
+License: MIT OR Apache-2.0
+Distribution license choice: MIT. The upstream crate is dual-licensed under
+MIT OR Apache-2.0; this distribution uses the MIT license option.
+
+MIT License
+
+Copyright (c) 2019 Martin Algesten
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+RUST-NATIVE-TLS/RUST-NATIVE-TLS
+
+Project URL: https://github.com/rust-native-tls/rust-native-tls
+License: MIT OR Apache-2.0
+Distribution license choice: MIT. The upstream crate is dual-licensed under
+MIT OR Apache-2.0; this distribution uses the MIT license option.
+
+Copyright (c) 2016 The rust-native-tls Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 CODEZENO/CLAUDE-CODE-USAGE-MONITOR
 
 Project URL: https://github.com/CodeZeno/Claude-Code-Usage-Monitor
 License: MIT
 
-Codex Usage is a maintained derivative of CodeZeno/Claude-Code-Usage-Monitor.
-Thanks to Craig Constable and the upstream contributors for the original
-project. Changes in this repository are not affiliated with or endorsed by the
-upstream maintainers or OpenAI.
+Quota Usage retains source lineage from CodeZeno/Claude-Code-Usage-Monitor and
+upstream-ray/codex-usage-monitor. Thanks to Craig Constable and the upstream
+contributors for the original projects. Changes in this repository are not
+affiliated with or endorsed by the upstream maintainers or OpenAI.
 
 MIT License
 
@@ -112,3 +170,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+TECHNOLOGY ACKNOWLEDGMENTS
+
+MICROSOFT/WINDOWS-APP-SDK-WINUI-3
+
+Project URL: https://github.com/microsoft/microsoft-ui-xaml
+Source license: MIT
+
+WinUI 3 is used through the Windows App SDK. Its source repository is MIT-licensed.
+The shared Windows App Runtime is installed separately and is not bundled with
+this application.

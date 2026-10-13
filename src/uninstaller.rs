@@ -36,12 +36,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, PostQuitMessage, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
 };
 
-const PRIVATE_HELPER_ARG: &str = "--codex-usage-uninstall-helper";
-const HELPER_EXE_NAME: &str = "codex-usage-uninstall-helper.exe";
-const HELPER_DIR_PREFIX: &str = "CodexUsageUninstall-";
+const PRIVATE_HELPER_ARG: &str = "--quota-usage-uninstall-helper";
+const LEGACY_PRIVATE_HELPER_ARG: &str = "--codex-usage-uninstall-helper";
+const HELPER_EXE_NAME: &str = "quota-usage-uninstall-helper.exe";
+const LEGACY_HELPER_EXE_NAME: &str = "codex-usage-uninstall-helper.exe";
+const HELPER_DIR_PREFIX: &str = "QuotaUsageUninstall-";
+const LEGACY_HELPER_DIR_PREFIX: &str = "CodexUsageUninstall-";
 const MANIFEST_NAME: &str = "manifest.bin";
-const MANIFEST_MAGIC: &[u8] = b"CodexUsageUninstallV1\n";
-const UNINSTALL_EVENT: &str = "Local\\CodexUsageUninstallInProgress";
+const MANIFEST_MAGIC: &[u8] = b"QuotaUsageUninstallV1\n";
+const LEGACY_MANIFEST_MAGIC: &[u8] = b"CodexUsageUninstallV1\n";
+const UNINSTALL_EVENT: &str = "Local\\QuotaUsageUninstallInProgress";
+const LEGACY_UNINSTALL_EVENT: &str = "Local\\CodexUsageUninstallInProgress";
 const READY_TIMEOUT_MS: u32 = 10_000;
 const HELPER_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const HELPER_REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -73,7 +78,7 @@ enum CleanupTarget {
         name: &'static str,
         only_if_executable: Option<PathBuf>,
     },
-    UninstallRegistryTree,
+    UninstallRegistryTree { key: &'static str },
 }
 
 #[derive(Clone, Debug)]
@@ -83,12 +88,42 @@ struct CleanupPlan {
     targets: Vec<CleanupTarget>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ManagedInstallLayout {
+    directory: &'static str,
+    executable: &'static str,
+    uninstall_key: &'static str,
+    shortcut: &'static str,
+}
+
+const MANAGED_INSTALL_LAYOUTS: [ManagedInstallLayout; 3] = [
+    ManagedInstallLayout {
+        directory: "QuotaUsage",
+        executable: "quota-usage.exe",
+        uninstall_key: r"Software\Microsoft\Windows\CurrentVersion\Uninstall\QuotaUsage",
+        shortcut: "Quota Usage.lnk",
+    },
+    ManagedInstallLayout {
+        directory: "CodexUsage",
+        executable: "codex-usage.exe",
+        uninstall_key: r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexUsage",
+        shortcut: "Codex Usage.lnk",
+    },
+    ManagedInstallLayout {
+        directory: "ClaudeCodeUsageMonitor",
+        executable: "ClaudeCodeUsageMonitor.exe",
+        uninstall_key: r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ClaudeCodeUsageMonitor",
+        shortcut: "Claude Code Usage Monitor.lnk",
+    },
+];
+
 #[derive(Clone, Debug, Default)]
 struct CleanupPaths {
     managed_install_dir: Option<PathBuf>,
     start_menu_shortcut: Option<PathBuf>,
     desktop_shortcut: Option<PathBuf>,
-    settings_dir: Option<PathBuf>,
+    settings_dirs: Vec<PathBuf>,
+    uninstall_key: Option<&'static str>,
 }
 
 struct OwnedHandle(HANDLE);
@@ -167,12 +202,16 @@ fn create_named_event(name: &str, initially_signaled: bool) -> Result<OwnedHandl
     Ok(OwnedHandle(handle))
 }
 
-fn create_global_uninstall_gate() -> Result<OwnedHandle, String> {
-    let gate = create_named_event(UNINSTALL_EVENT, true)?;
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        return Err("Another Codex Usage uninstall is already in progress.".to_string());
+fn create_global_uninstall_gates() -> Result<Vec<OwnedHandle>, String> {
+    let mut gates = Vec::new();
+    for name in [UNINSTALL_EVENT, LEGACY_UNINSTALL_EVENT] {
+        let gate = create_named_event(name, true)?;
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            return Err("Another Quota Usage uninstall is already in progress.".to_string());
+        }
+        gates.push(gate);
     }
-    Ok(gate)
+    Ok(gates)
 }
 
 fn private_event_names(stage: &Path) -> Result<PrivateEventNames, String> {
@@ -193,8 +232,10 @@ fn private_event_names(stage: &Path) -> Result<PrivateEventNames, String> {
 }
 
 fn parse_stage_identity(basename: &str) -> Option<StageIdentity> {
+    let basename = basename
+        .strip_prefix(HELPER_DIR_PREFIX)
+        .or_else(|| basename.strip_prefix(LEGACY_HELPER_DIR_PREFIX))?;
     let components = basename
-        .strip_prefix(HELPER_DIR_PREFIX)?
         .split('-')
         .collect::<Vec<_>>();
     if components.len() != 3
@@ -218,6 +259,19 @@ fn parse_stage_identity(basename: &str) -> Option<StageIdentity> {
     u128::from_str_radix(components[1], 16).ok()?;
     u64::from_str_radix(components[2], 16).ok()?;
     Some(StageIdentity { parent_pid })
+}
+
+fn helper_executable_name_for_stage(basename: &str) -> Option<&'static str> {
+    if parse_stage_identity(basename).is_none() {
+        return None;
+    }
+    if basename.starts_with(HELPER_DIR_PREFIX) {
+        Some(HELPER_EXE_NAME)
+    } else if basename.starts_with(LEGACY_HELPER_DIR_PREFIX) {
+        Some(LEGACY_HELPER_EXE_NAME)
+    } else {
+        None
+    }
 }
 
 fn create_private_events(names: &PrivateEventNames) -> Result<PrivateEvents, String> {
@@ -251,6 +305,19 @@ fn open_private_event(
     unsafe { OpenEventW(access, false, PCWSTR::from_raw(name.as_ptr())) }
         .map(OwnedHandle)
         .map_err(|error| format!("Unable to open private uninstall event: {error}"))
+}
+
+fn open_global_uninstall_gates(stage: &Path) -> Result<Vec<OwnedHandle>, String> {
+    let basename = stage.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    let events: &[&str] = if basename.starts_with(LEGACY_HELPER_DIR_PREFIX) {
+        &[LEGACY_UNINSTALL_EVENT]
+    } else {
+        &[UNINSTALL_EVENT, LEGACY_UNINSTALL_EVENT]
+    };
+    events
+        .iter()
+        .map(|event| open_private_event(event, SYNCHRONIZATION_SYNCHRONIZE))
+        .collect()
 }
 
 fn open_private_events(names: &PrivateEventNames) -> Result<PrivateEvents, String> {
@@ -306,7 +373,7 @@ pub fn begin_uninstall(remove_settings: bool) -> Result<(), String> {
 
     // Signal the startup gate before any staging work so newly launched app
     // instances cannot race the helper's readiness handshake.
-    let _gate = create_global_uninstall_gate()?;
+    let _gates = create_global_uninstall_gates()?;
 
     cleanup_stale_staging()?;
     let executable = std::env::current_exe()
@@ -406,41 +473,48 @@ pub fn begin_uninstall(remove_settings: bool) -> Result<(), String> {
 
 /// Return whether the signaled startup gate currently blocks new app instances.
 pub fn is_uninstall_in_progress() -> Result<bool, String> {
-    let name = wide(UNINSTALL_EVENT);
-    let handle = match unsafe {
-        OpenEventW(
-            SYNCHRONIZATION_SYNCHRONIZE,
-            false,
-            PCWSTR::from_raw(name.as_ptr()),
-        )
-    } {
-        Ok(handle) => OwnedHandle(handle),
-        Err(error) if is_file_not_found_hresult(error.code().0 as u32) => return Ok(false),
-        Err(error) => return Err(format!("Unable to inspect uninstall startup gate: {error}")),
-    };
-    match classify_wait_result(unsafe { WaitForSingleObject(handle.0, 0) }) {
-        WaitState::Signaled => Ok(true),
-        WaitState::TimedOut => Ok(false),
-        WaitState::Failed => {
-            let error = unsafe { GetLastError() };
-            Err(format!(
-                "Unable to inspect uninstall startup gate: {}",
-                io::Error::from_raw_os_error(error.0 as i32)
-            ))
+    for event in [UNINSTALL_EVENT, LEGACY_UNINSTALL_EVENT] {
+        let name = wide(event);
+        let handle = match unsafe {
+            OpenEventW(
+                SYNCHRONIZATION_SYNCHRONIZE,
+                false,
+                PCWSTR::from_raw(name.as_ptr()),
+            )
+        } {
+            Ok(handle) => OwnedHandle(handle),
+            Err(error) if is_file_not_found_hresult(error.code().0 as u32) => continue,
+            Err(error) => {
+                return Err(format!("Unable to inspect uninstall startup gate: {error}"));
+            }
+        };
+        match classify_wait_result(unsafe { WaitForSingleObject(handle.0, 0) }) {
+            WaitState::Signaled => return Ok(true),
+            WaitState::TimedOut => {}
+            WaitState::Failed => {
+                let error = unsafe { GetLastError() };
+                return Err(format!(
+                    "Unable to inspect uninstall startup gate: {}",
+                    io::Error::from_raw_os_error(error.0 as i32)
+                ));
+            }
+            WaitState::Unexpected(result) => {
+                return Err(format!(
+                    "Unable to inspect uninstall startup gate (unexpected wait result {result:#x})."
+                ));
+            }
         }
-        WaitState::Unexpected(result) => Err(format!(
-            "Unable to inspect uninstall startup gate (unexpected wait result {result:#x})."
-        )),
     }
+    Ok(false)
 }
 
 /// Show a visible startup error before the application initializes its UI.
 pub fn show_startup_error(message: &str) {
-    show_message("Codex Usage startup error", message, MB_ICONERROR);
+    show_message("Quota Usage startup error", message, MB_ICONERROR);
 }
 
 pub fn show_startup_info(message: &str) {
-    show_message("Codex Usage", message, MB_ICONINFORMATION);
+    show_message("Quota Usage", message, MB_ICONINFORMATION);
 }
 
 fn abort_helper(
@@ -568,14 +642,17 @@ fn wait_for_helper_commit(
 
 /// Handle private helper mode before normal application startup.
 pub fn handle_cli_mode(args: &[OsString]) -> Option<i32> {
-    if args.get(1).map(OsString::as_os_str) != Some(OsStr::new(PRIVATE_HELPER_ARG)) {
+    let helper_arg = args.get(1).map(OsString::as_os_str)?;
+    if helper_arg != OsStr::new(PRIVATE_HELPER_ARG)
+        && helper_arg != OsStr::new(LEGACY_PRIVATE_HELPER_ARG)
+    {
         return None;
     }
 
     let result = run_helper_mode(args);
     match result {
         Ok(message) => {
-            show_message("Uninstall Codex Usage", &message, MB_ICONINFORMATION);
+            show_message("Uninstall Quota Usage", &message, MB_ICONINFORMATION);
             Some(0)
         }
         Err(error) => {
@@ -586,55 +663,66 @@ pub fn handle_cli_mode(args: &[OsString]) -> Option<i32> {
 }
 
 fn detect_kind_for_executable(executable: &Path) -> UninstallKind {
-    let managed_dir = env_path("LOCALAPPDATA").map(|path| path.join("Programs").join("CodexUsage"));
-    let winget_roots = winget_install_roots();
     let resolved_executable = canonical_or_normalized(executable);
     let resolved_executable = resolved_executable.as_deref().unwrap_or(executable);
-    let registry_evidence =
-        read_registry_string(UNINSTALL_KEY, "InstallLocation").and_then(|install| {
-            read_registry_string(UNINSTALL_KEY, "DisplayIcon").map(|icon| (install, icon))
-        });
-    let (registered_install, registered_icon) = match registry_evidence {
-        Ok(evidence) => evidence,
-        Err(_) => {
-            if winget_roots
-                .iter()
-                .any(|root| is_same_or_child_path(resolved_executable, root))
-            {
-                return UninstallKind::Winget;
-            }
-            return UninstallKind::Portable;
-        }
-    };
-    let registered_install = registered_install
-        .as_deref()
-        .map(Path::new)
-        .filter(|path| path.is_absolute())
-        .and_then(canonical_or_normalized);
-    let registered_icon = registered_icon
-        .as_deref()
-        .map(Path::new)
-        .filter(|path| path.is_absolute())
-        .and_then(canonical_or_normalized);
-    let managed_dir = managed_dir.as_deref().and_then(canonical_or_normalized);
-    let kind = classify_from_evidence(
-        resolved_executable,
-        managed_dir.as_deref(),
-        registered_install.as_deref(),
-        registered_icon.as_deref(),
-        &[],
-    );
-    if kind == UninstallKind::Managed {
-        return kind;
+    if registered_managed_layout(resolved_executable)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return UninstallKind::Managed;
     }
-    classify_from_evidence(resolved_executable, None, None, None, &winget_roots)
+    if winget_install_roots()
+        .iter()
+        .any(|root| is_same_or_child_path(resolved_executable, root))
+    {
+        UninstallKind::Winget
+    } else {
+        UninstallKind::Portable
+    }
+}
+
+fn registered_managed_layout(
+    executable: &Path,
+) -> Result<Option<ManagedInstallLayout>, String> {
+    let Some(local_app_data) = env_path("LOCALAPPDATA") else {
+        return Ok(None);
+    };
+    for layout in MANAGED_INSTALL_LAYOUTS {
+        let install_dir = local_app_data
+            .join("Programs")
+            .join(layout.directory);
+        let expected_exe = install_dir.join(layout.executable);
+        if !resolved_equal(executable, &expected_exe) {
+            continue;
+        }
+        let registered_install = read_registry_string(layout.uninstall_key, "InstallLocation")?;
+        let registered_icon = read_registry_string(layout.uninstall_key, "DisplayIcon")?;
+        if registered_install
+            .as_deref()
+            .is_some_and(|value| resolved_equal(Path::new(value), &install_dir))
+            && registered_icon
+                .as_deref()
+                .is_some_and(|value| resolved_equal(Path::new(value), &expected_exe))
+        {
+            return Ok(Some(layout));
+        }
+    }
+    Ok(None)
 }
 
 fn build_live_plan(executable: &Path, remove_settings: bool) -> Result<CleanupPlan, String> {
     let executable = canonical_or_normalized(executable)
         .ok_or_else(|| format!("Unable to resolve current executable path: {executable:?}"))?;
     let kind = detect_kind_for_executable(&executable);
-    let paths = live_cleanup_paths(kind, remove_settings)?;
+    let managed_layout = if kind == UninstallKind::Managed {
+        Some(registered_managed_layout(&executable)?.ok_or_else(|| {
+            format!("Refusing managed cleanup because ownership could not be verified for {executable:?}.")
+        })?)
+    } else {
+        None
+    };
+    let paths = live_cleanup_paths(kind, remove_settings, managed_layout)?;
     let mut targets = build_targets(kind, &executable, remove_settings, &paths)?;
     if kind != UninstallKind::Winget {
         // Companion cache only: preferences and the shared Windows runtime are separate.
@@ -643,17 +731,17 @@ fn build_live_plan(executable: &Path, remove_settings: bool) -> Result<CleanupPl
         targets.push(CleanupTarget::Directory(cache));
     }
 
-    if kind == UninstallKind::Managed {
-        let local_app_data = env_path("LOCALAPPDATA")
-            .ok_or_else(|| "LOCALAPPDATA is unavailable or not an absolute path.".to_string())?;
-        let install_dir = local_app_data.join("Programs").join("CodexUsage");
-        let expected_exe = install_dir.join("codex-usage.exe");
+    if let Some(layout) = managed_layout {
+        let install_dir = paths.managed_install_dir.as_ref().ok_or_else(|| {
+            "Managed install directory is missing from cleanup plan.".to_string()
+        })?;
+        let expected_exe = install_dir.join(layout.executable);
         if !resolved_equal(&executable, &expected_exe) {
             return Err(format!(
                 "Refusing managed cleanup because executable path changed: {executable:?}"
             ));
         }
-        verify_managed_registry_match(&install_dir, &expected_exe)?;
+        verify_managed_registry_match(install_dir, &expected_exe, layout.uninstall_key)?;
     }
 
     for target in &targets {
@@ -669,36 +757,55 @@ fn build_live_plan(executable: &Path, remove_settings: bool) -> Result<CleanupPl
     })
 }
 
-fn live_cleanup_paths(kind: UninstallKind, remove_settings: bool) -> Result<CleanupPaths, String> {
+fn live_cleanup_paths(
+    kind: UninstallKind,
+    remove_settings: bool,
+    managed_layout: Option<ManagedInstallLayout>,
+) -> Result<CleanupPaths, String> {
     let mut paths = CleanupPaths::default();
     if kind == UninstallKind::Managed {
+        let layout = managed_layout.ok_or_else(|| {
+            "Managed install layout is missing from cleanup plan.".to_string()
+        })?;
         let local_app_data = env_path("LOCALAPPDATA")
             .ok_or_else(|| "LOCALAPPDATA is unavailable or not an absolute path.".to_string())?;
         let app_data = env_path("APPDATA")
             .ok_or_else(|| "APPDATA is unavailable or not an absolute path.".to_string())?;
-        paths.managed_install_dir = Some(local_app_data.join("Programs").join("CodexUsage"));
+        paths.managed_install_dir = Some(
+            local_app_data
+                .join("Programs")
+                .join(layout.directory),
+        );
+        paths.uninstall_key = Some(layout.uninstall_key);
         paths.start_menu_shortcut = Some(
             app_data
                 .join("Microsoft")
                 .join("Windows")
                 .join("Start Menu")
                 .join("Programs")
-                .join("Codex Usage.lnk"),
+                .join(layout.shortcut),
         );
         paths.desktop_shortcut = Some(
             dirs::desktop_dir()
                 .ok_or_else(|| "Unable to resolve current user's Desktop directory.".to_string())?
-                .join("Codex Usage.lnk"),
+                .join(layout.shortcut),
         );
         if remove_settings {
-            paths.settings_dir = Some(app_data.join("CodexUsage"));
+            paths.settings_dirs = settings_directories(&app_data);
         }
     } else if kind == UninstallKind::Portable && remove_settings {
         let app_data = env_path("APPDATA")
             .ok_or_else(|| "APPDATA is unavailable or not an absolute path.".to_string())?;
-        paths.settings_dir = Some(app_data.join("CodexUsage"));
+        paths.settings_dirs = settings_directories(&app_data);
     }
     Ok(paths)
+}
+
+fn settings_directories(app_data: &Path) -> Vec<PathBuf> {
+    ["QuotaUsage", "CodexUsage", "ClaudeCodeUsageMonitor"]
+        .into_iter()
+        .map(|name| app_data.join(name))
+        .collect()
 }
 
 fn build_targets(
@@ -721,59 +828,50 @@ fn build_targets(
                 .desktop_shortcut
                 .as_ref()
                 .ok_or_else(|| "Desktop shortcut is missing from cleanup plan.".to_string())?;
-            targets.extend([
-                CleanupTarget::StartupValue {
-                    name: "CodexUsage",
-                    only_if_executable: None,
-                },
-                CleanupTarget::StartupValue {
-                    name: "ClaudeCodeUsageMonitor",
-                    only_if_executable: None,
-                },
-                CleanupTarget::File(start_menu.clone()),
-            ]);
+            targets.extend(startup_cleanup_targets(executable));
+            targets.push(CleanupTarget::File(start_menu.clone()));
             targets.push(CleanupTarget::File(desktop.clone()));
-            targets.push(CleanupTarget::UninstallRegistryTree);
+            let uninstall_key = paths.uninstall_key.ok_or_else(|| {
+                "Managed uninstall registry key is missing from cleanup plan.".to_string()
+            })?;
+            targets.push(CleanupTarget::UninstallRegistryTree { key: uninstall_key });
             if remove_settings {
-                targets.push(CleanupTarget::Directory(
+                targets.extend(
                     paths
-                        .settings_dir
-                        .as_ref()
-                        .ok_or_else(|| {
-                            "Settings directory is missing from cleanup plan.".to_string()
-                        })?
-                        .clone(),
-                ));
+                        .settings_dirs
+                        .iter()
+                        .cloned()
+                        .map(CleanupTarget::Directory),
+                );
             }
             targets.push(CleanupTarget::Directory(install_dir.clone()));
         }
         UninstallKind::Portable => {
             targets.push(CleanupTarget::File(executable.to_path_buf()));
-            targets.extend([
-                CleanupTarget::StartupValue {
-                    name: "CodexUsage",
-                    only_if_executable: Some(executable.to_path_buf()),
-                },
-                CleanupTarget::StartupValue {
-                    name: "ClaudeCodeUsageMonitor",
-                    only_if_executable: Some(executable.to_path_buf()),
-                },
-            ]);
+            targets.extend(startup_cleanup_targets(executable));
             if remove_settings {
-                targets.push(CleanupTarget::Directory(
+                targets.extend(
                     paths
-                        .settings_dir
-                        .as_ref()
-                        .ok_or_else(|| {
-                            "Settings directory is missing from cleanup plan.".to_string()
-                        })?
-                        .clone(),
-                ));
+                        .settings_dirs
+                        .iter()
+                        .cloned()
+                        .map(CleanupTarget::Directory),
+                );
             }
         }
         UninstallKind::Winget => {}
     }
     Ok(targets)
+}
+
+fn startup_cleanup_targets(executable: &Path) -> Vec<CleanupTarget> {
+    ["QuotaUsage", "CodexUsage", "ClaudeCodeUsageMonitor"]
+        .into_iter()
+        .map(|name| CleanupTarget::StartupValue {
+            name,
+            only_if_executable: Some(executable.to_path_buf()),
+        })
+        .collect()
 }
 
 fn classify_from_evidence(
@@ -786,11 +884,15 @@ fn classify_from_evidence(
     if let (Some(expected_dir), Some(registered_install), Some(registered_icon)) =
         (expected_managed_dir, registered_install, registered_icon)
     {
-        let expected_exe = expected_dir.join("codex-usage.exe");
-        if paths_equal(executable, &expected_exe)
+        let expected_exe = MANAGED_INSTALL_LAYOUTS
+            .iter()
+            .find(|layout| expected_dir.file_name() == Some(OsStr::new(layout.directory)))
+            .map(|layout| expected_dir.join(layout.executable));
+        if expected_exe.as_deref().is_some_and(|expected_exe| {
+            paths_equal(executable, expected_exe)
             && paths_equal(registered_install, expected_dir)
-            && paths_equal(registered_icon, &expected_exe)
-        {
+            && paths_equal(registered_icon, expected_exe)
+        }) {
             return UninstallKind::Managed;
         }
     }
@@ -808,7 +910,7 @@ impl CleanupTarget {
     fn path(&self) -> Option<&Path> {
         match self {
             Self::File(path) | Self::Directory(path) => Some(path),
-            Self::StartupValue { .. } | Self::UninstallRegistryTree => None,
+            Self::StartupValue { .. } | Self::UninstallRegistryTree { .. } => None,
         }
     }
 }
@@ -840,6 +942,15 @@ fn run_helper_mode(args: &[OsString]) -> Result<String, String> {
     let parent = OwnedHandle(parent);
 
     let stage = validate_helper_staging()?;
+    let legacy_protocol = args.get(1).map(OsString::as_os_str)
+        == Some(OsStr::new(LEGACY_PRIVATE_HELPER_ARG));
+    let legacy_stage = stage
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with(LEGACY_HELPER_DIR_PREFIX));
+    if legacy_protocol != legacy_stage {
+        return Err("Uninstall helper argument does not match its staging layout.".to_string());
+    }
     let stage_identity = stage
         .file_name()
         .and_then(OsStr::to_str)
@@ -865,8 +976,8 @@ fn run_helper_mode(args: &[OsString]) -> Result<String, String> {
         return Err(winget_refusal());
     }
 
-    let _gate = open_private_event(UNINSTALL_EVENT, SYNCHRONIZATION_SYNCHRONIZE)
-        .map_err(|error| format!("Unable to retain uninstall startup gate: {error}"))?;
+    let _gates = open_global_uninstall_gates(&stage)
+        .map_err(|error| format!("Unable to retain uninstall startup gates: {error}"))?;
     let private_names = private_event_names(&stage)?;
     let private_events = open_private_events(&private_names)?;
     unsafe { SetEvent(private_events.ready.0) }
@@ -877,7 +988,7 @@ fn run_helper_mode(args: &[OsString]) -> Result<String, String> {
     let failures = execute_plan(&plan);
     if failures.is_empty() {
         Ok(format!(
-            "Codex Usage uninstall completed. Temporary helper may remain at {:?}; future uninstall attempts clean at most {MAX_STALE_STAGES_PER_RUN} matching staging directories older than 24 hours.",
+            "Quota Usage uninstall completed. Temporary helper may remain at {:?}; future uninstall attempts clean at most {MAX_STALE_STAGES_PER_RUN} matching staging directories older than 24 hours.",
             stage
         ))
     } else {
@@ -898,8 +1009,8 @@ fn execute_plan(plan: &CleanupPlan) -> Vec<String> {
                 name,
                 only_if_executable,
             } => remove_startup_value(name, only_if_executable.as_deref()),
-            CleanupTarget::UninstallRegistryTree => {
-                remove_matching_uninstall_registry_tree(&plan.executable)
+            CleanupTarget::UninstallRegistryTree { key } => {
+                remove_matching_uninstall_registry_tree(&plan.executable, key)
             }
         };
         if let Err(error) = result {
@@ -1062,36 +1173,43 @@ fn remove_startup_value(name: &str, expected_executable: Option<&Path>) -> Resul
     }
 }
 
-fn remove_matching_uninstall_registry_tree(executable: &Path) -> Result<(), String> {
+fn remove_matching_uninstall_registry_tree(
+    executable: &Path,
+    uninstall_key: &str,
+) -> Result<(), String> {
     let install_dir = executable.parent().ok_or_else(|| {
         format!("Unable to determine managed install directory for {executable:?}")
     })?;
-    match open_registry_key_raw(UNINSTALL_KEY, KEY_QUERY_VALUE) {
+    match open_registry_key_raw(uninstall_key, KEY_QUERY_VALUE) {
         Ok(key) => drop(RegistryKey(key)),
         Err(error) if is_registry_not_found_code(error) => return Ok(()),
         Err(error) => {
             return Err(format!(
-                "Unable to inspect registry subtree HKCU\\{UNINSTALL_KEY}: {}",
+                "Unable to inspect registry subtree HKCU\\{uninstall_key}: {}",
                 registry_error(error)
             ));
         }
     }
-    verify_managed_registry_match(install_dir, executable)?;
-    let key = wide(UNINSTALL_KEY);
+    verify_managed_registry_match(install_dir, executable, uninstall_key)?;
+    let key = wide(uninstall_key);
     let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR::from_raw(key.as_ptr())) };
     if status.0 == 0 || is_registry_not_found_code(status) {
         Ok(())
     } else {
         Err(format!(
-            "Unable to remove registry subtree HKCU\\{UNINSTALL_KEY}: {}",
+            "Unable to remove registry subtree HKCU\\{uninstall_key}: {}",
             registry_error(status)
         ))
     }
 }
 
-fn verify_managed_registry_match(install_dir: &Path, executable: &Path) -> Result<(), String> {
-    let registered_install = read_registry_string(UNINSTALL_KEY, "InstallLocation")?;
-    let registered_icon = read_registry_string(UNINSTALL_KEY, "DisplayIcon")?;
+fn verify_managed_registry_match(
+    install_dir: &Path,
+    executable: &Path,
+    uninstall_key: &str,
+) -> Result<(), String> {
+    let registered_install = read_registry_string(uninstall_key, "InstallLocation")?;
+    let registered_icon = read_registry_string(uninstall_key, "DisplayIcon")?;
     if !registered_install
         .as_deref()
         .is_some_and(|value| resolved_equal(Path::new(value), install_dir))
@@ -1100,7 +1218,7 @@ fn verify_managed_registry_match(install_dir: &Path, executable: &Path) -> Resul
             .is_some_and(|value| resolved_equal(Path::new(value), executable))
     {
         return Err(format!(
-            "Refusing managed cleanup: HKCU\\{UNINSTALL_KEY} no longer matches install directory {install_dir:?} and executable {executable:?}."
+            "Refusing managed cleanup: HKCU\\{uninstall_key} no longer matches install directory {install_dir:?} and executable {executable:?}."
         ));
     }
     Ok(())
@@ -1267,7 +1385,6 @@ fn winget_install_roots() -> Vec<PathBuf> {
     roots
 }
 
-const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexUsage";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -1486,7 +1603,8 @@ fn remove_generated_stage(stage: &Path) -> Result<(), String> {
         || !stage
             .file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| name.starts_with(HELPER_DIR_PREFIX))
+            .and_then(helper_executable_name_for_stage)
+            .is_some()
     {
         return Err(format!(
             "Refusing to remove unexpected staging path {stage:?}."
@@ -1506,7 +1624,12 @@ fn remove_generated_stage(stage: &Path) -> Result<(), String> {
         let entry = entry
             .map_err(|error| format!("Unable to inspect staging directory {stage:?}: {error}"))?;
         let path = entry.path();
-        if entry.file_name() != OsStr::new(HELPER_EXE_NAME)
+        let helper_name = stage
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(helper_executable_name_for_stage)
+            .ok_or_else(|| format!("Refusing to remove unexpected staging path {stage:?}."))?;
+        if entry.file_name() != OsStr::new(helper_name)
             && entry.file_name() != OsStr::new(MANIFEST_NAME)
         {
             return Err(format!(
@@ -1565,11 +1688,15 @@ fn read_manifest(path: &Path) -> Result<HelperManifest, String> {
     File::open(path)
         .and_then(|mut file| file.read_to_end(&mut bytes))
         .map_err(|error| format!("Unable to read helper manifest {path:?}: {error}"))?;
-    let header_len = MANIFEST_MAGIC.len() + 8;
-    if bytes.get(..MANIFEST_MAGIC.len()) != Some(MANIFEST_MAGIC) || bytes.len() < header_len {
+    let magic = [MANIFEST_MAGIC, LEGACY_MANIFEST_MAGIC]
+        .into_iter()
+        .find(|magic| bytes.get(..magic.len()) == Some(*magic))
+        .ok_or_else(|| format!("Invalid helper manifest header at {path:?}."))?;
+    let header_len = magic.len() + 8;
+    if bytes.len() < header_len {
         return Err(format!("Invalid helper manifest header at {path:?}."));
     }
-    let pid_start = MANIFEST_MAGIC.len();
+    let pid_start = magic.len();
     let parent_pid = u32::from_le_bytes(bytes[pid_start..pid_start + 4].try_into().unwrap());
     let length_start = pid_start + 4;
     let unit_count =
@@ -1598,11 +1725,11 @@ fn validate_helper_staging() -> Result<PathBuf, String> {
     let stage = helper
         .parent()
         .ok_or_else(|| format!("Staged helper has no parent directory: {helper:?}"))?;
-    if helper.file_name() != Some(OsStr::new(HELPER_EXE_NAME))
-        || !stage
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| parse_stage_identity(name).is_some())
+    let helper_name = stage
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(helper_executable_name_for_stage);
+    if helper_name.is_none_or(|name| helper.file_name() != Some(OsStr::new(name)))
     {
         return Err(format!(
             "Refusing helper outside expected staging layout: {helper:?}"
@@ -1658,7 +1785,7 @@ fn cleanup_stale_staging() -> Result<(), String> {
         if !entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.starts_with(HELPER_DIR_PREFIX))
+            .is_some_and(|name| helper_executable_name_for_stage(name).is_some())
         {
             continue;
         }
@@ -1688,6 +1815,11 @@ fn cleanup_stale_staging() -> Result<(), String> {
 
 fn validate_stale_stage_contents(path: &Path) -> Result<(), String> {
     validate_destructive_path(path)?;
+    let helper_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(helper_executable_name_for_stage)
+        .ok_or_else(|| format!("Refusing unexpected helper staging path {path:?}."))?;
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1701,7 +1833,7 @@ fn validate_stale_stage_contents(path: &Path) -> Result<(), String> {
         let entry = entry
             .map_err(|error| format!("Unable to inspect stale helper staging {path:?}: {error}"))?;
         let name = entry.file_name();
-        if name != OsStr::new(HELPER_EXE_NAME) && name != OsStr::new(MANIFEST_NAME) {
+        if name != OsStr::new(helper_name) && name != OsStr::new(MANIFEST_NAME) {
             return Err(format!(
                 "Refusing stale helper staging with unexpected artifact {:?}.",
                 entry.path()
@@ -1751,13 +1883,16 @@ mod tests {
     fn paths() -> CleanupPaths {
         CleanupPaths {
             managed_install_dir: Some(PathBuf::from(
-                r"C:\Users\user\AppData\Local\Programs\CodexUsage",
+                r"C:\Users\user\AppData\Local\Programs\QuotaUsage",
             )),
             start_menu_shortcut: Some(PathBuf::from(
-                r"C:\Users\user\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Codex Usage.lnk",
+                r"C:\Users\user\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Quota Usage.lnk",
             )),
-            desktop_shortcut: Some(PathBuf::from(r"C:\Users\user\Desktop\Codex Usage.lnk")),
-            settings_dir: Some(PathBuf::from(r"C:\Users\user\AppData\Roaming\CodexUsage")),
+            desktop_shortcut: Some(PathBuf::from(r"C:\Users\user\Desktop\Quota Usage.lnk")),
+            settings_dirs: settings_directories(Path::new(
+                r"C:\Users\user\AppData\Roaming",
+            )),
+            uninstall_key: Some(MANAGED_INSTALL_LAYOUTS[0].uninstall_key),
         }
     }
 
@@ -1805,26 +1940,36 @@ mod tests {
 
     #[test]
     fn staged_event_identity_requires_the_exact_generated_basename_shape() {
-        let basename = "CodexUsageUninstall-42-00000000000000000000000000000001-0000000000000002";
+        let basename = "QuotaUsageUninstall-42-00000000000000000000000000000001-0000000000000002";
         assert_eq!(
             parse_stage_identity(basename),
             Some(StageIdentity { parent_pid: 42 })
         );
-        assert!(parse_stage_identity("CodexUsageUninstall-42-short-0000000000000002").is_none());
+        let legacy_basename = "CodexUsageUninstall-42-00000000000000000000000000000001-0000000000000002";
+        assert_eq!(
+            parse_stage_identity(legacy_basename),
+            Some(StageIdentity { parent_pid: 42 })
+        );
+        assert_eq!(
+            helper_executable_name_for_stage(legacy_basename),
+            Some(LEGACY_HELPER_EXE_NAME)
+        );
+        assert_eq!(helper_executable_name_for_stage(basename), Some(HELPER_EXE_NAME));
+        assert!(parse_stage_identity("QuotaUsageUninstall-42-short-0000000000000002").is_none());
         assert!(parse_stage_identity(
-            "CodexUsageUninstall-0-00000000000000000000000000000001-0000000000000002"
+            "QuotaUsageUninstall-0-00000000000000000000000000000001-0000000000000002"
         )
         .is_none());
         assert!(parse_stage_identity(
-            "CodexUsageUninstall-42-00000000000000000000000000000001-0000000000000002-extra"
+            "QuotaUsageUninstall-42-00000000000000000000000000000001-0000000000000002-extra"
         )
         .is_none());
         assert!(parse_stage_identity(
-            "CodexUsageUninstall-042-00000000000000000000000000000001-0000000000000002"
+            "QuotaUsageUninstall-042-00000000000000000000000000000001-0000000000000002"
         )
         .is_none());
         assert!(parse_stage_identity(
-            "CodexUsageUninstall-42-0000000000000000000000000000000A-0000000000000002"
+            "QuotaUsageUninstall-42-0000000000000000000000000000000A-0000000000000002"
         )
         .is_none());
 
@@ -1835,7 +1980,11 @@ mod tests {
     }
 
     fn registry_matches(executable: &Path, expected_dir: &Path) -> bool {
-        let expected_exe = expected_dir.join("codex-usage.exe");
+        let expected_exe = MANAGED_INSTALL_LAYOUTS
+            .iter()
+            .find(|layout| expected_dir.file_name() == Some(OsStr::new(layout.directory)))
+            .map(|layout| expected_dir.join(layout.executable))
+            .unwrap();
         classify_from_evidence(
             executable,
             Some(expected_dir),
@@ -1847,6 +1996,11 @@ mod tests {
 
     #[test]
     fn managed_classification_requires_exact_executable_and_both_registry_paths() {
+        let new_install = Path::new(r"C:\Users\user\AppData\Local\Programs\QuotaUsage");
+        let new_exe = new_install.join("quota-usage.exe");
+        assert!(registry_matches(&new_exe, new_install));
+        assert!(!registry_matches(&new_install.join("other.exe"), new_install));
+
         let install = Path::new(r"C:\Users\user\AppData\Local\Programs\CodexUsage");
         let exe = install.join("codex-usage.exe");
         assert!(registry_matches(&exe, install));
@@ -1895,39 +2049,43 @@ mod tests {
     #[test]
     fn managed_and_portable_cleanup_plans_have_narrow_scope() {
         let executable =
-            Path::new(r"C:\Users\user\AppData\Local\Programs\CodexUsage\codex-usage.exe");
+            Path::new(r"C:\Users\user\AppData\Local\Programs\QuotaUsage\quota-usage.exe");
         let cleanup_paths = paths();
         let managed =
             build_targets(UninstallKind::Managed, executable, false, &cleanup_paths).unwrap();
         assert!(managed.contains(&CleanupTarget::Directory(PathBuf::from(
-            r"C:\Users\user\AppData\Local\Programs\CodexUsage"
+            r"C:\Users\user\AppData\Local\Programs\QuotaUsage"
         ))));
-        assert!(managed.contains(&CleanupTarget::UninstallRegistryTree));
+        assert!(managed.contains(&CleanupTarget::UninstallRegistryTree {
+            key: MANAGED_INSTALL_LAYOUTS[0].uninstall_key
+        }));
         assert!(!managed.contains(&CleanupTarget::Directory(PathBuf::from(
-            r"C:\Users\user\AppData\Roaming\CodexUsage"
+            r"C:\Users\user\AppData\Roaming\QuotaUsage"
         ))));
 
-        let portable_exe = Path::new(r"D:\Portable\codex-usage.exe");
+        let portable_exe = Path::new(r"D:\Portable\quota-usage.exe");
         let portable =
             build_targets(UninstallKind::Portable, portable_exe, false, &cleanup_paths).unwrap();
         assert!(portable.contains(&CleanupTarget::File(portable_exe.to_path_buf())));
         assert!(!portable
             .iter()
             .any(|target| matches!(target, CleanupTarget::Directory(_))));
-        assert!(!portable.contains(&CleanupTarget::UninstallRegistryTree));
+        assert!(!portable
+            .iter()
+            .any(|target| matches!(target, CleanupTarget::UninstallRegistryTree { .. })));
         assert!(portable.contains(&CleanupTarget::StartupValue {
-            name: "CodexUsage",
+            name: "QuotaUsage",
             only_if_executable: Some(portable_exe.to_path_buf()),
         }));
     }
 
     #[test]
     fn settings_target_is_opt_in_and_winget_plan_is_empty() {
-        let exe = Path::new(r"D:\Portable\codex-usage.exe");
+        let exe = Path::new(r"D:\Portable\quota-usage.exe");
         let cleanup_paths = paths();
         let portable = build_targets(UninstallKind::Portable, exe, true, &cleanup_paths).unwrap();
         assert!(portable.contains(&CleanupTarget::Directory(PathBuf::from(
-            r"C:\Users\user\AppData\Roaming\CodexUsage"
+            r"C:\Users\user\AppData\Roaming\QuotaUsage"
         ))));
         assert!(
             build_targets(UninstallKind::Winget, exe, true, &cleanup_paths)
@@ -1954,17 +2112,17 @@ mod tests {
 
     #[test]
     fn portable_startup_cleanup_requires_an_exact_executable_reference() {
-        let executable = Path::new(r"C:\Users\user\Portable Apps\codex-usage.exe");
+        let executable = Path::new(r"C:\Users\user\Portable Apps\quota-usage.exe");
         assert!(startup_value_references(
-            OsStr::new(r#""C:\Users\user\Portable Apps\codex-usage.exe""#),
+            OsStr::new(r#""C:\Users\user\Portable Apps\quota-usage.exe""#),
             executable
         ));
         assert!(!startup_value_references(
-            OsStr::new(r#""C:\Users\user\Portable Apps\codex-usage.exe" --background"#),
+            OsStr::new(r#""C:\Users\user\Portable Apps\quota-usage.exe" --background"#),
             executable
         ));
         assert!(!startup_value_references(
-            OsStr::new(r"C:\Users\user\Portable Apps\codex-usage-old.exe"),
+            OsStr::new(r"C:\Users\user\Portable Apps\quota-usage-old.exe"),
             executable
         ));
     }

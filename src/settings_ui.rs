@@ -47,10 +47,10 @@
 //! alert_threshold_percent (0|10|20|30); palette
 //! (system|high_contrast_dark|high_contrast_light), bar_style
 //! (continuous|segmented), bar_thickness (standard|slim), font_size
-//! (standard|large), provider_spacing (none|small|normal|large; default small),
+//! (standard|large), provider_spacing (none|small|normal|large; default normal),
 //! provider_order (array of all seven unique IDs claude/codex/antigravity/opencode/
 //! cursor/grok/copilot), provider_icon_position (top|center|bottom; default top),
-//! provider_monochrome (boolean; default false; uses the palette percentage text
+//! provider_monochrome (boolean; default true; uses the palette percentage text
 //! color for logos while usage_text_color is null),
 //! claude_accent/codex_accent/antigravity_accent/
 //! opencode_accent/cursor_accent/grok_accent/copilot_accent (null or
@@ -62,18 +62,37 @@
 //! Actions: refresh, update, uninstall, repository, exit, recommended,
 //! reset_appearance, reset_colors, reset_position. URLs/paths/commands cannot
 //! be supplied. Update/uninstall retain the widget's confirmation flows.
+//! Debug-only development operations (release builds reject them with
+//! error_code="development_disabled"):
+//! {"op":"development_override","provider":"codex","enabled":true,
+//! "force_available":true,"session_percent":35,"weekly_percent":72}, where
+//! provider is one of claude/codex/antigravity/opencode/cursor/grok/copilot;
+//! enabled gates the override, force_available simulates local availability,
+//! and each percentage is optional, null, or 0..=100. Omitted/null clears that
+//! quota override so its live value is shown; omitted values do not retain the
+//! previous override. The request replaces the selected provider's full override.
+//! {"op":"development_reset"} clears every provider override. These operations
+//! are transient and never change persisted settings.
 //!
 //! State schema: {"settings": {all set keys above with their effective values},
 //! "effective_language":string,"claude_code_available":bool,"codex_available":bool,
 //! "antigravity_available":bool,"opencode_available":bool,"cursor_available":bool,
 //! "grok_available":bool,"copilot_available":bool (all availability fields
-//! report local credential presence only),
+//! reflect effective availability, including enabled debug overrides),
+//! "credential_availability":{all seven availability fields with actual local
+//! credential presence},
 //! "monitors":[{"device":string,"primary":bool}],"version":string,
 //! "update_status":string,"install_channel":"portable"|"winget"}.
 //! `settings.monitor_device` may be null before explicit selection.
 //! Supported languages are supplied as `languages:[{code:string,name:string}]`.
 //! Additional state: `effective_appearance:{dark:bool,claude_accent:[u8,u8,u8],
 //! codex_accent:[u8,u8,u8]}`, `update_busy:bool`, and `update_available:bool`.
+//! Development state also includes `development_enabled:bool` and
+//! `development_overrides:{claude,codex,antigravity,opencode,cursor,grok,copilot}`;
+//! each entry has `enabled`, `force_available`, `session_percent`, and
+//! `weekly_percent`. The availability fields reflect effective development
+//! availability; `credential_availability` retains the actual local credential
+//! presence. Release builds report `development_enabled:false` and inactive entries.
 //! Malformed JSON, invalid framing/version/operation/key or unexpected fields
 //! close the connection; valid requests with invalid values return ok=false.
 //! The child is assigned to a kill-on-close job, including abrupt parent exits.
@@ -116,6 +135,43 @@ pub enum Operation {
     Preview { changes: Vec<Change> },
     Persist,
     Action { action: Action },
+    DevelopmentOverride {
+        provider: DevelopmentProvider,
+        enabled: bool,
+        force_available: bool,
+        #[serde(default)]
+        session_percent: Option<f64>,
+        #[serde(default)]
+        weekly_percent: Option<f64>,
+    },
+    DevelopmentReset,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DevelopmentProvider {
+    Claude,
+    Codex,
+    Antigravity,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    Cursor,
+    Grok,
+    Copilot,
+}
+
+impl DevelopmentProvider {
+    pub fn index(self) -> usize {
+        match self {
+            Self::Claude => 0,
+            Self::Codex => 1,
+            Self::Antigravity => 2,
+            Self::OpenCode => 3,
+            Self::Cursor => 4,
+            Self::Grok => 5,
+            Self::Copilot => 6,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,7 +374,7 @@ fn open_in_session(
         return Err(format!("SettingsUI.exe is missing from {}. Build and publish the native companion using settings-ui/BUILDING.md, or reinstall the complete application payload. Windows App Runtime 1.8 x64 is required; it is not installed automatically.", directory.display()));
     }
     let name = format!(
-        r"\\.\pipe\CodexUsage.Settings.{}.{}",
+        r"\\.\pipe\QuotaUsage.Settings.{}.{}",
         std::process::id(),
         REVISION.fetch_add(1, Ordering::Relaxed)
     );
@@ -508,6 +564,21 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
             id: u32,
             action: Action,
         },
+        DevelopmentOverride {
+            v: u32,
+            id: u32,
+            provider: DevelopmentProvider,
+            enabled: bool,
+            force_available: bool,
+            #[serde(default)]
+            session_percent: Option<f64>,
+            #[serde(default)]
+            weekly_percent: Option<f64>,
+        },
+        DevelopmentReset {
+            v: u32,
+            id: u32,
+        },
     }
     let wire: WireRequest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     let request = match wire {
@@ -562,6 +633,30 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
             v,
             id,
             operation: Operation::Action { action },
+        },
+        WireRequest::DevelopmentOverride {
+            v,
+            id,
+            provider,
+            enabled,
+            force_available,
+            session_percent,
+            weekly_percent,
+        } => Request {
+            v,
+            id,
+            operation: Operation::DevelopmentOverride {
+                provider,
+                enabled,
+                force_available,
+                session_percent,
+                weekly_percent,
+            },
+        },
+        WireRequest::DevelopmentReset { v, id } => Request {
+            v,
+            id,
+            operation: Operation::DevelopmentReset,
         },
     };
     if request.v != 1 {
@@ -1095,7 +1190,7 @@ mod tests {
     #[test]
     fn private_pipe_accepts_current_user_and_reports_client_pid() {
         use std::io::Write;
-        let name = format!(r"\\.\pipe\CodexUsage.Settings.Test.{}", std::process::id());
+        let name = format!(r"\\.\pipe\QuotaUsage.Settings.Test.{}", std::process::id());
         let pipe = create_pipe(&name).unwrap();
         // SAFETY: the server handle is valid and uses nonblocking mode.
         unsafe {
@@ -1141,7 +1236,9 @@ mod tests {
     #[test]
     fn ipc_child_fixture() {
         use std::io::{Read, Write};
-        let Some(name) = std::env::var_os("CODEX_SETTINGS_TEST_PIPE") else {
+        let Some(name) = std::env::var_os("QUOTA_USAGE_SETTINGS_TEST_PIPE")
+            .or_else(|| std::env::var_os("CODEX_SETTINGS_TEST_PIPE"))
+        else {
             return;
         };
         let mut pipe = std::fs::OpenOptions::new()
@@ -1171,7 +1268,7 @@ mod tests {
     #[test]
     fn authenticated_child_round_trips_through_bounded_queue() {
         let name = format!(
-            r"\\.\pipe\CodexUsage.Settings.RoundTrip.{}",
+            r"\\.\pipe\QuotaUsage.Settings.RoundTrip.{}",
             std::process::id()
         );
         let pipe = create_pipe(&name).unwrap();
@@ -1182,7 +1279,7 @@ mod tests {
                 "settings_ui::tests::ipc_child_fixture",
                 "--nocapture",
             ])
-            .env("CODEX_SETTINGS_TEST_PIPE", &name)
+            .env("QUOTA_USAGE_SETTINGS_TEST_PIPE", &name)
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();

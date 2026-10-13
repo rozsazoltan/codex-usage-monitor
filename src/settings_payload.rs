@@ -159,7 +159,7 @@ pub fn cache_root() -> io::Result<PathBuf> {
     if !local.is_absolute() {
         return Err(invalid("Local application data path must be absolute"));
     }
-    Ok(local.join("CodexUsage").join("SettingsPayloads"))
+    Ok(local.join("QuotaUsage").join("SettingsPayloads"))
 }
 
 fn regular_metadata(metadata: &fs::Metadata, directory: bool) -> io::Result<()> {
@@ -371,7 +371,7 @@ pub fn prepare() -> Result<Option<PreparedPayload>, String> {
         return Ok(None);
     }
     cache_root().and_then(|root| extract(&root, MANIFEST, PAYLOAD)).map(Some)
-        .map_err(|e| format!("Cannot prepare native settings: {e}. The cache is under LocalAppData\\CodexUsage\\SettingsPayloads. Settings also require Windows App Runtime 1.8 x64; install it from Microsoft's Windows App SDK downloads page. It is never installed automatically."))
+        .map_err(|e| format!("Cannot prepare native settings: {e}. The cache is under LocalAppData\\QuotaUsage\\SettingsPayloads. Settings also require Windows App Runtime 1.8 x64; install it from Microsoft's Windows App SDK downloads page. It is never installed automatically."))
 }
 
 fn development_payload_allowed(
@@ -476,7 +476,7 @@ mod tests {
             return;
         }
         let root = std::env::temp_dir().join(format!(
-            "codex-payload-test-{}-{}",
+            "quota-payload-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -511,10 +511,10 @@ mod tests {
     fn private_cache_is_not_preferences_or_shared_runtime() {
         let local = dirs::data_local_dir().unwrap();
         let cache = cache_root().unwrap();
-        assert_eq!(cache, local.join("CodexUsage").join("SettingsPayloads"));
+        assert_eq!(cache, local.join("QuotaUsage").join("SettingsPayloads"));
         assert_ne!(cache, local);
         if let Some(roaming) = dirs::data_dir() {
-            assert_ne!(cache, roaming.join("CodexUsage"));
+            assert_ne!(cache, roaming.join("QuotaUsage"));
         }
     }
 
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn junction_ancestors_are_rejected_without_touching_the_target() {
         let root = std::env::temp_dir().join(format!(
-            "codex-payload-junction-test-{}",
+            "quota-payload-junction-test-{}",
             std::process::id()
         ));
         fs::create_dir(&root).unwrap();

@@ -8,10 +8,10 @@ fn main() {
     let mut res = WindowsResource::new();
     let numeric_version = pack_version(version);
 
-    res.set_icon("src/icons/redesign/codex-usage-meter.ico")
+    res.set_icon("src/icons/redesign/quota-usage-monitor.ico")
         .set("CompanyName", "datarose.net")
-        .set("ProductName", "Codex Usage Monitor")
-        .set("FileDescription", "Codex Usage Monitor")
+        .set("ProductName", "Quota Usage Monitor")
+        .set("FileDescription", "Lightweight, portable, easy-to-use, customizable, open-source usage monitor for Claude, Codex, and many other providers")
         .set("FileVersion", version)
         .set("ProductVersion", version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)
@@ -22,13 +22,18 @@ fn main() {
 
 fn embed_settings_payload() {
     use std::{env, fs, path::PathBuf};
+    println!("cargo:rerun-if-env-changed=QUOTA_SETTINGS_PAYLOAD");
+    println!("cargo:rerun-if-env-changed=QUOTA_SETTINGS_MSBUILD");
+    println!("cargo:rerun-if-env-changed=QUOTA_SETTINGS_SKIP_NATIVE_BUILD");
     println!("cargo:rerun-if-env-changed=CODEX_SETTINGS_PAYLOAD");
     println!("cargo:rerun-if-env-changed=CODEX_SETTINGS_MSBUILD");
     println!("cargo:rerun-if-env-changed=CODEX_SETTINGS_SKIP_NATIVE_BUILD");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/icons/redesign/codex-usage-meter.ico");
+    println!("cargo:rerun-if-changed=src/icons/redesign/quota-usage-monitor.ico");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    if let Some(directory) = env::var_os("CODEX_SETTINGS_PAYLOAD") {
+    let payload = env::var_os("QUOTA_SETTINGS_PAYLOAD")
+        .or_else(|| env::var_os("CODEX_SETTINGS_PAYLOAD"));
+    if let Some(directory) = payload {
         assert_eq!(
             env::var("CARGO_CFG_TARGET_ARCH").unwrap(),
             "x86_64",
@@ -43,11 +48,13 @@ fn embed_settings_payload() {
             assert!(!bytes.is_empty(), "Empty settings payload");
             fs::write(out.join(name), bytes).unwrap();
         }
-    } else if env::var_os("CODEX_SETTINGS_SKIP_NATIVE_BUILD").as_deref()
+    } else if env::var_os("QUOTA_SETTINGS_SKIP_NATIVE_BUILD")
+        .or_else(|| env::var_os("CODEX_SETTINGS_SKIP_NATIVE_BUILD"))
+        .as_deref()
         == Some(std::ffi::OsStr::new("1"))
     {
         assert_ne!(env::var("PROFILE").unwrap(), "release", "Release builds require the native settings payload. Run scripts/build-release.ps1 (no restore is performed by build.rs).");
-        println!("cargo:warning=Native Settings build explicitly disabled; debug Settings may use the unverified settings-ui/bin/portable fallback. Remove CODEX_SETTINGS_SKIP_NATIVE_BUILD to build current sources.");
+        println!("cargo:warning=Native Settings build explicitly disabled; debug Settings may use the unverified settings-ui/bin/portable fallback. Remove QUOTA_SETTINGS_SKIP_NATIVE_BUILD to build current sources.");
         fs::write(out.join("manifest.json"), []).unwrap();
         fs::write(out.join("payload.bin"), []).unwrap();
     } else {
@@ -75,8 +82,8 @@ fn embed_settings_payload() {
             .args(["-NoProfile", "-NonInteractive", "-File", "scripts/build-settings-dev.ps1", "-OutputDirectory"])
             .arg(&out)
             .status()
-            .expect("Cannot start PowerShell 7.2+. Install pwsh and the native build prerequisites in settings-ui/BUILDING.md, or explicitly set CODEX_SETTINGS_SKIP_NATIVE_BUILD=1 for Rust-only work.");
-        assert!(status.success(), "Native Settings build failed; refusing to embed stale UI. See the MSBuild error above and settings-ui/BUILDING.md. Set CODEX_SETTINGS_MSBUILD to the full VS 2022 MSBuild.exe path if discovery fails. CODEX_SETTINGS_SKIP_NATIVE_BUILD=1 explicitly opts out for Rust-only work.");
+            .expect("Cannot start PowerShell 7.2+. Install pwsh and the native build prerequisites in settings-ui/BUILDING.md, or explicitly set QUOTA_SETTINGS_SKIP_NATIVE_BUILD=1 for Rust-only work.");
+        assert!(status.success(), "Native Settings build failed; refusing to embed stale UI. See the MSBuild error above and settings-ui/BUILDING.md. Set QUOTA_SETTINGS_MSBUILD to the full VS 2022 MSBuild.exe path if discovery fails. QUOTA_SETTINGS_SKIP_NATIVE_BUILD=1 explicitly opts out for Rust-only work.");
         for name in ["manifest.json", "payload.bin"] {
             assert!(
                 fs::metadata(out.join(name)).is_ok_and(|file| file.len() > 0),

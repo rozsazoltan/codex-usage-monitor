@@ -132,7 +132,20 @@ pub fn draw(
             );
         }
     } else {
-        text(hdc, percentage, rect, DT_RIGHT);
+        // Connection failures use a single-character status marker. Center it
+        // in the percentage column instead of pinning it to the provider's
+        // trailing edge, where it can visually touch the next provider logo
+        // when the inter-provider gap is set to None.
+        text(
+            hdc,
+            percentage,
+            rect,
+            if percentage == "!" {
+                DT_CENTER
+            } else {
+                DT_RIGHT
+            },
+        );
     }
     if reset.is_empty() || !show_reset_time {
         return;

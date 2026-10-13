@@ -1,18 +1,18 @@
 [package]
-name = "codex-usage"
-version = "1.10.0"
+name = "quota-usage"
+version = "2026.10.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Codex Usage"
-homepage = "https://github.com/rozsazoltan/codex-usage-monitor"
-repository = "https://github.com/rozsazoltan/codex-usage-monitor"
+description = "Lightweight, portable, easy-to-use, customizable, open-source usage monitor for Claude, Codex, and many other providers"
+homepage = "https://github.com/rozsazoltan/quota-usage-monitor"
+repository = "https://github.com/rozsazoltan/quota-usage-monitor"
 
 [package.metadata.winres]
-CompanyName = "Rózsa Zoltán"
-ProductName = "Codex Usage"
-FileDescription = "Lightweight Codex usage monitor for Windows"
-OriginalFilename = "codex-usage.exe"
-InternalName = "CodexUsage"
+CompanyName = "datarose.net"
+ProductName = "Quota Usage Monitor"
+FileDescription = "Lightweight, portable, easy-to-use, customizable, open-source usage monitor for Claude, Codex, and many other providers"
+OriginalFilename = "quota-usage.exe"
+InternalName = "QuotaUsage"
 Comments = "Licensed under the GNU Affero General Public License v3 or later"
 LegalCopyright = "Original copyright (C) 2026 Code Zeno Pty Ltd; modifications (C) 2026 Ray; further modifications (C) 2026 Rózsa Zoltán"
 

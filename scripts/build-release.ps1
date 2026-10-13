@@ -1,5 +1,5 @@
 #requires -Version 7.2
-param([string]$MSBuild)
+param([string]$MSBuild = $(if ($env:QUOTA_SETTINGS_MSBUILD) { $env:QUOTA_SETTINGS_MSBUILD } else { $env:CODEX_SETTINGS_MSBUILD }))
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $MSBuild) {
@@ -9,7 +9,7 @@ if (-not $MSBuild) {
 }
 if (-not $MSBuild -or -not (Test-Path $MSBuild)) { throw 'Full Visual Studio 2022 MSBuild is required; dotnet build is not supported.' }
 Push-Location "$PSScriptRoot/.."
-$previous = $env:CODEX_SETTINGS_PAYLOAD
+$previousQuotaPayload = $env:QUOTA_SETTINGS_PAYLOAD
 $portableBuildDirectory = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../target/settings-portable-build'))
 try {
     & $MSBuild settings-ui/SettingsUI.vcxproj /restore /t:Rebuild /p:Configuration=Release /p:Platform=x64 /m /v:minimal
@@ -17,12 +17,12 @@ try {
     & $MSBuild settings-ui/SettingsUI.vcxproj /t:PublishPortable /p:Configuration=Release /p:Platform=x64 "/p:PortableOutputDir=$portableBuildDirectory" /m /v:minimal
     if ($LASTEXITCODE) { throw "Native publish failed: $LASTEXITCODE" }
     & "$PSScriptRoot/package-settings.ps1" -InputDirectory $portableBuildDirectory
-    $env:CODEX_SETTINGS_PAYLOAD = (Resolve-Path target/settings-payload).Path
+    $env:QUOTA_SETTINGS_PAYLOAD = (Resolve-Path target/settings-payload).Path
     cargo test --locked settings_payload::tests
     if ($LASTEXITCODE) { throw "Payload validation failed: $LASTEXITCODE" }
     cargo build --locked --release
     if ($LASTEXITCODE) { throw "Rust release build failed: $LASTEXITCODE" }
 } finally {
-    $env:CODEX_SETTINGS_PAYLOAD = $previous
+    $env:QUOTA_SETTINGS_PAYLOAD = $previousQuotaPayload
     Pop-Location
 }

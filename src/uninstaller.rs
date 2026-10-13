@@ -874,6 +874,7 @@ fn startup_cleanup_targets(executable: &Path) -> Vec<CleanupTarget> {
         .collect()
 }
 
+#[cfg(test)]
 fn classify_from_evidence(
     executable: &Path,
     expected_managed_dir: Option<&Path>,
@@ -1407,6 +1408,7 @@ fn resolved_equal(left: &Path, right: &Path) -> bool {
         .is_some_and(|(a, b)| ordinal_case_insensitive_equal(&a, &b))
 }
 
+#[cfg(test)]
 fn paths_equal(left: &Path, right: &Path) -> bool {
     path_key(left)
         .zip(path_key(right))

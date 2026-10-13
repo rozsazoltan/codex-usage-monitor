@@ -28,7 +28,7 @@ $intermediate = (Join-Path $native 'obj') + '\'
 $binaries = (Join-Path $native 'bin') + '\'
 Push-Location "$PSScriptRoot/.."
 try {
-    & $MSBuild settings-ui/SettingsUI.vcxproj /restore '/t:Rebuild;PublishPortable' /p:Configuration=Release /p:Platform=x64 /m:1 /v:minimal "/p:BaseIntermediateOutputPath=$intermediate" "/p:IntDir=$intermediate" "/p:OutDir=$binaries" "/p:PortableOutputDir=$portable"
+    & $MSBuild settings-ui/SettingsUI.vcxproj /restore '/t:Rebuild;PublishPortable' /p:Configuration=Release /p:QuotaDevelopmentUI=true /p:Platform=x64 /m:1 /v:minimal "/p:BaseIntermediateOutputPath=$intermediate" "/p:IntDir=$intermediate" "/p:OutDir=$binaries" "/p:PortableOutputDir=$portable"
     if ($LASTEXITCODE) { throw "Native Settings build/publish failed: $LASTEXITCODE. Fix the native prerequisites/errors; no stale payload will be embedded. See settings-ui/BUILDING.md." }
     & "$PSScriptRoot/package-settings.ps1" -InputDirectory $portable -OutputDirectory $output
 } finally {

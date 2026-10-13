@@ -249,6 +249,20 @@ namespace winrt::SettingsUI::implementation
         NavigationUpdate().InfoBadge(updateIndicator_);
         NavigationUpdate().Visibility(Visibility::Collapsed);
         auto weak = get_weak();
+#if QUOTA_DEVELOPMENT_UI
+        auto developmentShortcut = Input::KeyboardAccelerator();
+        developmentShortcut.Key(Windows::System::VirtualKey::F12);
+        developmentShortcut.Invoked([weak](auto const&, auto const& args)
+        {
+            if (auto self = weak.get(); self && !self->closed_ && self->state_ &&
+                self->state_.GetNamedBoolean(L"development_enabled", false))
+            {
+                self->OpenDevelopment();
+                args.Handled(true);
+            }
+        });
+        Navigation().KeyboardAccelerators().Append(developmentShortcut);
+#endif
         previewTimer_ = dispatcher_.CreateTimer();
         previewTimer_.Interval(std::chrono::milliseconds(180));
         previewTimer_.IsRepeating(false);
@@ -357,7 +371,11 @@ namespace winrt::SettingsUI::implementation
             if (args) LocalFree(args);
         }
         const auto requestedPage = page_;
+        page_ = L"";
         Navigation().SelectedItem(Navigation().MenuItems().GetAt(0));
+#if QUOTA_DEVELOPMENT_UI
+        if (requestedPage == L"Development") OpenDevelopment();
+#endif
         for (auto const& item : Navigation().MenuItems()) if (item.try_as<NavigationViewItem>() && std::wstring(unbox_value<hstring>(item.as<NavigationViewItem>().Tag()).c_str()) == requestedPage) Navigation().SelectedItem(item);
         for (auto const& item : Navigation().FooterMenuItems()) if (item.try_as<NavigationViewItem>() && std::wstring(unbox_value<hstring>(item.as<NavigationViewItem>().Tag()).c_str()) == requestedPage) Navigation().SelectedItem(item);
         if (pipeName_.empty()) ShowMessage(L"Settings could not connect to the widget. Open this window from the Quota Usage widget.", true);
@@ -741,6 +759,10 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::ContinueDeferredWork()
     {
+#if QUOTA_DEVELOPMENT_UI
+        SendNextDevelopmentRequest();
+        if (developmentRequestInFlight_) return;
+#endif
         const bool canStartDeferredAction = deferredAction_ && !HasPendingChanges() && inFlight_ == 0 &&
             !mutationInFlight_ && !persistInFlight_ &&
             (!persistNeeded_ || (closeRequested_ && closeWithoutSavingApproved_));
@@ -933,6 +955,9 @@ namespace winrt::SettingsUI::implementation
             {
                 auto target = std::wstring(message.GetNamedString(L"page", L"general").c_str());
                 if (!target.empty()) target[0] = static_cast<wchar_t>(towupper(target[0]));
+#if QUOTA_DEVELOPMENT_UI
+                if (target == L"Development") OpenDevelopment();
+#endif
                 for (auto const& item : Navigation().MenuItems()) if (item.try_as<NavigationViewItem>() && std::wstring(unbox_value<hstring>(item.as<NavigationViewItem>().Tag()).c_str()) == target) Navigation().SelectedItem(item);
                 for (auto const& item : Navigation().FooterMenuItems()) if (item.try_as<NavigationViewItem>() && std::wstring(unbox_value<hstring>(item.as<NavigationViewItem>().Tag()).c_str()) == target) Navigation().SelectedItem(item);
                 if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
@@ -947,6 +972,12 @@ namespace winrt::SettingsUI::implementation
                 bool localEcho = false;
                 if (revision >= revision_)
                 {
+#if QUOTA_DEVELOPMENT_UI
+                    if (page_ == L"Appearance" && state_ &&
+                        state_.GetNamedObject(L"development_overrides", JsonObject()).Stringify() !=
+                        updated.GetNamedObject(L"development_overrides", JsonObject()).Stringify())
+                        settingsRefreshPending_ = true;
+#endif
                     settingsChanged = SettingsChanged(state_, updated);
                     auto localChanges = JsonObject();
                     if (flightChanges_) for (auto const& pair : flightChanges_) localChanges.Insert(pair.Key(), pair.Value());
@@ -972,6 +1003,9 @@ namespace winrt::SettingsUI::implementation
                 }
                 if (refreshPage) settingsRefreshPending_ = true;
                 if (refreshPage) RefreshSettingsControlsIfSafe();
+#if QUOTA_DEVELOPMENT_UI
+                if (page_ == L"Appearance") RefreshSettingsControlsIfSafe();
+#endif
             }
             return;
         }
@@ -985,6 +1019,12 @@ namespace winrt::SettingsUI::implementation
         const bool wasMutation = mutationInFlight_;
         const bool wasPanePersistence = paneStateRequestInFlight_;
         const bool wasSettingsAction = settingsActionInFlight_;
+#if QUOTA_DEVELOPMENT_UI
+        const bool wasDevelopment = developmentRequestInFlight_;
+        const bool wasDevelopmentReset = developmentResetInFlight_;
+        developmentRequestInFlight_ = false;
+        developmentResetInFlight_ = false;
+#endif
         const auto completedSettingsAction = settingsActionInFlightName_;
         initialGetPending_ = false;
         previewInFlight_ = false;
@@ -998,6 +1038,10 @@ namespace winrt::SettingsUI::implementation
         settingsActionInFlightName_.reset();
         inFlight_ = 0;
         const bool ok = message.GetNamedBoolean(L"ok", false);
+#if QUOTA_DEVELOPMENT_UI
+        if (wasDevelopment && !ok)
+            ShowMessage(std::wstring(message.GetNamedString(L"error", L"The development override could not be applied.").c_str()), true);
+#endif
         if (wasPreview || wasPresetPreview)
         {
             if (wasPresetPreview && ok && completedPresetGeneration == appearancePresetGeneration_ &&
@@ -1020,6 +1064,9 @@ namespace winrt::SettingsUI::implementation
                 widgetPreviewStatus_.Text(NativeLocalization::Translate(L"The widget preview is temporarily unavailable.", g_nativeLanguage));
 
             SendPendingPaneState();
+#if QUOTA_DEVELOPMENT_UI
+            SendNextDevelopmentRequest();
+#endif
             if (flushRequested_) SendNextMutation();
             else if (appearancePresetPreviewNext_ < appearancePresetPreviewJobs_.size()) SendNextPresetPreviewIfIdle();
             else if (previewPending_) SendWidgetPreviewIfIdle();
@@ -1039,6 +1086,13 @@ namespace winrt::SettingsUI::implementation
         }
         UpdateProviderAvailability();
         UpdateAboutControls();
+#if QUOTA_DEVELOPMENT_UI
+        if (wasDevelopment && ok)
+        {
+            ShowMessage(L"Development overrides updated. Saved settings are unchanged.");
+            if (wasDevelopmentReset && page_ == L"Development") RenderPage(page_);
+        }
+#endif
         const bool wasPersist = persistInFlight_;
         persistInFlight_ = false;
         if (mutationInFlight_)
@@ -1213,6 +1267,20 @@ namespace winrt::SettingsUI::implementation
     }
     JsonObject MainWindow::Setting(std::wstring const&) { return State(); }
     bool MainWindow::Bool(std::wstring const& key) { auto s = State(); return s.GetNamedBoolean(key, false); }
+    bool MainWindow::AppearanceProviderEnabled(std::wstring const& key)
+    {
+        if (Bool(key)) return true;
+#if QUOTA_DEVELOPMENT_UI
+        if (state_ && state_.GetNamedBoolean(L"development_enabled", false))
+        {
+            const auto id = key == L"show_claude_code" ? std::wstring(L"claude") : key.substr(5);
+            const auto overrides = state_.GetNamedObject(L"development_overrides", JsonObject());
+            const auto provider = overrides.GetNamedObject(id, JsonObject());
+            return provider.GetNamedBoolean(L"enabled", false) && provider.GetNamedBoolean(L"force_available", false);
+        }
+#endif
+        return false;
+    }
     std::wstring MainWindow::Text(std::wstring const& key)
     {
         auto settings = State();
@@ -1224,6 +1292,7 @@ namespace winrt::SettingsUI::implementation
         if (hydrating_) return;
         if (!pendingChanges_) pendingChanges_ = JsonObject();
         pendingChanges_.Insert(key, value);
+        UpdateProviderAvailability();
         flushRequested_ = false;
         UpdateSaveBar();
         if (key == L"widget_visible")
@@ -1579,6 +1648,13 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::UpdateProviderAvailability()
     {
         const auto providers = ProviderAppearanceMeta();
+        if (providerSpacingSelector_)
+        {
+            size_t enabledProviders = 0;
+            for (auto const& provider : providers)
+                if (AppearanceProviderEnabled(provider.enable)) ++enabledProviders;
+            providerSpacingSelector_.IsEnabled(enabledProviders > 1);
+        }
         const auto count = std::min(providerToggles_.size(), providers.size());
         for (size_t i = 0; i < count; ++i)
         {
@@ -2164,6 +2240,7 @@ namespace winrt::SettingsUI::implementation
         providerToggles_.clear();
         providerDetailEnableToggle_ = nullptr;
         providerIconPositionSelector_ = nullptr;
+        providerSpacingSelector_ = nullptr;
         widgetPreviewImage_ = nullptr;
         widgetPreviewStatus_ = nullptr;
         ClearStickyPreview();
@@ -2208,10 +2285,15 @@ namespace winrt::SettingsUI::implementation
             {L"About",L"A closer look at the app, how it works, and its project details."},
             {L"Experimental",L"Opt in to experimental limits and extras."},
             {L"Update",L"See the current update status and install the latest available version."}};
-        PageSummary().Text(NativeLocalization::Translate(summaries.at(page), g_nativeLanguage));
+        auto summary = summaries.find(page);
+        PageSummary().Text(summary != summaries.end() ? NativeLocalization::Translate(summary->second, g_nativeLanguage) : std::wstring());
         hydrating_ = true;
+#if QUOTA_DEVELOPMENT_UI
+        if (page == L"Development") BuildDevelopment(); else
+#endif
         if (page == L"General") BuildGeneral(); else if (page == L"Monitoring") BuildMonitoring(); else if (page == L"Appearance") { if (detailProvider_ >= 0 && detailProvider_ < 7) BuildProviderDetail(detailProvider_); else BuildAppearance(); } else if (page == L"Placement") BuildPlacement(); else if (page == L"Update") BuildUpdate(); else if (page == L"Experimental") BuildExperimental(); else BuildAbout();
         hydrating_ = false;
+        UpdateProviderAvailability();
     }
 
     void MainWindow::UpdateWidgetPageAvailability()
@@ -2831,7 +2913,7 @@ namespace winrt::SettingsUI::implementation
             const auto found = std::find(ids.begin(), ids.end(), oldId);
             if (found == ids.end()) continue;
             const auto metaIndex = static_cast<size_t>(std::distance(ids.begin(), found));
-            const bool enabled = Bool(providers[metaIndex].enable);
+            const bool enabled = AppearanceProviderEnabled(providers[metaIndex].enable);
             const auto id = enabled && enabledIndex < enabledOrder.size() ? enabledOrder[enabledIndex++] : oldId;
             fullOrder.Append(JsonValue::CreateStringValue(id));
         }
@@ -3050,7 +3132,7 @@ namespace winrt::SettingsUI::implementation
         {
             const int metaIndex = orderedProviders[static_cast<size_t>(orderIndex)];
             const auto& meta = allProviders[static_cast<size_t>(metaIndex)];
-            if (!Bool(meta.enable)) continue;
+            if (!AppearanceProviderEnabled(meta.enable)) continue;
             ++visibleProviderNumber;
             auto tileContent = Grid();
             auto nameColumn = ColumnDefinition(); nameColumn.Width(GridLength{ 1, GridUnitType::Star });
@@ -3211,6 +3293,7 @@ namespace winrt::SettingsUI::implementation
         addCombo(styleCombos, bars, NativeLocalization::Translate(L"Progress bars", g_nativeLanguage), L"bar_style", {{L"continuous",NativeLocalization::Translate(L"Continuous", g_nativeLanguage)},{L"segmented",NativeLocalization::Translate(L"Segmented", g_nativeLanguage)}});
         addCombo(styleCombos, thickness, NativeLocalization::Translate(L"Bar thickness", g_nativeLanguage), L"bar_thickness", {{L"standard",NativeLocalization::Translate(L"Thick", g_nativeLanguage)},{L"slim",NativeLocalization::Translate(L"Slim", g_nativeLanguage)}});
         addCombo(styleCombos, providerSpacing, NativeLocalization::Translate(L"Provider spacing", g_nativeLanguage), L"provider_spacing", {{L"none",NativeLocalization::Translate(L"None", g_nativeLanguage)},{L"small",NativeLocalization::Translate(L"Small", g_nativeLanguage)},{L"normal",NativeLocalization::Translate(L"Normal", g_nativeLanguage)},{L"large",NativeLocalization::Translate(L"Large", g_nativeLanguage)}});
+        providerSpacingSelector_ = providerSpacing;
         addCombo(styleCombos, fontSize, NativeLocalization::Translate(L"Text size", g_nativeLanguage), L"font_size", {{L"standard",NativeLocalization::Translate(L"Standard", g_nativeLanguage)},{L"large",NativeLocalization::Translate(L"Large", g_nativeLanguage)}});
         styleCombos.SizeChanged([styleCombos](auto const& sender, auto const&) mutable
         {
@@ -3536,6 +3619,121 @@ namespace winrt::SettingsUI::implementation
         stack.Children().Append(ToggleRow(copy, toggle));
         card.Child(stack); PageHost().Children().Append(card);
     }
+
+#if QUOTA_DEVELOPMENT_UI
+    void MainWindow::OpenDevelopment()
+    {
+        if (state_ && !state_.GetNamedBoolean(L"development_enabled", false)) return;
+        if (!developmentNavigationItem_)
+        {
+            developmentNavigationItem_ = NavigationViewItem();
+            developmentNavigationItem_.Content(box_value(L"Development"));
+            developmentNavigationItem_.Tag(box_value(L"Development"));
+            developmentNavigationItem_.Icon(SymbolIcon(Symbol::Repair));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(developmentNavigationItem_, L"NavigationDevelopment");
+            Navigation().FooterMenuItems().Append(developmentNavigationItem_);
+        }
+        NavigateTo(L"Development");
+    }
+
+    void MainWindow::QueueDevelopmentRequest(JsonObject const& request)
+    {
+        if (!state_ || !state_.GetNamedBoolean(L"development_enabled", false) || stopping_) return;
+        if (developmentRequests_.size() >= 32)
+        {
+            ShowMessage(L"Development requests are still applying. Try again in a moment.", true);
+            return;
+        }
+        developmentRequests_.push(request);
+        SendNextDevelopmentRequest();
+    }
+
+    void MainWindow::SendNextDevelopmentRequest()
+    {
+        if (stopping_ || closed_ || closeRequested_ || inFlight_ != 0 || developmentRequests_.empty()) return;
+        auto request = developmentRequests_.front();
+        developmentRequests_.pop();
+        developmentRequestInFlight_ = true;
+        developmentResetInFlight_ = request.GetNamedString(L"op", L"") == L"development_reset";
+        Send(request);
+    }
+
+    void MainWindow::BuildDevelopment()
+    {
+        PageEyebrow().Text(L"DEBUG BUILD ONLY");
+        PageSummary().Text(L"Simulate providers and usage without changing credentials or saved settings.");
+        SaveHint().Text(L"Use Apply on each provider. Overrides affect the widget and previews immediately and disappear when the app exits.");
+        auto intro = Card();
+        auto introContent = StackPanel(); introContent.Spacing(12);
+        introContent.Children().Append(Label(L"Temporary development overrides", 19));
+        introContent.Children().Append(Label(L"Force enable bypasses local provider detection and the provider count limit. Blank percentages keep the live quota value. Values are used percentages, from 0 to 100.", 13));
+        auto reset = Button(); reset.Content(box_value(L"Reset all overrides"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(reset, L"DevelopmentReset");
+        reset.Click([this](auto const&, auto const&) { QueueDevelopmentRequest(Request(L"development_reset")); });
+        introContent.Children().Append(reset); intro.Child(introContent); PageHost().Children().Append(intro);
+
+        const std::array<std::wstring, 7> ids{ L"claude", L"codex", L"antigravity", L"opencode", L"cursor", L"grok", L"copilot" };
+        const auto providers = ProviderAppearanceMeta();
+        const auto overrides = state_ ? state_.GetNamedObject(L"development_overrides", JsonObject()) : JsonObject();
+        for (size_t i = 0; i < providers.size(); ++i)
+        {
+            const auto id = ids[i];
+            const auto current = overrides.GetNamedObject(id, JsonObject());
+            auto card = Card(); auto content = StackPanel(); content.Spacing(12);
+            content.Children().Append(Label(providers[i].setupName, 19));
+            auto enabled = ToggleSwitch(); SetSwitchContent(enabled);
+            enabled.IsOn(current.GetNamedBoolean(L"enabled", false));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(enabled, L"Use development override for " + id);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(enabled, L"Development_enabled_" + id);
+            auto enabledCopy = StackPanel(); enabledCopy.Children().Append(Label(L"Use development override"));
+            content.Children().Append(ToggleRow(enabledCopy, enabled));
+            auto force = ToggleSwitch(); SetSwitchContent(force);
+            force.IsOn(current.GetNamedBoolean(L"force_available", false));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(force, L"Force enable " + id);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(force, L"Development_force_" + id);
+            auto forceCopy = StackPanel(); forceCopy.Children().Append(Label(L"Force enable provider"));
+            content.Children().Append(ToggleRow(forceCopy, force));
+            auto values = Grid(); values.ColumnSpacing(12);
+            values.ColumnDefinitions().Append(ColumnDefinition()); values.ColumnDefinitions().Append(ColumnDefinition());
+            std::array<NumberBox, 2> inputs;
+            const std::array<std::wstring, 2> keys{ L"session_percent", L"weekly_percent" };
+            for (size_t window = 0; window < inputs.size(); ++window)
+            {
+                auto input = NumberBox(); input.Minimum(0); input.Maximum(100);
+                input.Header(box_value(window == 0 ? L"5-hour usage (%)" : L"7-day usage (%)"));
+                input.PlaceholderText(L"Live value");
+                input.SpinButtonPlacementMode(NumberBoxSpinButtonPlacementMode::Compact);
+                const auto value = current.GetNamedValue(keys[window], JsonValue::CreateNullValue());
+                input.Value(value.ValueType() == JsonValueType::Number ? value.GetNumber() : std::numeric_limits<double>::quiet_NaN());
+                Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(input, L"Development_" + keys[window] + L"_" + id);
+                Grid::SetColumn(input, static_cast<int>(window)); values.Children().Append(input); inputs[window] = input;
+            }
+            content.Children().Append(values);
+            auto apply = Button(); apply.Content(box_value(L"Apply"));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(apply, L"Apply overrides for " + id);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(apply, L"Development_apply_" + id);
+            apply.Click([this, id, enabled, force, inputs, keys](auto const&, auto const&)
+            {
+                auto request = Request(L"development_override");
+                request.Insert(L"provider", JsonValue::CreateStringValue(id));
+                request.Insert(L"enabled", JsonValue::CreateBooleanValue(enabled.IsOn()));
+                request.Insert(L"force_available", JsonValue::CreateBooleanValue(force.IsOn()));
+                for (size_t window = 0; window < inputs.size(); ++window)
+                {
+                    const double value = inputs[window].Value();
+                    if (!std::isnan(value) && (!std::isfinite(value) || value < 0 || value > 100))
+                    {
+                        ShowMessage(L"Usage percentages must be between 0 and 100, or blank for live values.", true);
+                        return;
+                    }
+                    request.Insert(keys[window], std::isnan(value) ? JsonValue::CreateNullValue() : JsonValue::CreateNumberValue(value));
+                }
+                QueueDevelopmentRequest(request);
+            });
+            content.Children().Append(apply); card.Child(content); PageHost().Children().Append(card);
+        }
+    }
+#endif
 
     void MainWindow::BuildAbout()
     {

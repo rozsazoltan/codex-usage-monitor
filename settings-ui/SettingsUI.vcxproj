@@ -26,6 +26,8 @@
     <NuGetTargetPlatformVersion>$(WindowsTargetPlatformVersion)</NuGetTargetPlatformVersion>
     <RestorePackagesPath>$(MSBuildThisFileDirectory)packages</RestorePackagesPath>
     <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)obj\</BaseIntermediateOutputPath>
+    <QuotaDevelopmentUI Condition="'$(QuotaDevelopmentUI)' == ''">false</QuotaDevelopmentUI>
+    <QuotaDevelopmentDefine Condition="'$(QuotaDevelopmentUI)' == 'true'">QUOTA_DEVELOPMENT_UI=1;</QuotaDevelopmentDefine>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
@@ -52,7 +54,7 @@
       <WarningLevel>Level4</WarningLevel>
       <Optimization>MinSpace</Optimization>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <PreprocessorDefinitions>NDEBUG;NOMINMAX;WIN32_LEAN_AND_MEAN;_VSDESIGNER_DONT_LOAD_AS_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>$(QuotaDevelopmentDefine)NDEBUG;NOMINMAX;WIN32_LEAN_AND_MEAN;_VSDESIGNER_DONT_LOAD_AS_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/bigobj /utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(ProjectDir);$(GeneratedFilesDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>

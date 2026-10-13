@@ -96,11 +96,18 @@ namespace winrt::SettingsUI::implementation
         void BuildAbout();
         void BuildUpdate();
         void BuildExperimental();
+#if QUOTA_DEVELOPMENT_UI
+        void OpenDevelopment();
+        void BuildDevelopment();
+        void QueueDevelopmentRequest(winrt::Windows::Data::Json::JsonObject const& request);
+        void SendNextDevelopmentRequest();
+#endif
         void NavigateTo(std::wstring const& page);
         void BuildPreviewCard();
         void UpdatePreviewOverflow();
         winrt::Windows::Data::Json::JsonObject Setting(std::wstring const& key);
         bool Bool(std::wstring const& key);
+        bool AppearanceProviderEnabled(std::wstring const& key);
         std::wstring Text(std::wstring const& key);
         winrt::Windows::Data::Json::JsonObject State() const;
 
@@ -117,6 +124,13 @@ namespace winrt::SettingsUI::implementation
         winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch providerDetailEnableToggle_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch widgetVisibilityToggle_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::ComboBox providerIconPositionSelector_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::ComboBox providerSpacingSelector_{ nullptr };
+#if QUOTA_DEVELOPMENT_UI
+        winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem developmentNavigationItem_{ nullptr };
+        std::queue<winrt::Windows::Data::Json::JsonObject> developmentRequests_;
+        bool developmentRequestInFlight_{};
+        bool developmentResetInFlight_{};
+#endif
         winrt::Microsoft::UI::Xaml::Controls::GridView providerOrderGrid_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Canvas providerOrderOverlay_{ nullptr };
         winrt::Microsoft::UI::Xaml::Shapes::Rectangle providerInsertionIndicator_{ nullptr };

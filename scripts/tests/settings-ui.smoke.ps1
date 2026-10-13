@@ -7,6 +7,8 @@ Requires an interactive Windows desktop and the installed x64 Windows App Runtim
 Uses a private synthetic backend; no widget, credentials, or settings files are used.
 Does not build, publish, install dependencies, or connect to the real widget.
 Preview and explicitly authorized setting edits use only an in-memory synthetic backend.
+-DevelopmentOnly runs the debug Development page/F12/override checks.
+-ReleaseOnly asserts F12 cannot reveal Development even when the synthetic state enables it.
 #>
 [CmdletBinding()]
 param(
@@ -14,11 +16,17 @@ param(
     [string]$TemporaryDirectory = (Join-Path ([IO.Path]::GetTempPath()) 'opencode'),
     [ValidateRange(2, 60)][int]$TimeoutSeconds = 15,
     [switch]$AppearanceOnly,
-    [switch]$SaveStateOnly
+    [switch]$SaveStateOnly,
+    [switch]$DevelopmentOnly,
+    [switch]$ReleaseOnly
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $IsWindows) { throw 'This smoke test requires an interactive Windows desktop.' }
+if ($DevelopmentOnly -and $ReleaseOnly) { throw 'DevelopmentOnly and ReleaseOnly cannot be used together.' }
+if (($DevelopmentOnly -or $ReleaseOnly) -and ($AppearanceOnly -or $SaveStateOnly)) {
+    throw 'DevelopmentOnly/ReleaseOnly cannot be combined with AppearanceOnly or SaveStateOnly.'
+}
 
 $companion = (Resolve-Path -LiteralPath $CompanionDirectory).Path
 $names = @('SettingsUI.exe', 'Microsoft.WindowsAppRuntime.Bootstrap.dll', 'SettingsUI.pri', 'App.xbf', 'MainWindow.xbf')
@@ -66,6 +74,8 @@ public static class SettingsUISmokeNative {
     static extern int GetWindowText(IntPtr window, StringBuilder text, int length);
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
     public static IntPtr FindOwnedWindow(uint pid, string title) {
         IntPtr found = IntPtr.Zero;
         EnumWindows((window, parameter) => {
@@ -97,7 +107,8 @@ $snapshot = @{
         show_percentage = $true; show_bar = $true; show_reset_time = $true; usage_text_color = $null
         claude_accent = $null; codex_accent = $null; monitor_device = 'smoke-display'; anchor_left = $false
     }
-    effective_language = 'en'; claude_code_available = $false; codex_available = $true
+    effective_language = 'en'; development_enabled = $false; development_overrides = @{}
+    claude_code_available = $false; codex_available = $true
     antigravity_available = $false; opencode_available = $false; cursor_available = $true
     grok_available = $false; copilot_available = $true
     effective_appearance = @{ dark = $false; claude_accent = @(217, 119, 87); codex_accent = @(15, 143, 112) }
@@ -108,7 +119,7 @@ $snapshot = @{
 $controls = @{
     General = 'LanguageSelector'; Monitoring = 'Setting_show_codex'; Appearance = 'Appearance_palette'
     Placement = 'MonitorSelector'; Update = 'CheckForUpdates'; About = 'ThirdPartyNotices'
-    Experimental = 'Setting_allow_unlimited_providers'
+    Experimental = 'Setting_allow_unlimited_providers'; Development = 'DevelopmentReset'
 }
 $pages = @('General', 'Monitoring', 'Appearance', 'Placement', 'Update', 'About', 'Experimental')
 $timeoutMilliseconds = $TimeoutSeconds * 1000
@@ -203,7 +214,10 @@ function Receive-SmokeRequests {
                     Assert ($request.Count -eq 4 -and $request.changes -is [hashtable]) 'Preview must contain a changes object.'
                     foreach ($key in $request.changes.Keys) {
                         Assert ($key -in @('palette', 'bar_style', 'bar_thickness', 'provider_spacing', 'font_size', 'window_label_font_size',
-                            'claude_accent', 'codex_accent', 'usage_text_color', 'show_provider_icon', 'show_provider_icons',
+                            'claude_accent', 'codex_accent', 'antigravity_accent', 'opencode_accent', 'cursor_accent', 'grok_accent',
+                            'copilot_accent', 'usage_text_color', 'provider_monochrome', 'provider_order', 'provider_icon_position',
+                            'show_provider_icon', 'show_provider_icons', 'show_claude_icon', 'show_codex_icon', 'show_antigravity_icon',
+                            'show_opencode_icon', 'show_cursor_icon', 'show_grok_icon', 'show_copilot_icon',
                             'show_percentage', 'show_bar', 'show_reset_time')) "Unexpected preview candidate key: $key"
                     }
                     $backend.Previews.Add($request)
@@ -241,6 +255,36 @@ function Receive-SmokeRequests {
                         $backend.HoldNextSetBatch = $false
                         $backend.HeldMutationResponse = $response
                     } else { Write-Frame $backend.Pipe $backend.Process $response }
+                }
+                development_override {
+                    Assert ($request.Count -eq 8 -and $request.provider -in @('claude', 'codex', 'antigravity', 'opencode', 'cursor', 'grok', 'copilot') -and
+                        $request.enabled -is [bool] -and $request.force_available -is [bool]) 'Invalid synthetic development override.'
+                    foreach ($key in @('session_percent', 'weekly_percent')) {
+                        $value = $request[$key]
+                        if ($null -ne $value) {
+                            Assert ($value -is [ValueType] -and $value -isnot [bool] -and [double]$value -ge 0 -and [double]$value -le 100) "Invalid development percentage: $key."
+                        }
+                    }
+                    $backend.DevelopmentRequests.Add($request)
+                    $backend.State.development_overrides[$request.provider] = @{
+                        enabled = $request.enabled; force_available = $request.force_available
+                        session_percent = $request.session_percent; weekly_percent = $request.weekly_percent
+                    }
+                    $backend.Revision++
+                    $response = @{ v = 1; id = $request.id; ok = $true; revision = $backend.Revision;
+                        state = (New-PreviewSnapshot $backend.State) }
+                    $backend.LastDevelopmentResponse = $response
+                    Write-Frame $backend.Pipe $backend.Process $response
+                }
+                development_reset {
+                    Assert ($request.Count -eq 3) 'Invalid synthetic development reset.'
+                    $backend.DevelopmentResetRequests++
+                    $backend.State.development_overrides = @{}
+                    $backend.Revision++
+                    $response = @{ v = 1; id = $request.id; ok = $true; revision = $backend.Revision;
+                        state = (New-PreviewSnapshot $backend.State) }
+                    $backend.LastDevelopmentResponse = $response
+                    Write-Frame $backend.Pipe $backend.Process $response
                 }
                 persist {
                     $backend.PersistRequests++
@@ -324,6 +368,7 @@ function Wait-Page([Windows.Automation.AutomationElement]$Window, [Diagnostics.P
                     $null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
                 }
                 Experimental { $control.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -in @([Windows.Automation.ToggleState]::On, [Windows.Automation.ToggleState]::Off) }
+                Development { $null -ne (Find-Control $Window 'Development_enabled_codex') }
             }
             if ($ready) { return }
         }
@@ -355,6 +400,66 @@ function Assert-NoUnexpectedRequests([IO.Pipes.NamedPipeServerStream]$Pipe) {
     } while ($clock.ElapsedMilliseconds -lt 400)
     Receive-SmokeRequests
     Assert ($script:smokeBackend.Commits.Count -eq $commits) 'A preview-only interaction unexpectedly committed settings.'
+}
+
+function Send-SmokeF12([IntPtr]$Window, [Diagnostics.Process]$Process) {
+    Assert-Running $Process 'sending F12 to the native settings window'
+    [SettingsUISmokeNative]::SetForegroundWindow($Window) | Out-Null
+    Start-Sleep -Milliseconds 50
+    [SettingsUISmokeNative]::keybd_event([byte]0x7B, [byte]0, [uint32]0, [UIntPtr]::Zero)
+    [SettingsUISmokeNative]::keybd_event([byte]0x7B, [byte]0, [uint32]2, [UIntPtr]::Zero)
+}
+
+function Set-DevelopmentToggle([Windows.Automation.AutomationElement]$Window, [string]$Id, [bool]$Value) {
+    $control = Find-Control $Window $Id
+    Assert ($null -ne $control) "Missing development toggle: $Id"
+    Show-SmokeControl $control
+    $pattern = $control.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern)
+    if (($pattern.Current.ToggleState -eq [Windows.Automation.ToggleState]::On) -ne $Value) { $pattern.Toggle() }
+}
+
+function Set-DevelopmentPercent([Windows.Automation.AutomationElement]$Window, [string]$Id, [double]$Value) {
+    $control = Find-Control $Window $Id
+    Assert ($null -ne $control) "Missing development percentage input: $Id"
+    Show-SmokeControl $control
+    $control.GetCurrentPattern([Windows.Automation.RangeValuePattern]::Pattern).SetValue($Value)
+}
+
+function Wait-DevelopmentRequests([Windows.Automation.AutomationElement]$Window,
+    [Diagnostics.Process]$Process, [int]$Count, [int]$ResetCount) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process 'servicing queued development operations'
+        if ($script:smokeBackend.DevelopmentRequests.Count -ge $Count -and
+            $script:smokeBackend.DevelopmentResetRequests -ge $ResetCount) { return }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    throw "Development operations did not complete (overrides=$($script:smokeBackend.DevelopmentRequests.Count)/$Count reset=$($script:smokeBackend.DevelopmentResetRequests)/$ResetCount)."
+}
+
+function Wait-SpacingEnabled([Windows.Automation.AutomationElement]$Window,
+    [Diagnostics.Process]$Process, [bool]$Enabled) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process 'updating provider spacing availability'
+        $combo = Find-Control $Window 'Appearance_provider_spacing'
+        if ($null -ne $combo -and $combo.Current.IsEnabled -eq $Enabled) { return $combo }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    throw "Provider spacing did not become enabled=$Enabled for the synthetic active-provider count."
+}
+
+function Scroll-SmokePageTop([Windows.Automation.AutomationElement]$Window) {
+    $containers = $Window.FindAll([Windows.Automation.TreeScope]::Descendants,
+        [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::IsScrollPatternAvailableProperty, $true))
+    $scroll = $null
+    foreach ($container in $containers) {
+        $pattern = $container.GetCurrentPattern([Windows.Automation.ScrollPattern]::Pattern)
+        if ($pattern.Current.VerticallyScrollable) { $scroll = $pattern; break }
+    }
+    Assert ($null -ne $scroll) 'The development page has no scrollable container.'
+    $scroll.SetScrollPercent([Windows.Automation.ScrollPattern]::NoScroll, 0)
+    Start-Sleep -Milliseconds 50
 }
 
 function Show-SmokeControl([Windows.Automation.AutomationElement]$Control, [int]$BudgetMs = -1,
@@ -1039,6 +1144,83 @@ function Test-ProviderAvailability([Windows.Automation.AutomationElement]$Window
     Write-Host 'Provider availability verified across Monitoring and Appearance detail: missing-setup copy, disabled unavailable/off switches, and saving unavailable/on switches off.'
 }
 
+function Test-DevelopmentUI([Windows.Automation.AutomationElement]$Window, [IntPtr]$Handle,
+    [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    Assert ($null -eq (Find-Control $Window 'NavigationDevelopment') -and
+        $null -eq (Find-Control $Window 'DevelopmentReset')) 'The debug Development page was visible before F12.'
+    Send-SmokeF12 $Handle $Process
+    Wait-Page $Window $Process 'Development'
+    Assert ($null -ne (Find-Control $Window 'NavigationDevelopment')) 'F12 did not reveal Development navigation.'
+
+    Set-DevelopmentToggle $Window 'Development_enabled_codex' $true
+    Set-DevelopmentToggle $Window 'Development_force_codex' $true
+    Set-DevelopmentPercent $Window 'Development_session_percent_codex' 37
+    (Find-Control $Window 'Development_apply_codex').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+
+    # Reset immediately after Apply. The native operation queue must preserve the
+    # override before the reset even while the first response is still in flight.
+    Scroll-SmokePageTop $Window
+    (Find-Control $Window 'DevelopmentReset').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Wait-DevelopmentRequests $Window $Process 1 1
+
+    $codex = $script:smokeBackend.DevelopmentRequests[0]
+    Assert ($codex.provider -ceq 'codex' -and $codex.enabled -eq $true -and $codex.force_available -eq $true -and
+        [double]$codex.session_percent -eq 37 -and $null -eq $codex.weekly_percent) 'Codex development Apply sent incorrect values or failed to preserve a blank live-value percentage.'
+    Assert ($script:smokeBackend.LastDevelopmentResponse.ok -eq $true -and
+        $script:smokeBackend.LastDevelopmentResponse.state.development_overrides.Count -eq 0) 'Development reset did not return the cleared synthetic override state.'
+
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process 'reloading development controls after reset'
+        $enabled = Find-Control $Window 'Development_enabled_codex'
+        $force = Find-Control $Window 'Development_force_codex'
+        if ($null -ne $enabled -and $null -ne $force -and
+            $enabled.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq [Windows.Automation.ToggleState]::Off -and
+            $force.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq [Windows.Automation.ToggleState]::Off) { break }
+        Start-Sleep -Milliseconds 20
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
+    Assert ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds) 'Development reset response did not reload the provider controls.'
+
+    Select-Page $Window $Process 'Appearance'
+    $state = $script:smokeBackend.State.Clone()
+    $state.settings = $script:smokeBackend.State.settings.Clone()
+    foreach ($key in @('show_claude_code', 'show_antigravity', 'show_opencode', 'show_cursor', 'show_grok', 'show_copilot')) {
+        $state.settings[$key] = $false
+    }
+    $state.settings.show_codex = $true
+    $script:smokeBackend.State = $state
+    $script:smokeBackend.Revision++
+    Write-Frame $Pipe $Process @{ v = 1; event = 'state'; revision = $script:smokeBackend.Revision; state = (New-PreviewSnapshot $state) }
+    Wait-SpacingEnabled $Window $Process $false | Out-Null
+
+    $state = $script:smokeBackend.State.Clone()
+    $state.settings = $script:smokeBackend.State.settings.Clone()
+    $state.settings.show_opencode = $true
+    $script:smokeBackend.State = $state
+    $script:smokeBackend.Revision++
+    Write-Frame $Pipe $Process @{ v = 1; event = 'state'; revision = $script:smokeBackend.Revision; state = (New-PreviewSnapshot $state) }
+    Wait-SpacingEnabled $Window $Process $true | Out-Null
+
+    Write-Frame $Pipe $Process @{ v = 1; event = 'activate'; page = 'development' }
+    Wait-Page $Window $Process 'Development'
+    Assert-NoUnexpectedRequests $Pipe
+    Write-Host 'Development UI verified: hidden until F12, per-provider forced overrides and nullable percentages, queued reset/reload, trusted activation, and spacing disabled/enabled at one/two active providers.'
+}
+
+function Test-ReleaseF12([Windows.Automation.AutomationElement]$Window, [IntPtr]$Handle,
+    [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
+    Assert ($null -eq (Find-Control $Window 'NavigationDevelopment') -and
+        $null -eq (Find-Control $Window 'DevelopmentReset')) 'A release build exposed the Development page before F12.'
+    Send-SmokeF12 $Handle $Process
+    Start-Sleep -Milliseconds 250
+    Assert ($null -eq (Find-Control $Window 'NavigationDevelopment') -and
+        $null -eq (Find-Control $Window 'DevelopmentReset')) 'F12 exposed Development navigation in a release build.'
+    Assert ($script:smokeBackend.DevelopmentRequests.Count -eq 0 -and
+        $script:smokeBackend.DevelopmentResetRequests -eq 0) 'F12 generated a development backend request in a release build.'
+    Assert-NoUnexpectedRequests $Pipe
+    Write-Host 'Release F12 verified: Development remains unavailable and no development operation is sent.'
+}
+
 function Request-WindowClose([IntPtr]$Window, [Diagnostics.Process]$Process) {
     Assert-Running $Process 'requesting ordinary window close'
     [uint32]$owner = 0
@@ -1129,7 +1311,8 @@ function Open-Notices([Windows.Automation.AutomationElement]$Window, [Diagnostic
 
 function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll = $false,
     [bool]$DraftCloseCancellation = $false, [bool]$Notices = $false, [bool]$UpdateAvailable = $true,
-    [bool]$SaveStateOnly = $false) {
+    [bool]$SaveStateOnly = $false, [bool]$DevelopmentUI = $false,
+    [bool]$DevelopmentF12 = $false, [bool]$ReleaseF12 = $false) {
     $process = $null
     $pipe = $null
     $script:smokeBackend = $null
@@ -1171,6 +1354,8 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
         $result.InitialGet = $true
         $caseSnapshot = $snapshot.Clone()
         $caseSnapshot.settings = $snapshot.settings.Clone()
+        $caseSnapshot.development_enabled = $DevelopmentUI
+        $caseSnapshot.development_overrides = @{}
         $caseSnapshot.update_available = $UpdateAvailable
         $script:smokeBackend = @{
             Pipe = $pipe; Process = $process; State = $caseSnapshot; Revision = 1
@@ -1178,6 +1363,8 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
             Previews = [Collections.Generic.List[object]]::new(); HoldNextPreview = $false; HeldPreview = $null
             HoldNextSetBatch = $false; HeldMutationResponse = $null; FailNextSetBatchSave = $false
             FailNextPersist = $false; PersistRequests = 0
+            DevelopmentRequests = [Collections.Generic.List[object]]::new(); DevelopmentResetRequests = 0
+            LastDevelopmentResponse = $null
         }
         Write-Frame $pipe $process @{ v = 1; id = $request.id; ok = $true; revision = 1; state = (New-PreviewSnapshot $caseSnapshot) }
 
@@ -1209,6 +1396,12 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
             $updateBadge = $window.FindFirst([Windows.Automation.TreeScope]::Descendants, $updateBadgeCondition)
             Assert ($null -ne $updateBadge -and -not $updateBadge.Current.IsOffscreen) 'The available-update dot was not exposed with the Update navigation item.'
         }
+        if ($DevelopmentUI -and $Page -ceq 'Development') {
+            Assert ($null -ne (Find-Control $window 'NavigationDevelopment') -and
+                $null -ne (Find-Control $window 'Development_enabled_codex')) 'The --page development startup route did not render the Development page.'
+            Write-Frame $pipe $process @{ v = 1; event = 'activate'; page = 'development' }
+            Wait-Page $window $process 'Development'
+        }
         Write-Host "$Page startup: PID $($process.Id), get received, HWND $($result.HWND), hydrated page ready after $($clock.ElapsedMilliseconds) ms."
         if ($NavigateAll) {
             foreach ($next in $pages) { Select-Page $window $process $next }
@@ -1229,6 +1422,14 @@ function Invoke-SmokeCase([string]$Page, [string]$CloseMode, [bool]$NavigateAll 
             Test-DraftCloseCancellation $window $hwnd $pipe $process 'usage_text_color'
             $result.DraftCancel = $true
             $result.Navigated = $pages -join ', '
+        }
+        if ($DevelopmentF12) {
+            Assert ($Page -ceq 'Monitoring' -and $DevelopmentUI) 'Development F12 validation requires a Monitoring startup with development_enabled.'
+            Test-DevelopmentUI $window $hwnd $pipe $process
+        }
+        if ($ReleaseF12) {
+            Assert ($Page -ceq 'Monitoring' -and $DevelopmentUI) 'Release F12 validation requires a Monitoring startup with development_enabled.'
+            Test-ReleaseF12 $window $hwnd $pipe $process
         }
         $noticesHandle = [IntPtr]::Zero
         if ($Notices) {
@@ -1323,7 +1524,14 @@ try {
         @{ Page = 'About'; CloseMode = 'Shutdown'; Notices = $true },
         @{ Page = 'About'; CloseMode = 'Shutdown'; UpdateAvailable = $false }
     )
-    if ($SaveStateOnly) { $cases = @(@{ Page = 'Appearance'; CloseMode = 'WindowClose'; SaveStateOnly = $true }) }
+    if ($DevelopmentOnly) {
+        $cases = @(
+            @{ Page = 'Monitoring'; CloseMode = 'Shutdown'; DevelopmentUI = $true; DevelopmentF12 = $true }
+            @{ Page = 'Development'; CloseMode = 'Shutdown'; DevelopmentUI = $true }
+        )
+    }
+    elseif ($ReleaseOnly) { $cases = @(@{ Page = 'Monitoring'; CloseMode = 'Shutdown'; DevelopmentUI = $true; ReleaseF12 = $true }) }
+    elseif ($SaveStateOnly) { $cases = @(@{ Page = 'Appearance'; CloseMode = 'WindowClose'; SaveStateOnly = $true }) }
     elseif ($AppearanceOnly) { $cases = @(@{ Page = 'Appearance'; CloseMode = 'WindowClose' }) }
     foreach ($case in $cases) { $results.Add((Invoke-SmokeCase @case)) }
     foreach ($name in $names) {
@@ -1335,7 +1543,9 @@ try {
         $failed | Format-List Page, Close, PID, Error
         throw "$($failed.Count) Settings UI smoke test(s) failed."
     }
-    if ($SaveStateOnly) { Write-Host 'Passed: focused save-state transitions and close validation.' }
+    if ($DevelopmentOnly) { Write-Host 'Passed: debug-only Development page, F12 shortcut, override protocol, reset, and provider-spacing checks.' }
+    elseif ($ReleaseOnly) { Write-Host 'Passed: release-only F12 isolation check.' }
+    elseif ($SaveStateOnly) { Write-Host 'Passed: focused save-state transitions and close validation.' }
     elseif ($AppearanceOnly) { Write-Host 'Passed: focused Appearance behavior and close validation.' }
     else { Write-Host 'Passed: all six startup routes and page navigation; shutdown/disconnect/window close and immediate EOF races with exit code 0; canceled draft close followed by discard/reuse/close; open notices cleaned up on shutdown.' }
 } finally {

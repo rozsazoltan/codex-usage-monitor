@@ -1,7 +1,8 @@
 //! Settings companion protocol v1 (Rust owns all state).
 //!
 //! Launch: `SettingsUI.exe --pipe <full-name> --parent-pid <decimal> --page
-//! <general|monitoring|appearance|placement|about>`. No settings-file access.
+//! <general|monitoring|appearance|placement|about>` (debug builds also accept
+//! `development`). No settings-file access.
 //! Duplex byte pipe: u32 little-endian byte length followed by UTF-8 JSON,
 //! requests 1..=65536 bytes, responses 1..=2097152 bytes. The server restricts access to the current token user,
 //! rejects remote clients, and checks the client PID against the spawned child.
@@ -62,8 +63,7 @@
 //! Actions: refresh, update, uninstall, repository, exit, recommended,
 //! reset_appearance, reset_colors, reset_position. URLs/paths/commands cannot
 //! be supplied. Update/uninstall retain the widget's confirmation flows.
-//! Debug-only development operations (release builds reject them with
-//! error_code="development_disabled"):
+//! Debug-only development operations (not present in release builds):
 //! {"op":"development_override","provider":"codex","enabled":true,
 //! "force_available":true,"session_percent":35,"weekly_percent":72}, where
 //! provider is one of claude/codex/antigravity/opencode/cursor/grok/copilot;
@@ -80,19 +80,21 @@
 //! "grok_available":bool,"copilot_available":bool (all availability fields
 //! reflect effective availability, including enabled debug overrides),
 //! "credential_availability":{all seven availability fields with actual local
-//! credential presence},
+//! credential presence}, "effective_provider_visibility":{show_claude_code,
+//! show_codex,show_antigravity,show_opencode,show_cursor,show_grok,show_copilot}
+//! (effective widget visibility, separate from persisted setting values),
 //! "monitors":[{"device":string,"primary":bool}],"version":string,
 //! "update_status":string,"install_channel":"portable"|"winget"}.
 //! `settings.monitor_device` may be null before explicit selection.
 //! Supported languages are supplied as `languages:[{code:string,name:string}]`.
 //! Additional state: `effective_appearance:{dark:bool,claude_accent:[u8,u8,u8],
 //! codex_accent:[u8,u8,u8]}`, `update_busy:bool`, and `update_available:bool`.
-//! Development state also includes `development_enabled:bool` and
+//! Debug-build state also includes `development_enabled:bool` and
 //! `development_overrides:{claude,codex,antigravity,opencode,cursor,grok,copilot}`;
 //! each entry has `enabled`, `force_available`, `session_percent`, and
 //! `weekly_percent`. The availability fields reflect effective development
 //! availability; `credential_availability` retains the actual local credential
-//! presence. Release builds report `development_enabled:false` and inactive entries.
+//! presence. These fields are omitted from release-build state.
 //! Malformed JSON, invalid framing/version/operation/key or unexpected fields
 //! close the connection; valid requests with invalid values return ok=false.
 //! The child is assigned to a kill-on-close job, including abrupt parent exits.
@@ -124,6 +126,8 @@ pub enum Page {
     Appearance,
     Placement,
     About,
+    #[cfg(debug_assertions)]
+    Development,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +139,7 @@ pub enum Operation {
     Preview { changes: Vec<Change> },
     Persist,
     Action { action: Action },
+    #[cfg(debug_assertions)]
     DevelopmentOverride {
         provider: DevelopmentProvider,
         enabled: bool,
@@ -144,9 +149,11 @@ pub enum Operation {
         #[serde(default)]
         weekly_percent: Option<f64>,
     },
+    #[cfg(debug_assertions)]
     DevelopmentReset,
 }
 
+#[cfg(debug_assertions)]
 #[derive(Clone, Copy, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DevelopmentProvider {
@@ -160,6 +167,7 @@ pub enum DevelopmentProvider {
     Copilot,
 }
 
+#[cfg(debug_assertions)]
 impl DevelopmentProvider {
     pub fn index(self) -> usize {
         match self {
@@ -564,6 +572,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
             id: u32,
             action: Action,
         },
+        #[cfg(debug_assertions)]
         DevelopmentOverride {
             v: u32,
             id: u32,
@@ -575,6 +584,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
             #[serde(default)]
             weekly_percent: Option<f64>,
         },
+        #[cfg(debug_assertions)]
         DevelopmentReset {
             v: u32,
             id: u32,
@@ -634,6 +644,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
             id,
             operation: Operation::Action { action },
         },
+        #[cfg(debug_assertions)]
         WireRequest::DevelopmentOverride {
             v,
             id,
@@ -653,6 +664,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, String> {
                 weekly_percent,
             },
         },
+        #[cfg(debug_assertions)]
         WireRequest::DevelopmentReset { v, id } => Request {
             v,
             id,
@@ -1123,6 +1135,48 @@ mod tests {
         });
         assert!(parse_request(&serde_json::to_vec(&too_many).unwrap()).is_err());
     }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn development_page_and_override_requests_are_debug_only_protocol_values() {
+        assert_eq!(
+            serde_json::to_value(Page::Development).unwrap(),
+            "development"
+        );
+        let request = parse_request(
+            br#"{"v":1,"id":9,"op":"development_override","provider":"codex","enabled":true,"force_available":true,"session_percent":35,"weekly_percent":72}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request.operation,
+            Operation::DevelopmentOverride {
+                provider: DevelopmentProvider::Codex,
+                enabled: true,
+                force_available: true,
+                session_percent: Some(35.0),
+                weekly_percent: Some(72.0),
+            }
+        ));
+        assert!(matches!(
+            parse_request(br#"{"v":1,"id":10,"op":"development_reset"}"#)
+                .unwrap()
+                .operation,
+            Operation::DevelopmentReset
+        ));
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_protocol_rejects_development_pages_and_operations() {
+        for wire in [
+            br#"{"v":1,"id":9,"op":"development_override","provider":"codex","enabled":true,"force_available":true}"#.as_slice(),
+            br#"{"v":1,"id":10,"op":"development_reset"}"#,
+        ] {
+            assert!(parse_request(wire).is_err());
+        }
+        assert!(serde_json::from_str::<Page>("\"development\"").is_err());
+    }
+
     #[test]
     fn little_endian_framing() {
         let value = json!({"v":1,"event":"shutdown"});

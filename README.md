@@ -2,6 +2,8 @@
 
 Quota Usage Monitor is a lightweight, portable, easy-to-use, customizable, open-source Windows taskbar widget for monitoring usage limits and reset times across **Claude Code, Codex, Antigravity, OpenCode Go, Cursor, Grok Build, GitHub Copilot, and other providers**. Configure it through a **native Windows settings GUI**, with a live appearance preview and separate logo and color controls for each provider.
 
+![Quota Usage Monitor showcasing dark and light widget themes, segmented progress bars, appearance customization, and the native Windows settings interface. Widget previews use sample data.](.github/quota-usage-monitor-showcase.png)
+
 ## Features
 
 - Monitor seven providers from the Windows taskbar and notification area.

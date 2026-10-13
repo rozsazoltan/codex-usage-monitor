@@ -96,6 +96,7 @@ struct AppState {
     copilot_weekly_percent: f64,
     copilot_weekly_text: String,
     provider_availability: poller::ProviderAvailability,
+    #[cfg(debug_assertions)]
     development_overrides: [DevelopmentOverride; 7],
     show_claude_code: bool,
     show_codex: bool,
@@ -139,6 +140,7 @@ struct AppState {
     settings_pane_open: bool,
 }
 
+#[cfg(debug_assertions)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct DevelopmentOverride {
     enabled: bool,
@@ -219,6 +221,8 @@ const IDM_UNINSTALL: u16 = 105;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 const IDM_SETTINGS: u16 = 106;
+#[cfg(debug_assertions)]
+const VK_F12_KEY_CODE: usize = 0x7B;
 const IDM_APPEARANCE_PAGE: u16 = 107;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
@@ -3034,15 +3038,16 @@ fn total_widget_width() -> i32 {
         state
             .as_ref()
             .map(|s| {
+                let visibility = effective_provider_visibility(s);
                 (
                     active_model_count(
-                        s.show_claude_code,
-                        s.show_codex,
-                        s.show_antigravity,
-                        s.show_opencode,
-                        s.show_cursor,
-                        s.show_grok,
-                        s.show_copilot,
+                        visibility[0],
+                        visibility[1],
+                        visibility[2],
+                        visibility[3],
+                        visibility[4],
+                        visibility[5],
+                        visibility[6],
                     ),
                     s.language,
                     s.appearance,
@@ -3320,6 +3325,7 @@ pub fn run() {
                 copilot_weekly_percent: 0.0,
                 copilot_weekly_text: "--".to_string(),
                 provider_availability,
+                #[cfg(debug_assertions)]
                 development_overrides: [DevelopmentOverride::default(); 7],
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
@@ -3491,14 +3497,15 @@ fn update_quota_tooltips() {
         let mut regions = Vec::new();
         if !s.dragging {
             let chinese = s.language == LanguageId::SimplifiedChinese;
+            let visibility = effective_provider_visibility(s);
             let count = active_model_count(
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-                s.show_opencode,
-                s.show_cursor,
-                s.show_grok,
-                s.show_copilot,
+                visibility[0],
+                visibility[1],
+                visibility[2],
+                visibility[3],
+                visibility[4],
+                visibility[5],
+                visibility[6],
             );
             let (label_width, _) = usage_layout_widths(s.language, s.appearance);
             let mut left = sc(LEFT_DIVIDER_W)
@@ -3510,49 +3517,49 @@ fn update_quota_tooltips() {
             let tooltip_providers = [
                 (
                     0,
-                    s.show_claude_code,
+                    visibility[0],
                     "Claude Code",
                     &display[0].session_text,
                     &display[0].weekly_text,
                 ),
                 (
                     1,
-                    s.show_codex,
+                    visibility[1],
                     "Codex",
                     &display[1].session_text,
                     &display[1].weekly_text,
                 ),
                 (
                     2,
-                    s.show_antigravity,
+                    visibility[2],
                     "Antigravity",
                     &display[2].session_text,
                     &display[2].weekly_text,
                 ),
                 (
                     3,
-                    s.show_opencode,
+                    visibility[3],
                     "OpenCode",
                     &display[3].session_text,
                     &display[3].weekly_text,
                 ),
                 (
                     4,
-                    s.show_cursor,
+                    visibility[4],
                     "Cursor",
                     &display[4].session_text,
                     &display[4].weekly_text,
                 ),
                 (
                     5,
-                    s.show_grok,
+                    visibility[5],
                     "Grok",
                     &display[5].session_text,
                     &display[5].weekly_text,
                 ),
                 (
                     6,
-                    s.show_copilot,
+                    visibility[6],
                     "Copilot",
                     &display[6].session_text,
                     &display[6].weekly_text,
@@ -3671,6 +3678,7 @@ fn render_layered() {
             Some(s) => {
                 let display: [ProviderDisplay; 7] =
                     std::array::from_fn(|index| provider_display(s, ProviderId::ALL[index]));
+                let visibility = effective_provider_visibility(s);
                 (
                     s.hwnd,
                     s.is_dark,
@@ -3706,13 +3714,13 @@ fn render_layered() {
                     display[6].session_text.clone(),
                     display[6].weekly_percent,
                     display[6].weekly_text.clone(),
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_antigravity,
-                    s.show_opencode,
-                    s.show_cursor,
-                    s.show_grok,
-                    s.show_copilot,
+                    visibility[0],
+                    visibility[1],
+                    visibility[2],
+                    visibility[3],
+                    visibility[4],
+                    visibility[5],
+                    visibility[6],
                     s.show_provider_icons,
                     s.show_session_window,
                     s.show_weekly_window,
@@ -5000,6 +5008,11 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        #[cfg(debug_assertions)]
+        WM_KEYDOWN if wparam.0 == VK_F12_KEY_CODE => {
+            open_settings(hwnd, Page::Development);
+            LRESULT(0)
+        }
         WM_POWERBROADCAST
             if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize
                 || wparam.0 == PBT_APMRESUMESUSPEND as usize =>
@@ -5436,7 +5449,10 @@ fn show_settings_menu(hwnd: HWND) {
 }
 
 fn effective_provider_availability(state: &AppState) -> poller::ProviderAvailability {
+    #[cfg(debug_assertions)]
     let mut availability = state.provider_availability;
+    #[cfg(not(debug_assertions))]
+    let availability = state.provider_availability;
     #[cfg(debug_assertions)]
     for provider in ProviderId::ALL {
         let development = state.development_overrides[provider.index()];
@@ -5456,25 +5472,59 @@ fn effective_provider_availability(state: &AppState) -> poller::ProviderAvailabi
     availability
 }
 
-fn development_override_json(override_state: DevelopmentOverride) -> serde_json::Value {
-    use serde_json::json;
-    if cfg!(debug_assertions) {
-        json!({
-            "enabled": override_state.enabled,
-            "force_available": override_state.force_available,
-            "session_percent": override_state.session_percent,
-            "weekly_percent": override_state.weekly_percent,
-        })
-    } else {
-        json!({
-            "enabled": false,
-            "force_available": false,
-            "session_percent": null,
-            "weekly_percent": null,
-        })
-    }
+fn effective_provider_visibility(state: &AppState) -> [bool; 7] {
+    let visibility = [
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+        state.show_opencode,
+        state.show_cursor,
+        state.show_grok,
+        state.show_copilot,
+    ];
+    #[cfg(debug_assertions)]
+    let visibility = development_provider_visibility(visibility, &state.development_overrides);
+    visibility
 }
 
+fn provider_visibility_json(visibility: [bool; 7]) -> serde_json::Value {
+    serde_json::json!({
+        "show_claude_code": visibility[0],
+        "show_codex": visibility[1],
+        "show_antigravity": visibility[2],
+        "show_opencode": visibility[3],
+        "show_cursor": visibility[4],
+        "show_grok": visibility[5],
+        "show_copilot": visibility[6],
+    })
+}
+
+#[cfg(debug_assertions)]
+fn development_provider_visibility(
+    mut visibility: [bool; 7],
+    overrides: &[DevelopmentOverride; 7],
+) -> [bool; 7] {
+    for provider in ProviderId::ALL {
+        let development = overrides[provider.index()];
+        if development.enabled && development.force_available {
+            visibility[provider.index()] = true;
+        }
+    }
+    visibility
+}
+
+#[cfg(debug_assertions)]
+fn development_override_json(override_state: DevelopmentOverride) -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "enabled": override_state.enabled,
+        "force_available": override_state.force_available,
+        "session_percent": override_state.session_percent,
+        "weekly_percent": override_state.weekly_percent,
+    })
+}
+
+#[cfg(debug_assertions)]
 fn development_overrides_snapshot(state: &AppState) -> serde_json::Value {
     use serde_json::json;
     let overrides = state.development_overrides;
@@ -5546,7 +5596,7 @@ fn provider_display(state: &AppState, provider: ProviderId) -> ProviderDisplay {
             state.copilot_weekly_text.as_str(),
         ),
     };
-    let mut display = ProviderDisplay {
+    let display = ProviderDisplay {
         session_percent,
         session_text: session_text.to_string(),
         weekly_percent,
@@ -5555,30 +5605,37 @@ fn provider_display(state: &AppState, provider: ProviderId) -> ProviderDisplay {
     #[cfg(not(debug_assertions))]
     let _ = provider;
     #[cfg(debug_assertions)]
-    {
+    let display = {
+        let mut display = display;
         let development = state.development_overrides[provider.index()];
         if development.enabled {
             if let Some(percent) = development.session_percent {
                 display.session_percent = percent;
-                display.session_text = development_percentage_text(percent, state.language);
+                display.session_text = development_percentage_text(percent, state.language, false);
             }
             if let Some(percent) = development.weekly_percent {
                 display.weekly_percent = percent;
-                display.weekly_text = development_percentage_text(percent, state.language);
+                display.weekly_text = development_percentage_text(percent, state.language, true);
             }
         }
-    }
+        display
+    };
     display
 }
 
 #[cfg(debug_assertions)]
-fn development_percentage_text(percent: f64, language: LanguageId) -> String {
+fn development_percentage_text(percent: f64, language: LanguageId, weekly: bool) -> String {
     let shown = if language == LanguageId::SimplifiedChinese {
         poller::remaining_percentage(percent)
     } else {
         percent
     };
-    format!("{shown:.0}%")
+    let strings = language.strings();
+    if weekly {
+        format!("{shown:.0}% · 7{}", strings.day_suffix)
+    } else {
+        format!("{shown:.0}% · 5{}", strings.hour_suffix)
+    }
 }
 
 fn settings_snapshot() -> serde_json::Value {
@@ -5601,14 +5658,14 @@ fn settings_snapshot() -> serde_json::Value {
     let grok = custom_color(s.appearance.grok_accent, grok_accent_color());
     let copilot = custom_color(s.appearance.copilot_accent, copilot_accent_color());
     let candidate = SettingsCandidate::from_app_state(s, startup);
-    let preview = widget_preview_image_with_development(
-        &candidate,
-        s.language,
-        s.is_dark,
-        &s.development_overrides,
-    );
+    let visibility = effective_provider_visibility(s);
+    #[cfg(debug_assertions)]
+    let preview =
+        widget_preview_image_impl(&candidate, s.language, s.is_dark, &s.development_overrides);
+    #[cfg(not(debug_assertions))]
+    let preview = widget_preview_image_impl(&candidate, s.language, s.is_dark);
     let availability = effective_provider_availability(s);
-    json!({
+    let snapshot = json!({
         "widget_preview_image":preview.as_ref().map(|image| image.0.as_str()),
         "widget_preview_width":preview.as_ref().map(|image| image.1),
         "widget_preview_height":preview.as_ref().map(|image| image.2),
@@ -5657,8 +5714,7 @@ fn settings_snapshot() -> serde_json::Value {
         "grok_available":availability.grok_available,
         "copilot_available":availability.copilot_available,
         "credential_availability":provider_availability_json(s.provider_availability),
-        "development_enabled":cfg!(debug_assertions),
-        "development_overrides":development_overrides_snapshot(s),
+        "effective_provider_visibility":provider_visibility_json(visibility),
         "effective_appearance":{"dark":dark,"claude_accent":[claude.r,claude.g,claude.b],"codex_accent":[codex.r,codex.g,codex.b],"antigravity_accent":[antigravity.r,antigravity.g,antigravity.b],"opencode_accent":[opencode.r,opencode.g,opencode.b],"cursor_accent":[cursor.r,cursor.g,cursor.b],"grok_accent":[grok.r,grok.g,grok.b],"copilot_accent":[copilot.r,copilot.g,copilot.b]},
         "update_busy":matches!(s.update_status, UpdateStatus::Checking | UpdateStatus::Applying),
         "update_available":update_available(&s.update_status),
@@ -5666,7 +5722,15 @@ fn settings_snapshot() -> serde_json::Value {
         "languages":LanguageId::ALL.iter().map(|l| json!({"code":l.code(),"name":l.native_name()})).collect::<Vec<_>>(),
         "update_status":version_action_label(s.language.strings(),s.language,s.install_channel,&s.update_status),
         "install_channel":match s.install_channel { InstallChannel::Portable => "portable", InstallChannel::Winget => "winget" }
-    })
+    });
+    #[cfg(debug_assertions)]
+    let snapshot = {
+        let mut snapshot = snapshot;
+        snapshot["development_enabled"] = json!(true);
+        snapshot["development_overrides"] = development_overrides_snapshot(s);
+        snapshot
+    };
+    snapshot
 }
 
 /// Return canonical settings with a draft bitmap, without changing or publishing state.
@@ -5674,6 +5738,7 @@ fn preview_settings_snapshot(
     changes: &[settings_ui::Change],
 ) -> Result<serde_json::Value, SettingsApplyError> {
     let snapshot = settings_snapshot();
+    #[cfg(debug_assertions)]
     let (current, availability, language, system_dark, development_overrides) = {
         let state = lock_state();
         let s = state
@@ -5690,6 +5755,22 @@ fn preview_settings_snapshot(
             s.development_overrides,
         )
     };
+    #[cfg(not(debug_assertions))]
+    let (current, availability, language, system_dark) = {
+        let state = lock_state();
+        let s = state
+            .as_ref()
+            .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
+        (
+            SettingsCandidate::from_app_state(
+                s,
+                snapshot["settings"]["startup"].as_bool().unwrap_or(false),
+            ),
+            effective_provider_availability(s),
+            s.language,
+            s.is_dark,
+        )
+    };
     let monitors = snapshot["monitors"]
         .as_array()
         .map(|values| {
@@ -5699,16 +5780,31 @@ fn preview_settings_snapshot(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    draft_settings_snapshot_with_development(
-        snapshot,
-        &current,
-        changes,
-        availability,
-        &monitors,
-        language,
-        system_dark,
-        &development_overrides,
-    )
+    #[cfg(debug_assertions)]
+    {
+        draft_settings_snapshot_impl(
+            snapshot,
+            &current,
+            changes,
+            availability,
+            &monitors,
+            language,
+            system_dark,
+            &development_overrides,
+        )
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        draft_settings_snapshot_impl(
+            snapshot,
+            &current,
+            changes,
+            availability,
+            &monitors,
+            language,
+            system_dark,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -5721,19 +5817,34 @@ fn draft_settings_snapshot(
     language: LanguageId,
     system_dark: bool,
 ) -> Result<serde_json::Value, SettingsApplyError> {
-    draft_settings_snapshot_with_development(
-        snapshot,
-        current,
-        changes,
-        availability,
-        monitors,
-        language,
-        system_dark,
-        &[DevelopmentOverride::default(); 7],
-    )
+    #[cfg(debug_assertions)]
+    {
+        draft_settings_snapshot_impl(
+            snapshot,
+            current,
+            changes,
+            availability,
+            monitors,
+            language,
+            system_dark,
+            &[DevelopmentOverride::default(); 7],
+        )
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        draft_settings_snapshot_impl(
+            snapshot,
+            current,
+            changes,
+            availability,
+            monitors,
+            language,
+            system_dark,
+        )
+    }
 }
 
-fn draft_settings_snapshot_with_development(
+fn draft_settings_snapshot_impl(
     mut snapshot: serde_json::Value,
     current: &SettingsCandidate,
     changes: &[settings_ui::Change],
@@ -5741,7 +5852,7 @@ fn draft_settings_snapshot_with_development(
     monitors: &[String],
     language: LanguageId,
     system_dark: bool,
-    development_overrides: &[DevelopmentOverride; 7],
+    #[cfg(debug_assertions)] development_overrides: &[DevelopmentOverride; 7],
 ) -> Result<serde_json::Value, SettingsApplyError> {
     let candidate =
         validate_settings_changes_with_availability(current, changes, availability, monitors)?;
@@ -5752,12 +5863,23 @@ fn draft_settings_snapshot_with_development(
             language
         }
     });
-    let preview = widget_preview_image_with_development(
-        &candidate,
-        language,
-        system_dark,
-        development_overrides,
-    );
+    #[cfg(debug_assertions)]
+    let preview =
+        widget_preview_image_impl(&candidate, language, system_dark, development_overrides);
+    #[cfg(not(debug_assertions))]
+    let preview = widget_preview_image_impl(&candidate, language, system_dark);
+    let visibility = [
+        candidate.show_claude_code,
+        candidate.show_codex,
+        candidate.show_antigravity,
+        candidate.show_opencode,
+        candidate.show_cursor,
+        candidate.show_grok,
+        candidate.show_copilot,
+    ];
+    #[cfg(debug_assertions)]
+    let visibility = development_provider_visibility(visibility, development_overrides);
+    snapshot["effective_provider_visibility"] = provider_visibility_json(visibility);
     snapshot["widget_preview_image"] =
         serde_json::json!(preview.as_ref().map(|image| image.0.as_str()));
     snapshot["widget_preview_width"] = serde_json::json!(preview.as_ref().map(|image| image.1));
@@ -5768,31 +5890,37 @@ fn draft_settings_snapshot_with_development(
 
 /// Paint deterministic sample quotas through the real widget renderer into an
 /// isolated top-down DIB. No window handles or live quota state are involved.
-fn preview_provider_display(
-    override_state: DevelopmentOverride,
-    language: LanguageId,
-    session_text: &str,
-    weekly_text: &str,
-) -> ProviderDisplay {
-    let mut display = ProviderDisplay {
+fn preview_provider_display(session_text: &str, weekly_text: &str) -> ProviderDisplay {
+    ProviderDisplay {
         session_percent: 18.0,
         session_text: session_text.to_string(),
         weekly_percent: 42.0,
         weekly_text: weekly_text.to_string(),
-    };
-    #[cfg(debug_assertions)]
+    }
+}
+
+#[cfg(debug_assertions)]
+fn preview_provider_display_with_development(
+    mut display: ProviderDisplay,
+    override_state: DevelopmentOverride,
+    language: LanguageId,
+) -> ProviderDisplay {
     if override_state.enabled {
         if let Some(percent) = override_state.session_percent {
             display.session_percent = percent;
-            display.session_text = development_percentage_text(percent, language);
+            display.session_text = development_percentage_text(percent, language, false);
+        } else if override_state.force_available {
+            display.session_text =
+                development_percentage_text(display.session_percent, language, false);
         }
         if let Some(percent) = override_state.weekly_percent {
             display.weekly_percent = percent;
-            display.weekly_text = development_percentage_text(percent, language);
+            display.weekly_text = development_percentage_text(percent, language, true);
+        } else if override_state.force_available {
+            display.weekly_text =
+                development_percentage_text(display.weekly_percent, language, true);
         }
     }
-    #[cfg(not(debug_assertions))]
-    let _ = (override_state, language);
     display
 }
 
@@ -5802,30 +5930,48 @@ fn widget_preview_image(
     language: LanguageId,
     system_dark: bool,
 ) -> Option<(String, i32, i32)> {
-    widget_preview_image_with_development(
-        candidate,
-        language,
-        system_dark,
-        &[DevelopmentOverride::default(); 7],
-    )
+    #[cfg(debug_assertions)]
+    {
+        widget_preview_image_impl(
+            candidate,
+            language,
+            system_dark,
+            &[DevelopmentOverride::default(); 7],
+        )
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        widget_preview_image_impl(candidate, language, system_dark)
+    }
 }
 
-fn widget_preview_image_with_development(
+fn widget_preview_image_impl(
     candidate: &SettingsCandidate,
     language: LanguageId,
     system_dark: bool,
-    development_overrides: &[DevelopmentOverride; 7],
+    #[cfg(debug_assertions)] development_overrides: &[DevelopmentOverride; 7],
 ) -> Option<(String, i32, i32)> {
     let appearance = candidate.appearance;
+    let visibility = [
+        candidate.show_claude_code,
+        candidate.show_codex,
+        candidate.show_antigravity,
+        candidate.show_opencode,
+        candidate.show_cursor,
+        candidate.show_grok,
+        candidate.show_copilot,
+    ];
+    #[cfg(debug_assertions)]
+    let visibility = development_provider_visibility(visibility, development_overrides);
     let width = total_widget_width_for(
         active_model_count(
-            candidate.show_claude_code,
-            candidate.show_codex,
-            candidate.show_antigravity,
-            candidate.show_opencode,
-            candidate.show_cursor,
-            candidate.show_grok,
-            candidate.show_copilot,
+            visibility[0],
+            visibility[1],
+            visibility[2],
+            visibility[3],
+            visibility[4],
+            visibility[5],
+            visibility[6],
         ),
         language,
         appearance,
@@ -5885,14 +6031,17 @@ fn widget_preview_image_with_development(
                 format!("42% · 3{}", strings.day_suffix),
             )
         };
+        #[cfg(debug_assertions)]
         let preview_values: [ProviderDisplay; 7] = std::array::from_fn(|index| {
-            preview_provider_display(
+            preview_provider_display_with_development(
+                preview_provider_display(&session, &weekly),
                 development_overrides[index],
                 language,
-                &session,
-                &weekly,
             )
         });
+        #[cfg(not(debug_assertions))]
+        let preview_values: [ProviderDisplay; 7] =
+            std::array::from_fn(|_| preview_provider_display(&session, &weekly));
         paint_content(
             dc,
             width,
@@ -5933,13 +6082,13 @@ fn widget_preview_image_with_development(
             &preview_values[6].session_text,
             preview_values[6].weekly_percent,
             &preview_values[6].weekly_text,
-            candidate.show_claude_code,
-            candidate.show_codex,
-            candidate.show_antigravity,
-            candidate.show_opencode,
-            candidate.show_cursor,
-            candidate.show_grok,
-            candidate.show_copilot,
+            visibility[0],
+            visibility[1],
+            visibility[2],
+            visibility[3],
+            visibility[4],
+            visibility[5],
+            visibility[6],
             candidate.show_provider_icons,
             candidate.show_session_window,
             candidate.show_weekly_window,
@@ -6044,6 +6193,7 @@ fn handle_settings_requests(hwnd: HWND) {
             let _ = pending.reply.try_send(reply);
             continue;
         }
+        #[cfg(debug_assertions)]
         let development_result = match &pending.request.operation {
             Operation::DevelopmentOverride {
                 provider,
@@ -6061,6 +6211,7 @@ fn handle_settings_requests(hwnd: HWND) {
             Operation::DevelopmentReset => Some(reset_development_overrides()),
             _ => None,
         };
+        #[cfg(debug_assertions)]
         if let Some(result) = development_result {
             let state = settings_snapshot();
             settings_ui::publish(state.clone());
@@ -6096,6 +6247,7 @@ fn handle_settings_requests(hwnd: HWND) {
                             Err(SettingsApplyError::new("save_failed", message))
                         })
                 }),
+            #[cfg(debug_assertions)]
             Operation::DevelopmentOverride { .. } | Operation::DevelopmentReset => {
                 unreachable!("development operations are handled before settings updates")
             }
@@ -6157,6 +6309,7 @@ fn setting_value<T: serde::de::DeserializeOwned>(
         .map_err(|error| invalid_setting(format!("Invalid setting value: {error}")))
 }
 
+#[cfg(debug_assertions)]
 fn apply_development_override(
     provider: settings_ui::DevelopmentProvider,
     enabled: bool,
@@ -6164,64 +6317,40 @@ fn apply_development_override(
     session_percent: Option<f64>,
     weekly_percent: Option<f64>,
 ) -> Result<(), SettingsApplyError> {
-    #[cfg(debug_assertions)]
-    {
-        for percent in [session_percent, weekly_percent].into_iter().flatten() {
-            if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
-                return Err(invalid_setting(
-                    "Development quota percentages must be between 0 and 100.",
-                ));
-            }
+    for percent in [session_percent, weekly_percent].into_iter().flatten() {
+        if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+            return Err(invalid_setting(
+                "Development quota percentages must be between 0 and 100.",
+            ));
         }
-        let mut state = lock_state();
-        let app_state = state
-            .as_mut()
-            .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
-        app_state.development_overrides[provider.index()] = DevelopmentOverride {
-            enabled,
-            force_available,
-            session_percent,
-            weekly_percent,
-        };
-        drop(state);
-        render_layered();
-        Ok(())
     }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = (
-            provider,
-            enabled,
-            force_available,
-            session_percent,
-            weekly_percent,
-        );
-        Err(SettingsApplyError::new(
-            "development_disabled",
-            "Development overrides are available only in debug builds.",
-        ))
-    }
+    let mut state = lock_state();
+    let app_state = state
+        .as_mut()
+        .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
+    app_state.development_overrides[provider.index()] = DevelopmentOverride {
+        enabled,
+        force_available,
+        session_percent,
+        weekly_percent,
+    };
+    drop(state);
+    position_at_taskbar();
+    render_layered();
+    Ok(())
 }
 
+#[cfg(debug_assertions)]
 fn reset_development_overrides() -> Result<(), SettingsApplyError> {
-    #[cfg(debug_assertions)]
-    {
-        let mut state = lock_state();
-        let app_state = state
-            .as_mut()
-            .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
-        app_state.development_overrides = [DevelopmentOverride::default(); 7];
-        drop(state);
-        render_layered();
-        Ok(())
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        Err(SettingsApplyError::new(
-            "development_disabled",
-            "Development overrides are available only in debug builds.",
-        ))
-    }
+    let mut state = lock_state();
+    let app_state = state
+        .as_mut()
+        .ok_or_else(|| SettingsApplyError::new("unavailable", "Widget is shutting down"))?;
+    app_state.development_overrides = [DevelopmentOverride::default(); 7];
+    drop(state);
+    position_at_taskbar();
+    render_layered();
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -7080,6 +7209,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             Some(s) => {
                 let display: [ProviderDisplay; 7] =
                     std::array::from_fn(|index| provider_display(s, ProviderId::ALL[index]));
+                let visibility = effective_provider_visibility(s);
                 (
                     s.is_dark,
                     s.appearance,
@@ -7113,13 +7243,13 @@ fn paint(hdc: HDC, hwnd: HWND) {
                     display[6].session_text.clone(),
                     display[6].weekly_percent,
                     display[6].weekly_text.clone(),
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_antigravity,
-                    s.show_opencode,
-                    s.show_cursor,
-                    s.show_grok,
-                    s.show_copilot,
+                    visibility[0],
+                    visibility[1],
+                    visibility[2],
+                    visibility[3],
+                    visibility[4],
+                    visibility[5],
+                    visibility[6],
                     s.show_provider_icons,
                     s.show_session_window,
                     s.show_weekly_window,
@@ -8084,6 +8214,45 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn development_visibility_and_quota_mocks_do_not_change_saved_provider_flags() {
+        let configured = [false, true, false, false, false, false, false];
+        let mut overrides = [DevelopmentOverride::default(); 7];
+        overrides[ProviderId::Claude.index()] = DevelopmentOverride {
+            enabled: true,
+            force_available: true,
+            ..DevelopmentOverride::default()
+        };
+        overrides[ProviderId::Antigravity.index()] = DevelopmentOverride {
+            enabled: false,
+            force_available: true,
+            ..DevelopmentOverride::default()
+        };
+        let visibility = development_provider_visibility(configured, &overrides);
+        assert_eq!(visibility, [true, true, false, false, false, false, false]);
+        assert_eq!(configured, [false, true, false, false, false, false, false]);
+        let effective_visibility = provider_visibility_json(visibility);
+        assert_eq!(effective_visibility["show_claude_code"], true);
+        assert_eq!(effective_visibility["show_codex"], true);
+
+        let preview = preview_provider_display_with_development(
+            preview_provider_display("18% · 5h", "42% · 7d"),
+            overrides[ProviderId::Claude.index()],
+            LanguageId::English,
+        );
+        assert_eq!(preview.session_text, "18% · 5h");
+        assert_eq!(preview.weekly_text, "42% · 7d");
+        assert_eq!(
+            development_percentage_text(35.0, LanguageId::English, false),
+            "35% · 5h"
+        );
+        assert_eq!(
+            development_percentage_text(72.0, LanguageId::English, true),
+            "72% · 7d"
+        );
+    }
+
     #[test]
     fn recommended_and_reset_appearance_restore_widget_defaults() {
         for a in [
@@ -8121,6 +8290,11 @@ mod tests {
         .unwrap();
         assert_eq!(draft["settings"], canonical["settings"]);
         assert_eq!(draft["effective_language"], canonical["effective_language"]);
+        assert_eq!(
+            draft["effective_provider_visibility"]["show_claude_code"],
+            false
+        );
+        assert_eq!(draft["effective_provider_visibility"]["show_codex"], true);
         assert_eq!(
             draft["effective_appearance"],
             canonical["effective_appearance"]

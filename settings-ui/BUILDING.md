@@ -43,6 +43,19 @@ in ignored `packages/`, `obj/`, and `bin/` directories.
 
 ## Build and publish
 
+`cargo run` builds a development-enabled native companion. In the Settings window,
+press **F12** to reveal the **Development** page. Apply temporary force-enabled
+providers and 5-hour/7-day usage percentages there; blank percentages use live
+values. Overrides affect the widget and Appearance previews, never credentials or
+saved preferences, and are cleared when the Rust app exits. **Reset all overrides**
+restores live data. Provider spacing is disabled when fewer than two providers are
+enabled.
+
+The development page, shortcut, and request handlers are compiled out of production
+builds. The VC project defaults to `QuotaDevelopmentUI=false`; only
+`scripts/build-settings-dev.ps1` explicitly builds with `QuotaDevelopmentUI=true`.
+Do not use a development-enabled payload for a release build.
+
 From the repository root in PowerShell, using the verified installation path:
 
 ```powershell

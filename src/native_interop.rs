@@ -2,6 +2,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use std::{cell::Cell, thread_local};
 
+use crate::diagnose;
+
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, POINT, RECT, SYSTEMTIME};
 use windows::Win32::Graphics::Gdi::{
@@ -430,13 +432,24 @@ pub fn reset_layered_surface(hwnd: HWND) -> bool {
 pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPosition) -> bool {
     unsafe {
         if !IsWindow(hwnd).as_bool() || position.width <= 0 || position.height <= 0 {
+            diagnose::log(format!(
+                "set_window_mode: rejected (window_alive={}, size={}x{})",
+                IsWindow(hwnd).as_bool(),
+                position.width,
+                position.height
+            ));
             return false;
         }
         if parent.is_some_and(|parent| !IsWindow(parent).as_bool()) {
+            diagnose::log("set_window_mode: rejected (taskbar parent window is gone)");
             return false;
         }
         let mut rect = RECT::default();
         if GetWindowRect(hwnd, &mut rect).is_err() {
+            diagnose::log(format!(
+                "set_window_mode: GetWindowRect failed: {}",
+                std::io::Error::last_os_error()
+            ));
             return false;
         }
         let old_parent = GetParent(hwnd).unwrap_or_default();
@@ -502,6 +515,7 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
         if ex_style_before_position & !(WS_EX_TOPMOST.0 as i32) != expected_ex_style_before_position
             || (parent.is_some() && GetWindowLongW(hwnd, GWL_STYLE) != style)
         {
+            diagnose::log("set_window_mode: style change refused before positioning");
             let _ = restore_window(hwnd, old);
             return false;
         }
@@ -519,6 +533,10 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
             )
             .is_err()
         {
+            diagnose::log(format!(
+                "set_window_mode: pre-parent SetWindowPos failed: {}",
+                std::io::Error::last_os_error()
+            ));
             let _ = restore_window(hwnd, old);
             return false;
         }
@@ -530,6 +548,10 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
             let _ = SetParent(hwnd, new_parent);
         }
         if !has_parent(hwnd, parent) {
+            diagnose::log(format!(
+                "set_window_mode: SetParent verification failed: {}",
+                std::io::Error::last_os_error()
+            ));
             let _ = restore_window(hwnd, old);
             return false;
         }
@@ -542,6 +564,7 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
             let _ = SetWindowLongW(hwnd, GWL_STYLE, style);
         }
         if GetWindowLongW(hwnd, GWL_STYLE) != style {
+            diagnose::log("set_window_mode: child style verification failed");
             let _ = restore_window(hwnd, old);
             return false;
         }
@@ -554,6 +577,10 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
             )
             .is_err()
         {
+            diagnose::log(format!(
+                "set_window_mode: SetLayeredWindowAttributes failed: {}",
+                std::io::Error::last_os_error()
+            ));
             let _ = restore_window(hwnd, old);
             return false;
         }
@@ -569,11 +596,22 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
         )
         .is_err()
         {
+            diagnose::log(format!(
+                "set_window_mode: final SetWindowPos failed: {}",
+                std::io::Error::last_os_error()
+            ));
             let _ = restore_window(hwnd, old);
             return false;
         }
         if GetWindowLongW(hwnd, GWL_EXSTYLE) != ex_style || GetWindowLongW(hwnd, GWL_STYLE) != style
         {
+            diagnose::log(format!(
+                "set_window_mode: final style verification failed (exstyle_actual={:#x} expected={:#x} style_actual={:#x} expected={:#x})",
+                GetWindowLongW(hwnd, GWL_EXSTYLE),
+                ex_style,
+                GetWindowLongW(hwnd, GWL_STYLE),
+                style
+            ));
             let _ = restore_window(hwnd, old);
             return false;
         }

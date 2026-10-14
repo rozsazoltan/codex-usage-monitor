@@ -4699,17 +4699,26 @@ fn taskbar_window_position(
     anchor_left: bool,
 ) -> Option<(native_interop::WindowPosition, i32)> {
     let width = widget_width.max(1);
-    let taskbar_height = (taskbar_rect.bottom - taskbar_rect.top).max(1);
+    let mut client_rect = RECT::default();
+    if unsafe { GetClientRect(taskbar_hwnd, &mut client_rect) }.is_err() {
+        return None;
+    }
+    let taskbar_height = client_rect.bottom - client_rect.top;
+    if taskbar_height <= 0 {
+        return None;
+    }
     let height = widget_height.max(1).min(taskbar_height);
     let max_offset = (tray_left - taskbar_rect.left - width).max(0);
     let offset = offset.clamp(0, max_offset);
     let screen_x = compute_anchor_x(taskbar_rect.left, tray_left, width, offset, anchor_left);
-    let screen_y = compute_anchor_y(taskbar_rect.top, taskbar_height, height);
-    let point = native_interop::screen_to_client(taskbar_hwnd, screen_x, screen_y)?;
+    // Explorer can move/hide its taskbar during fullscreen while AppBar still
+    // reports its normal screen rectangle. A child must stay in the live
+    // parent's client coordinates, not inherit that transient screen offset.
+    let point = native_interop::screen_to_client(taskbar_hwnd, screen_x, taskbar_rect.top)?;
     Some((
         native_interop::WindowPosition {
             x: point.x,
-            y: point.y,
+            y: compute_anchor_y(client_rect.top, taskbar_height, height),
             width,
             height,
         },
@@ -5378,6 +5387,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_RBUTTONUP => {
+            diagnose::log("context menu requested from widget");
             show_context_menu(hwnd);
             LRESULT(0)
         }
@@ -5386,6 +5396,10 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_COMMAND => {
+            diagnose::log(format!(
+                "widget command received id={}",
+                wparam.0 as u16
+            ));
             handle_command(hwnd, wparam.0 as u16);
             publish_settings();
             LRESULT(0)
@@ -5396,6 +5410,7 @@ unsafe extern "system" fn wnd_proc(
                     toggle_widget_visibility(hwnd);
                 }
                 tray_icon::TrayAction::ShowContextMenu => {
+                    diagnose::log("context menu requested from tray");
                     show_context_menu(hwnd);
                 }
                 tray_icon::TrayAction::None => {}
@@ -5447,6 +5462,33 @@ fn open_settings(hwnd: HWND, page: Page) {
     }
 }
 
+/// Forwards a picked context-menu command to the widget window. The widget
+/// itself is a WS_CHILD of Explorer's taskbar and a child window can never
+/// become the foreground window, which TrackPopupMenu requires — without a
+/// foreground owner the menu dismisses itself instantly. The menu is hosted
+/// on a throwaway top-level popup instead; commands arrive here and are
+/// relayed so the existing WM_COMMAND handling stays untouched.
+unsafe extern "system" fn menu_owner_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_COMMAND {
+        let target = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut core::ffi::c_void);
+        diagnose::log(format!(
+            "context menu command picked id={} target_valid={}",
+            (wparam.0 & 0xffff) as u16,
+            !target.is_invalid()
+        ));
+        if !target.is_invalid() {
+            let _ = SendMessageW(target, WM_COMMAND, wparam, lparam);
+        }
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
 fn show_settings_menu(hwnd: HWND) {
     let (strings, visible) = {
         let state = lock_state();
@@ -5480,9 +5522,70 @@ fn show_settings_menu(hwnd: HWND) {
         }
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
-        let _ = SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, None);
-        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        // Host the menu on a temporary top-level popup: the embedded widget
+        // cannot take the foreground, so TrackPopupMenu owned by it would
+        // vanish before the user can pick anything.
+        let class_name = native_interop::wide_str("QuotaUsageMenuOwner");
+        let hinstance = GetModuleHandleW(PCWSTR::null())
+            .map(|handle| HINSTANCE(handle.0))
+            .unwrap_or_default();
+        let _ = RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(menu_owner_proc),
+            hInstance: hinstance,
+            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+            ..Default::default()
+        });
+        let owner = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        );
+        let owner = match owner {
+            Ok(owner) => {
+                SetWindowLongPtrW(owner, GWLP_USERDATA, hwnd.0 as isize);
+                owner
+            }
+            Err(error) => {
+                diagnose::log(format!(
+                    "context menu owner fallback to widget: {error}"
+                ));
+                hwnd
+            }
+        };
+        let foreground = SetForegroundWindow(owner);
+        // TPM_RETURNCMD hands the picked item id back directly instead of
+        // routing WM_COMMAND through the owner window, which proved
+        // unreliable while the widget lives inside Explorer's taskbar.
+        let picked = TrackPopupMenuEx(
+            menu,
+            TPM_RIGHTBUTTON.0 | TPM_RETURNCMD.0,
+            point.x,
+            point.y,
+            owner,
+            None,
+        );
+        diagnose::log(format!(
+            "context menu popup result foreground_set={} picked={} error={}",
+            foreground.as_bool(),
+            picked.0,
+            std::io::Error::last_os_error()
+        ));
+        if picked.0 != 0 {
+            let _ = SendMessageW(hwnd, WM_COMMAND, WPARAM(picked.0 as usize), LPARAM(0));
+        }
+        let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
+        if owner != hwnd {
+            let _ = DestroyWindow(owner);
+        }
         let _ = DestroyMenu(menu);
     }
 }
@@ -9556,6 +9659,24 @@ mod tests {
         assert!(changed);
         assert!(!settings.show_claude_code);
         assert!(settings.show_codex);
+    }
+
+    #[test]
+    fn embedded_position_ignores_stale_fullscreen_taskbar_screen_y() {
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0), windows::core::w!("STATIC"),
+                windows::core::w!("fullscreen-placement-test"), WS_POPUP,
+                0, -100, 800, 48, None, None, None, None,
+            ).unwrap();
+            let normal_rect = RECT { left: 0, top: 1032, right: 800, bottom: 1080 };
+            let (position, _) = taskbar_window_position(
+                parent, normal_rect, 200, 40, 700, 0, false,
+            ).unwrap();
+            assert_eq!(position.y, 8);
+            assert!(position.y + position.height <= 48);
+            let _ = DestroyWindow(parent);
+        }
     }
 
     #[test]

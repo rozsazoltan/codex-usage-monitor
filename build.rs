@@ -11,7 +11,7 @@ fn main() {
     res.set_icon("src/icons/redesign/quota-usage-monitor.ico")
         .set("CompanyName", "datarose.net")
         .set("ProductName", "Quota Usage Monitor")
-        .set("FileDescription", "Lightweight, portable, easy-to-use, customizable, open-source usage monitor for Claude, Codex, and many other providers")
+        .set("FileDescription", "Quota Usage Monitor")
         .set("FileVersion", version)
         .set("ProductVersion", version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)

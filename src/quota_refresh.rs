@@ -220,15 +220,12 @@ mod tests {
         }
     }
     #[test]
-    fn low_quota_accelerates_and_recovery_restores_the_base_interval() {
+    fn poll_interval_accelerates_only_for_live_low_quota() {
         assert_eq!(interval_ms(900_000, true, [&usage(98.0, 13.0)]), 60_000);
         assert_eq!(interval_ms(900_000, true, [&usage(80.0, 13.0)]), 60_000);
         assert_eq!(interval_ms(900_000, true, [&usage(79.0, 13.0)]), 900_000);
         assert_eq!(interval_ms(30_000, true, [&usage(98.0, 13.0)]), 30_000);
         assert_eq!(interval_ms(900_000, false, [&usage(98.0, 13.0)]), 900_000);
-    }
-    #[test]
-    fn missing_and_exhausted_windows_do_not_accelerate() {
         assert_eq!(interval_ms(900_000, true, [&UsageData::default()]), 900_000);
         assert_eq!(interval_ms(900_000, true, [&usage(98.0, 100.0)]), 900_000);
         assert_eq!(
@@ -260,15 +257,13 @@ mod tests {
         assert_eq!(percentage, "2% 01:59重置 *");
     }
     #[test]
-    fn polls_cannot_overlap_and_the_guard_is_released() {
+    fn poll_gate_coalesces_requests_and_releases_workers() {
         let gate = PollGate::new();
         let guard = gate.request(true).unwrap();
         assert!(gate.request(true).is_none());
         drop(guard);
         assert!(gate.request(true).is_some());
-    }
-    #[test]
-    fn clicks_coalesce_and_finishing_cannot_release_a_new_worker() {
+
         let gate = PollGate::new();
         let mut guard = gate.request(true).unwrap();
         for _ in 0..100 {
@@ -281,9 +276,7 @@ mod tests {
         assert!(gate.request(true).is_none());
         drop(next);
         assert!(gate.request(true).is_some());
-    }
-    #[test]
-    fn periodic_ticks_do_not_queue_a_retry_that_bypasses_backoff() {
+
         let gate = PollGate::new();
         let mut guard = gate.request(false).unwrap();
         assert!(gate.request(false).is_none());

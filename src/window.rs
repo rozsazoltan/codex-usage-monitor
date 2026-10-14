@@ -8255,23 +8255,26 @@ mod tests {
             .is_err());
         }
 
-        let small = Appearance::default();
+        // Appearance::default() ships Normal spacing: measure the preset
+        // deltas against that baseline instead of assuming Small.
+        let normal = Appearance::default();
+        assert_eq!(normal.provider_spacing, ProviderSpacing::Normal);
         let none = Appearance {
             provider_spacing: ProviderSpacing::None,
-            ..small
+            ..normal
         };
         let large = Appearance {
             provider_spacing: ProviderSpacing::Large,
-            ..small
+            ..normal
         };
-        let small_width = total_widget_width_for(2, LanguageId::English, small);
+        let normal_width = total_widget_width_for(2, LanguageId::English, normal);
         assert_eq!(
             total_widget_width_for(2, LanguageId::English, none),
-            small_width - sc(2)
+            normal_width - (sc(7) - sc(2))
         );
         assert_eq!(
             total_widget_width_for(2, LanguageId::English, large),
-            small_width + sc(7)
+            normal_width + (sc(11) - sc(7))
         );
     }
 
@@ -8662,6 +8665,18 @@ mod tests {
             value: json!("false"),
         };
         assert!(validate_settings_changes(&current, &[invalid], false, &[]).is_err());
+
+        let settings = SettingsFile {
+            settings_pane_open: false,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
+        let legacy: SettingsFile = serde_json::from_str(&test_settings_json("en")).unwrap();
+
+        assert!(!restored.settings_pane_open);
+        assert!(legacy.settings_pane_open);
+        assert!(serde_json::from_str::<SettingsFile>(r#"{"settings_pane_open":"false"}"#).is_err());
     }
 
     #[test]
@@ -9052,7 +9067,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_batch_provider_changes_validate_against_final_candidate_in_either_order() {
+    fn settings_batches_validate_against_final_candidate_in_either_order() {
         use serde_json::json;
         let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
         let codex_off = settings_ui::Change {
@@ -9072,11 +9087,7 @@ mod tests {
             assert!(!candidate.show_codex);
             assert!(candidate.show_claude_code);
         }
-    }
 
-    #[test]
-    fn settings_batch_window_changes_validate_against_final_candidate_in_either_order() {
-        use serde_json::json;
         let current = SettingsCandidate::from_settings(
             &SettingsFile {
                 show_session_window: true,
@@ -9160,8 +9171,30 @@ mod tests {
     }
 
     #[test]
-    fn per_provider_marks_and_bar_colors_accept_valid_values() {
+    fn per_provider_marks_and_bar_colors() {
         use serde_json::json;
+        let defaults = Appearance::default();
+        assert!(defaults.show_claude_icon);
+        assert!(defaults.show_codex_icon);
+        assert!(defaults.show_antigravity_icon);
+        assert!(defaults.show_opencode_icon);
+        assert!(defaults.show_cursor_icon);
+        assert!(defaults.show_grok_icon);
+        assert!(defaults.show_copilot_icon);
+        assert_eq!(defaults.antigravity_accent, None);
+        assert_eq!(defaults.opencode_accent, None);
+        assert_eq!(defaults.cursor_accent, None);
+        assert_eq!(defaults.grok_accent, None);
+        assert_eq!(defaults.copilot_accent, None);
+
+        let legacy: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert!(legacy.appearance.show_opencode_icon);
+        assert!(legacy.appearance.show_cursor_icon);
+        assert!(legacy.appearance.show_grok_icon);
+        assert!(legacy.appearance.show_copilot_icon);
+        assert_eq!(legacy.appearance.antigravity_accent, None);
+        assert_eq!(legacy.appearance.copilot_accent, None);
+
         let current = SettingsCandidate::from_settings(&SettingsFile::default(), false);
         let candidate = validate_settings_changes(
             &current,
@@ -9362,31 +9395,6 @@ mod tests {
     }
 
     #[test]
-    fn per_provider_marks_default_to_visible_with_no_custom_bar_colors() {
-        let defaults = Appearance::default();
-        assert!(defaults.show_claude_icon);
-        assert!(defaults.show_codex_icon);
-        assert!(defaults.show_antigravity_icon);
-        assert!(defaults.show_opencode_icon);
-        assert!(defaults.show_cursor_icon);
-        assert!(defaults.show_grok_icon);
-        assert!(defaults.show_copilot_icon);
-        assert_eq!(defaults.antigravity_accent, None);
-        assert_eq!(defaults.opencode_accent, None);
-        assert_eq!(defaults.cursor_accent, None);
-        assert_eq!(defaults.grok_accent, None);
-        assert_eq!(defaults.copilot_accent, None);
-
-        let legacy: SettingsFile = serde_json::from_str("{}").unwrap();
-        assert!(legacy.appearance.show_opencode_icon);
-        assert!(legacy.appearance.show_cursor_icon);
-        assert!(legacy.appearance.show_grok_icon);
-        assert!(legacy.appearance.show_copilot_icon);
-        assert_eq!(legacy.appearance.antigravity_accent, None);
-        assert_eq!(legacy.appearance.copilot_accent, None);
-    }
-
-    #[test]
     fn custom_provider_colors_survive_settings_round_trip() {
         let settings = SettingsFile {
             appearance: Appearance {
@@ -9436,20 +9444,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_pane_open_defaults_true_and_round_trips_as_a_boolean() {
-        let settings = SettingsFile {
-            settings_pane_open: false,
-            ..SettingsFile::default()
-        };
-        let json = serde_json::to_string(&settings).unwrap();
-        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
-        let legacy: SettingsFile = serde_json::from_str(&test_settings_json("en")).unwrap();
-
-        assert!(!restored.settings_pane_open);
-        assert!(legacy.settings_pane_open);
-        assert!(serde_json::from_str::<SettingsFile>(r#"{"settings_pane_open":"false"}"#).is_err());
-    }
-
     #[test]
     fn chosen_monitor_device_survives_settings_round_trip() {
         let settings = SettingsFile {

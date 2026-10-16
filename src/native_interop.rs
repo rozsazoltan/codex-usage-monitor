@@ -12,7 +12,6 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Window style constants
@@ -194,29 +193,9 @@ pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
     }
 }
 
-/// Get taskbar position via SHAppBarMessage
+/// Query the taskbar without synchronously waiting for Explorer's message loop.
 pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
-    unsafe {
-        let mut class_name = [0u16; 64];
-        let len = GetClassNameW(taskbar_hwnd, &mut class_name);
-        if len > 0 {
-            let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
-            if class_name == "Shell_SecondaryTrayWnd" {
-                return get_window_rect_safe(taskbar_hwnd);
-            }
-        }
-
-        let mut abd = APPBARDATA {
-            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-            hWnd: taskbar_hwnd,
-            ..Default::default()
-        };
-        let result = SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd);
-        if result == 0 {
-            return None;
-        }
-        Some(abd.rc)
-    }
+    get_window_rect_safe(taskbar_hwnd)
 }
 
 /// Get the bounding rectangle of a window
@@ -400,29 +379,65 @@ pub fn reset_layered_surface(hwnd: HWND) -> bool {
                 return false;
             }
             let position = WindowPosition {
-                x: rect.left, y: rect.top,
-                width: rect.right - rect.left, height: rect.bottom - rect.top,
+                x: rect.left,
+                y: rect.top,
+                width: rect.right - rect.left,
+                height: rect.bottom - rect.top,
             };
-            // Resetting the layered style on an Explorer child may be refused.
-            // The existing popup-to-child transition resets it while top-level.
-            if !set_window_mode(hwnd, None, position)
-                || !set_window_mode(hwnd, Some(parent), WindowPosition {
-                    x: point.x, y: point.y, ..position
-                })
+            // Explorer may refuse to reset the layered style on its child;
+            // transition through top-level mode without applying constant alpha.
+            if !set_window_mode_inner(hwnd, None, position, false)
+                || !set_window_mode_inner(
+                    hwnd,
+                    Some(parent),
+                    WindowPosition { x: point.x, y: point.y, ..position },
+                    false,
+                )
             {
                 let _ = restore_window(hwnd, old);
                 return false;
             }
             return true;
         }
-        let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as i32));
-        if GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED.0 as i32 != 0 {
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
             return false;
         }
-        let expected = style | WS_EX_LAYERED.0 as i32;
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, expected);
-        GetWindowLongW(hwnd, GWL_EXSTYLE) == expected
+        let old = WindowSnapshot {
+            parent: GetParent(hwnd).unwrap_or_default(),
+            style: GetWindowLongW(hwnd, GWL_STYLE),
+            ex_style: GetWindowLongW(hwnd, GWL_EXSTYLE),
+            rect,
+            visible: IsWindowVisible(hwnd).as_bool(),
+        };
+        let without_layered = old.ex_style & !(WS_EX_LAYERED.0 as i32);
+        let position = || {
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            )
+            .is_ok()
+        };
+
+        // Reset the layered style in place. Routing a child through floating
+        // mode calls SetLayeredWindowAttributes, which makes subsequent
+        // UpdateLayeredWindow calls incompatible with the per-pixel surface.
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, without_layered);
+        if GetWindowLongW(hwnd, GWL_EXSTYLE) != without_layered || !position() {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style);
+        if GetWindowLongW(hwnd, GWL_EXSTYLE) != old.ex_style || !position() {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+        true
     }
 }
 
@@ -430,6 +445,15 @@ pub fn reset_layered_surface(hwnd: HWND) -> bool {
 /// the coordinate space of its new parent. Native failures restore the prior
 /// parent, styles, rectangle, z-order, and visibility.
 pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPosition) -> bool {
+    set_window_mode_inner(hwnd, parent, position, true)
+}
+
+fn set_window_mode_inner(
+    hwnd: HWND,
+    parent: Option<HWND>,
+    position: WindowPosition,
+    set_constant_alpha: bool,
+) -> bool {
     unsafe {
         if !IsWindow(hwnd).as_bool() || position.width <= 0 || position.height <= 0 {
             diagnose::log(format!(
@@ -487,14 +511,50 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
             )
         };
 
+        // Detach while still WS_CHILD. Changing it to WS_POPUP first can
+        // reinterpret the Explorer parent as an owner (including its topmost
+        // band), and layered-style changes may be refused while attached.
+        if parent_changed && old.style as u32 & WS_CHILD_STYLE != 0 {
+            let _ = SetParent(hwnd, HWND::default());
+            let popup_style = ((old.style as u32 & !WS_CHILD_STYLE) | WS_POPUP_STYLE) as i32;
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, popup_style);
+            if !has_parent(hwnd, None) || !has_style(hwnd, popup_style, false) {
+                diagnose::log("set_window_mode: detach verification failed");
+                let _ = restore_window(hwnd, old);
+                return false;
+            }
+        }
+        // Clear the z-order band while top-level, before setting WS_CHILD or
+        // attaching to a topmost Explorer window. Clearing the bit alone does
+        // not change the actual z-order band.
+        if parent_changed
+            && SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            )
+            .is_err()
+        {
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+
         if parent.is_some() {
             // Reset WS_EX_LAYERED while still top-level so the next
             // UpdateLayeredWindow call can replace the popup's alpha mode.
             if parent_changed
-                && old_parent.is_invalid()
                 && old.ex_style & WS_EX_LAYERED.0 as i32 != 0
             {
                 let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style & !(WS_EX_LAYERED.0 as i32));
+                if GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED.0 as i32 != 0 {
+                    diagnose::log("set_window_mode: layered reset refused while detached");
+                    let _ = restore_window(hwnd, old);
+                    return false;
+                }
             }
             if GetWindowLongW(hwnd, GWL_EXSTYLE) != ex_style {
                 let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
@@ -521,7 +581,7 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
         }
 
         if parent.is_some()
-            && parent_changed
+            && GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as i32 != 0
             && SetWindowPos(
                 hwnd,
                 HWND_NOTOPMOST,
@@ -568,7 +628,8 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
             let _ = restore_window(hwnd, old);
             return false;
         }
-        if parent.is_none()
+        if set_constant_alpha
+            && parent.is_none()
             && SetLayeredWindowAttributes(
                 hwnd,
                 windows::Win32::Foundation::COLORREF(0),

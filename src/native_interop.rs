@@ -263,11 +263,12 @@ unsafe fn has_style(hwnd: HWND, expected: i32, is_child: bool) -> bool {
 }
 
 unsafe fn restore_window(hwnd: HWND, old: WindowSnapshot) -> bool {
+    log_window_transition("rollback begin", hwnd, Some(old.parent));
     let old_parent = (!old.parent.is_invalid()).then_some(old.parent);
     let current_parent = GetParent(hwnd).unwrap_or_default();
     let parent_changed = current_parent != old.parent;
     let topmost_cleared = if old_parent.is_some() && current_parent.is_invalid() {
-        SetWindowPos(
+        let cleared = SetWindowPos(
             hwnd,
             HWND_NOTOPMOST,
             0,
@@ -275,8 +276,11 @@ unsafe fn restore_window(hwnd: HWND, old: WindowSnapshot) -> bool {
             0,
             0,
             SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-        )
-        .is_ok()
+        );
+        if diagnose::is_enabled() {
+            diagnose::log(format!("rollback: HWND_NOTOPMOST result={cleared:?}"));
+        }
+        cleared.is_ok()
     } else {
         true
     };
@@ -288,7 +292,10 @@ unsafe fn restore_window(hwnd: HWND, old: WindowSnapshot) -> bool {
         if old.ex_style & WS_EX_LAYERED.0 as i32 != 0 {
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style & !(WS_EX_LAYERED.0 as i32));
         }
-        let _ = SetParent(hwnd, HWND::default());
+        let restored_parent = SetParent(hwnd, HWND::default());
+        if diagnose::is_enabled() {
+            diagnose::log(format!("rollback: detach SetParent result={restored_parent:?}"));
+        }
         if GetWindowLongW(hwnd, GWL_STYLE) != old.style {
             let _ = SetWindowLongW(hwnd, GWL_STYLE, old.style);
         }
@@ -304,7 +311,10 @@ unsafe fn restore_window(hwnd: HWND, old: WindowSnapshot) -> bool {
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style);
         }
         if parent_changed {
-            let _ = SetParent(hwnd, old.parent);
+            let restored_parent = SetParent(hwnd, old.parent);
+            if diagnose::is_enabled() {
+                diagnose::log(format!("rollback: restore SetParent result={restored_parent:?}"));
+            }
         }
     }
     let parent = has_parent(hwnd, old_parent);
@@ -334,8 +344,8 @@ unsafe fn restore_window(hwnd: HWND, old: WindowSnapshot) -> bool {
     } else {
         HWND_NOTOPMOST
     };
-    let positioned = coordinates
-        && SetWindowPos(
+    let positioned = coordinates && {
+        let result = SetWindowPos(
             hwnd,
             insert_after,
             point.x,
@@ -343,8 +353,12 @@ unsafe fn restore_window(hwnd: HWND, old: WindowSnapshot) -> bool {
             old.rect.right - old.rect.left,
             old.rect.bottom - old.rect.top,
             SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        )
-        .is_ok();
+        );
+        if diagnose::is_enabled() {
+            diagnose::log(format!("rollback: final SetWindowPos result={result:?}"));
+        }
+        result.is_ok()
+    };
     let style = has_style(hwnd, old.style, old_parent.is_some());
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) == old.ex_style;
     if old.visible {
@@ -352,11 +366,92 @@ unsafe fn restore_window(hwnd: HWND, old: WindowSnapshot) -> bool {
     } else {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
-    style && ex_style && parent && positioned && topmost_cleared
+    let restored = style && ex_style && parent && positioned && topmost_cleared;
+    if diagnose::is_enabled() {
+        diagnose::log(format!("rollback result: restored={restored} style={style} ex_style={ex_style} parent={parent} positioned={positioned} topmost_cleared={topmost_cleared}"));
+    }
+    log_window_transition("rollback end", hwnd, Some(old.parent));
+    restored
+}
+
+/// Snapshot only explicit recovery/transition boundaries, never routine paints.
+pub fn log_window_transition(phase: &str, hwnd: HWND, target_parent: Option<HWND>) {
+    if !diagnose::is_enabled() {
+        return;
+    }
+    unsafe {
+        diagnose::log(format!(
+            "window transition: phase={phase} hwnd={hwnd:?} alive={} parent={:?} owner={:?} style={:#x} exstyle={:#x} target_parent={:?}",
+            IsWindow(hwnd).as_bool(),
+            GetParent(hwnd).unwrap_or_default(),
+            GetWindow(hwnd, GW_OWNER).unwrap_or_default(),
+            GetWindowLongW(hwnd, GWL_STYLE),
+            GetWindowLongW(hwnd, GWL_EXSTYLE),
+            target_parent.unwrap_or_default(),
+        ));
+    }
+}
+
+/// Apply a style change so it takes effect immediately. SetWindowLongW only
+/// stores the new bits; without SWP_FRAMECHANGED the window manager can keep
+/// acting on the previous state (observed as a stuck topmost band after a
+/// Task View detach).
+unsafe fn apply_style(hwnd: HWND, style: i32) -> bool {
+    if has_style(hwnd, style, false) {
+        return true;
+    }
+    let _ = SetWindowLongW(hwnd, GWL_STYLE, style);
+    SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+    )
+    .is_ok()
+        && has_style(hwnd, style, false)
+}
+
+/// Clear a WS_EX_TOPMOST bit left behind by shell transitions (notably Task
+/// View). SetWindowPos(HWND_NOTOPMOST) alone can report success while the bit
+/// stays set on a window the shell is still settling; clearing the bit
+/// explicitly and re-applying with SWP_FRAMECHANGED recovers. A stuck bit
+/// poisons later UpdateLayeredWindow calls, so callers must fail rather than
+/// attach a poisoned window. Returns true when the bit is gone.
+unsafe fn clear_stuck_topmost(hwnd: HWND) -> bool {
+    for _ in 0..3 {
+        if GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as i32 == 0 {
+            return true;
+        }
+        let cleared = GetWindowLongW(hwnd, GWL_EXSTYLE) & !(WS_EX_TOPMOST.0 as i32);
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, cleared);
+        let repositioned = SetWindowPos(
+            hwnd,
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED,
+        );
+        if diagnose::is_enabled() {
+            diagnose::log(format!(
+                "topmost clear attempt: result={repositioned:?} exstyle={:#x}",
+                GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ));
+        }
+        if repositioned.is_err() {
+            return false;
+        }
+    }
+    GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as i32 == 0
 }
 
 /// Clear incompatible constant-alpha state before retrying a per-pixel update.
 pub fn reset_layered_surface(hwnd: HWND) -> bool {
+    log_window_transition("surface reset begin", hwnd, None);
     unsafe {
         if !IsWindow(hwnd).as_bool() {
             return false;
@@ -394,9 +489,11 @@ pub fn reset_layered_surface(hwnd: HWND) -> bool {
                     false,
                 )
             {
+                log_window_transition("surface reset transition failed", hwnd, Some(parent));
                 let _ = restore_window(hwnd, old);
                 return false;
             }
+            log_window_transition("surface reset child complete", hwnd, Some(parent));
             return true;
         }
         let mut rect = RECT::default();
@@ -428,15 +525,18 @@ pub fn reset_layered_surface(hwnd: HWND) -> bool {
         // mode calls SetLayeredWindowAttributes, which makes subsequent
         // UpdateLayeredWindow calls incompatible with the per-pixel surface.
         let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, without_layered);
+        log_window_transition("surface reset layered cleared", hwnd, None);
         if GetWindowLongW(hwnd, GWL_EXSTYLE) != without_layered || !position() {
             let _ = restore_window(hwnd, old);
             return false;
         }
         let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, old.ex_style);
+        log_window_transition("surface reset layered restored", hwnd, None);
         if GetWindowLongW(hwnd, GWL_EXSTYLE) != old.ex_style || !position() {
             let _ = restore_window(hwnd, old);
             return false;
         }
+        log_window_transition("surface reset popup complete", hwnd, None);
         true
     }
 }
@@ -454,6 +554,7 @@ fn set_window_mode_inner(
     position: WindowPosition,
     set_constant_alpha: bool,
 ) -> bool {
+    log_window_transition("mode change begin", hwnd, parent);
     unsafe {
         if !IsWindow(hwnd).as_bool() || position.width <= 0 || position.height <= 0 {
             diagnose::log(format!(
@@ -515,30 +616,41 @@ fn set_window_mode_inner(
         // reinterpret the Explorer parent as an owner (including its topmost
         // band), and layered-style changes may be refused while attached.
         if parent_changed && old.style as u32 & WS_CHILD_STYLE != 0 {
-            let _ = SetParent(hwnd, HWND::default());
+            log_window_transition("before detach", hwnd, parent);
+            let detached = SetParent(hwnd, HWND::default());
+            if diagnose::is_enabled() {
+                // A null previous parent is ambiguous in this API; retain the
+                // raw binding result alongside the actual parent snapshot.
+                diagnose::log(format!("mode change: detach SetParent result={detached:?}"));
+            }
+            log_window_transition("after detach", hwnd, parent);
             let popup_style = ((old.style as u32 & !WS_CHILD_STYLE) | WS_POPUP_STYLE) as i32;
-            let _ = SetWindowLongW(hwnd, GWL_STYLE, popup_style);
+            if !apply_style(hwnd, popup_style) {
+                diagnose::log("set_window_mode: detached popup style refused");
+                let _ = restore_window(hwnd, old);
+                return false;
+            }
+            log_window_transition("after detached popup style", hwnd, parent);
             if !has_parent(hwnd, None) || !has_style(hwnd, popup_style, false) {
                 diagnose::log("set_window_mode: detach verification failed");
+                let _ = restore_window(hwnd, old);
+                return false;
+            }
+            // The shell can leave WS_EX_TOPMOST behind on the detached window
+            // (observed after Task View); carrying it along poisons the
+            // surface, so clear it while top-level and re-verify the detach.
+            if !clear_stuck_topmost(hwnd) || !has_parent(hwnd, None) {
+                diagnose::log("set_window_mode: detached topmost state could not be cleared");
                 let _ = restore_window(hwnd, old);
                 return false;
             }
         }
         // Clear the z-order band while top-level, before setting WS_CHILD or
         // attaching to a topmost Explorer window. Clearing the bit alone does
-        // not change the actual z-order band.
-        if parent_changed
-            && SetWindowPos(
-                hwnd,
-                HWND_NOTOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-            )
-            .is_err()
-        {
+        // not change the actual z-order band, and a reported success alone
+        // does not prove the bit is gone.
+        if parent_changed && !clear_stuck_topmost(hwnd) {
+            diagnose::log("set_window_mode: pre-attach topmost state could not be cleared");
             let _ = restore_window(hwnd, old);
             return false;
         }
@@ -580,23 +692,14 @@ fn set_window_mode_inner(
             return false;
         }
 
+        // Drop a topmost band picked up while attached before re-attaching:
+        // the band comes from the Explorer parent, while an explicit bit on
+        // the child breaks UpdateLayeredWindow.
         if parent.is_some()
             && GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as i32 != 0
-            && SetWindowPos(
-                hwnd,
-                HWND_NOTOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-            )
-            .is_err()
+            && !clear_stuck_topmost(hwnd)
         {
-            diagnose::log(format!(
-                "set_window_mode: pre-parent SetWindowPos failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            diagnose::log("set_window_mode: pre-parent topmost state could not be cleared");
             let _ = restore_window(hwnd, old);
             return false;
         }
@@ -605,13 +708,28 @@ fn set_window_mode_inner(
         // null) and failure. Verify the resulting parent instead of trusting
         // the windows crate's Result conversion of that ambiguous return.
         if parent_changed {
-            let _ = SetParent(hwnd, new_parent);
+            let attached = SetParent(hwnd, new_parent);
+            if diagnose::is_enabled() {
+                diagnose::log(format!("mode change: target SetParent result={attached:?}"));
+            }
+            log_window_transition("after target SetParent", hwnd, parent);
         }
         if !has_parent(hwnd, parent) {
             diagnose::log(format!(
                 "set_window_mode: SetParent verification failed: {}",
                 std::io::Error::last_os_error()
             ));
+            let _ = restore_window(hwnd, old);
+            return false;
+        }
+        // Attaching to a topmost Explorer window can force the band bit back
+        // onto the child. The band comes from the parent; an explicit bit on
+        // the child breaks UpdateLayeredWindow, so clear and re-verify it.
+        if parent.is_some()
+            && GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as i32 != 0
+            && !clear_stuck_topmost(hwnd)
+        {
+            diagnose::log("set_window_mode: attach forced an uncleared topmost bit");
             let _ = restore_window(hwnd, old);
             return false;
         }
@@ -646,7 +764,7 @@ fn set_window_mode_inner(
             return false;
         }
 
-        if SetWindowPos(
+        let positioned = SetWindowPos(
             hwnd,
             insert_after,
             position.x,
@@ -654,18 +772,21 @@ fn set_window_mode_inner(
             position.width,
             position.height,
             SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        )
-        .is_err()
-        {
+        );
+        if diagnose::is_enabled() {
+            diagnose::log(format!("mode change: final SetWindowPos insert_after={insert_after:?} result={positioned:?}"));
+        }
+        log_window_transition("after final SetWindowPos", hwnd, parent);
+        if let Err(error) = positioned {
             diagnose::log(format!(
-                "set_window_mode: final SetWindowPos failed: {}",
-                std::io::Error::last_os_error()
+                "set_window_mode: final SetWindowPos failed: {error}"
             ));
             let _ = restore_window(hwnd, old);
             return false;
         }
         if GetWindowLongW(hwnd, GWL_EXSTYLE) != ex_style || GetWindowLongW(hwnd, GWL_STYLE) != style
         {
+            log_window_transition("final verification failed", hwnd, parent);
             diagnose::log(format!(
                 "set_window_mode: final style verification failed (exstyle_actual={:#x} expected={:#x} style_actual={:#x} expected={:#x})",
                 GetWindowLongW(hwnd, GWL_EXSTYLE),
@@ -676,6 +797,7 @@ fn set_window_mode_inner(
             let _ = restore_window(hwnd, old);
             return false;
         }
+        log_window_transition("mode change complete", hwnd, parent);
         true
     }
 }

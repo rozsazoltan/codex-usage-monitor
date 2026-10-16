@@ -3877,6 +3877,9 @@ fn render_layered() {
             &grok_accent,
             &copilot_accent,
         );
+        // GDI drawing may still be queued when we read the DIB directly for
+        // alpha processing and pass it to UpdateLayeredWindow.
+        let _ = GdiFlush();
 
         // System mode blends with the taskbar. High contrast modes use a solid
         // backdrop, so text stays legible even over translucent wallpapers.

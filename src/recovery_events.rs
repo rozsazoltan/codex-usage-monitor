@@ -17,7 +17,8 @@ use windows::Win32::System::Power::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, DEVICE_NOTIFY_WINDOW_HANDLE};
 
-pub const MESSAGE: u32 = 0x8000 + 4;
+// +4 is the taskbar recovery relay and +5 is the monitor refresh relay.
+pub const MESSAGE: u32 = 0x8000 + 6;
 static CONNECTIVITY: Mutex<Connectivity> = Mutex::new(Connectivity { online: None });
 #[derive(Default)]
 struct Connectivity {

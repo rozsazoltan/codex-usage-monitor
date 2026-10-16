@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 1024 1024" role="img" aria-label="Codex usage gauge icon">
+  <title>Codex usage meridian</title>
+  <desc>A premium open gauge arc in graphite with a fused aurora-gradient usage node; porcelain keyline separates the mark on dark backgrounds.</desc>
+  <defs>
+    <linearGradient id="aurora" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#41BFF4"/>
+      <stop offset="0.55" stop-color="#5D86F0"/>
+      <stop offset="1" stop-color="#7E5CFF"/>
+    </linearGradient>
+  </defs>
+  <!-- Porcelain keyline underlay: carries the silhouette on dark surfaces -->
+  <path d="M 512.4 809.2 A 290 290 0 1 1 759.2 562.4" fill="none" stroke="#EDF1F7" stroke-width="260" stroke-linecap="round"/>
+  <circle cx="759.2" cy="562.4" r="195" fill="#EDF1F7"/>
+  <!-- Graphite meridian: carries the mark on light surfaces -->
+  <path d="M 512.4 809.2 A 290 290 0 1 1 759.2 562.4" fill="none" stroke="#222A35" stroke-width="184" stroke-linecap="round"/>
+  <!-- Aurora usage node: the consumed-to-here value point, fused to the arc -->
+  <circle cx="759.2" cy="562.4" r="150" fill="url(#aurora)"/>
+</svg>

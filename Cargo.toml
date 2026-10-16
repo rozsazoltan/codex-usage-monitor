@@ -1,0 +1,60 @@
+[package]
+name = "quota-usage"
+version = "2026.10.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Lightweight, portable, easy-to-use, customizable, open-source usage monitor for Claude, Codex, and many other providers"
+homepage = "https://github.com/rozsazoltan/quota-usage-monitor"
+repository = "https://github.com/rozsazoltan/quota-usage-monitor"
+
+[package.metadata.winres]
+CompanyName = "datarose.net"
+ProductName = "Quota Usage Monitor"
+FileDescription = "Lightweight, portable, easy-to-use, customizable, open-source usage monitor for Claude, Codex, and many other providers"
+OriginalFilename = "quota-usage.exe"
+InternalName = "QuotaUsage"
+Comments = "Licensed under the GNU Affero General Public License v3 or later"
+LegalCopyright = "Original copyright (C) 2026 Code Zeno Pty Ltd; modifications (C) 2026 Ray; further modifications (C) 2026 Rózsa Zoltán"
+
+[dependencies]
+ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }
+native-tls = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+sha2 = "0.10"
+httpdate = "1"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Power",
+    "Win32_Storage_FileSystem",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Console",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_Security",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+]
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

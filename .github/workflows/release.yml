@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: calver-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate release version
+        id: validate-version
+        shell: pwsh
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          if ($env:RELEASE_EVENT -eq 'push') {
+            $version = & ./scripts/calver.ps1 -Mode ValidateTag -Tag $env:RELEASE_REF
+          } else {
+            $version = & ./scripts/calver.ps1 -Mode ValidateNext
+          }
+
+          if (-not $version -or $version.Count -ne 1) {
+            throw 'CalVer validation did not return exactly one version.'
+          }
+
+          "release_tag=v$version" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
+
+      - name: Verify native build prerequisites
+        shell: pwsh
+        run: |
+          # windows-2022 includes VS 2022 C++, full-framework MSBuild and this SDK.
+          $sdk = "${env:ProgramFiles(x86)}/Windows Kits/10/Include/10.0.26100.0"
+          if (-not (Test-Path "$sdk/um/Windows.h")) { throw 'Windows SDK 10.0.26100.0 is required.' }
+
+      - name: Build native companion and embedded release binary
+        shell: pwsh
+        run: ./scripts/build-release.ps1
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/quota-usage.exe dist/quota-usage.exe
+          Copy-Item dist/quota-usage.exe dist/codex-usage.exe
+
+          foreach ($name in @('quota-usage.exe', 'codex-usage.exe')) {
+            $hash = (Get-FileHash -Algorithm SHA256 "dist/$name").Hash.ToLowerInvariant()
+            "$hash  $name" | Set-Content -Encoding ascii "dist/$name.sha256"
+          }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.validate-version.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/quota-usage.exe
+            dist/quota-usage.exe.sha256
+            dist/codex-usage.exe
+            dist/codex-usage.exe.sha256
+          generate_release_notes: true
+          skip_if_release_exists: true

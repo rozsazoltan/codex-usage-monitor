@@ -1,0 +1,16 @@
+name: quota-usage-monitor
+version: 1.0.0
+description: APM project for Quota Usage Monitor
+author: Rózsa Zoltán
+# Which agent platforms to deploy to (uncomment to pin):
+# targets:
+#   - copilot
+#   - claude
+
+dependencies:
+  apm:
+    - microsoft/win-dev-skills#main
+    - microsoft/winappCli/plugins/winui/agent-plugin/skills/winui-design#57aee35fcd083c0e892bcd8a03ac9ad16e372c08
+  mcp: []
+includes: auto
+scripts: {}

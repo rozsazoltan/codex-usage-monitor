@@ -23,9 +23,7 @@ Quota Usage Monitor is a lightweight, portable, easy-to-use, customizable, open-
 
 ### Portable download
 
-Download `quota-usage.exe` from the [latest release](https://github.com/rozsazoltan/quota-usage-monitor/releases/latest) and run it where you saved it. No application installer is needed. Releases also include a byte-identical `codex-usage.exe` compatibility alias and checksum so older updater versions can transition to the new asset name.
-
-The executable embeds the native settings companion, but not the shared Windows App Runtime. Opening Settings extracts or verifies the companion under `%LOCALAPPDATA%\QuotaUsage\SettingsPayloads\<version>-<content-hash>`. This cache is separate from preferences; the downloaded executable stays in place. Version and updater/uninstaller CLI modes do not extract the companion.
+Download and run `quota-usage.exe` from the [latest release](https://github.com/rozsazoltan/quota-usage-monitor/releases/latest). No installer is needed. Settings are included; the [Windows App Runtime](#requirements) must be installed separately.
 
 ### Scoop and marcosnils/bin
 
@@ -130,27 +128,19 @@ Debug builds and tests automatically restore, build, publish, and embed the nati
 
 ### Portable release
 
-Install PowerShell 7.2+, Rust's x64 MSVC toolchain, Visual Studio 2022 C++ Build Tools (v143), Windows SDK **10.0.26100.0**, and full .NET Framework MSBuild with .NET Framework 4.7.2 or later for the XAML build tasks. Initial package restore needs access to nuget.org.
+Follow the prerequisites in [settings-ui/BUILDING.md](settings-ui/BUILDING.md), then run:
 
 ```powershell
 ./scripts/build-release.ps1
-# For a nonstandard Visual Studio installation:
-./scripts/build-release.ps1 -MSBuild 'D:\program\vs-buildtools\2022\MSBuild\Current\Bin\MSBuild.exe'
 ```
 
-The script rebuilds native XAML with full VS MSBuild, runs `PublishPortable`, packages the declared runtime files, validates the payload through Rust tests, and builds `target/release/quota-usage.exe`. Do not use `dotnet build`. The payload excludes the shared Windows App Runtime, symbols, WebView2, and the build toolchain.
-
-With `QUOTA_SETTINGS_PAYLOAD` set, `build.rs` embeds the pre-generated payload without restoring packages or accessing the network. A plain `cargo build --release` fails unless that variable points to a generated directory containing `manifest.json` and `payload.bin`. Use the release script and rerun it after native changes. The legacy `CODEX_SETTINGS_PAYLOAD` variable remains supported when the new variable is unset. Set `QUOTA_SETTINGS_MSBUILD` to select a nonstandard Visual Studio MSBuild path; `CODEX_SETTINGS_MSBUILD` remains supported as a legacy fallback. GitHub releases contain checksums for both the new portable executable and the legacy alias.
+Builds the native settings companion and `target/release/quota-usage.exe`. Use this script rather than plain `cargo build --release`; the shared Windows App Runtime is not bundled.
 
 ### Release version policy
 
-Releases use CalVer in the form `YYYY.M.patch`, with a **numeric, unpadded month** (for example, `2026.1.0`, not `2026.01.0`; Cargo requires valid SemVer). Do not edit the package version manually or enter a version when starting a release.
+Releases use `YYYY.M.patch` CalVer, such as `2026.10.0`. **Prepare release version** maintains the version automatically; do not edit it manually.
 
-The **Prepare release version** workflow updates only the root package versions in `Cargo.toml` and `Cargo.lock` on the default branch. It runs after branch pushes (but acts only on the default branch), daily to catch a UTC month rollover even when there are no commits, and can be dispatched on the default branch to repair a stale version. It selects the next patch from valid `vYYYY.M.patch` Git tags for the current UTC month: patch `0` if none exist, otherwise one above the highest patch. Legacy SemVer tags and tags for other months do not affect the calculation. The workflow commits the prepared files with `GITHUB_TOKEN`; because such pushes do not start another workflow run, the daily schedule is also the rollover safeguard. The default branch must allow the workflow's GitHub Actions bot to push these version commits.
-
-To publish, use **Release → Run workflow** on the default branch after version preparation has committed. The workflow takes no version input, verifies that the committed Cargo files match the next available CalVer, builds the checked-out commit, then creates the matching `vYYYY.M.patch` tag and GitHub Release only after the build succeeds. A stale version fails with instructions to run version preparation first. Pushing a `v*` tag remains supported, but the tag must exactly match the Cargo version and point to the checked-out commit; legacy or mismatched tags are rejected. Release and preparation runs share a concurrency lock, and reruns skip an already published release.
-
-If a valid tag was created but its release was not published, rerun the failed **Release** workflow after fixing the cause; do not move or force-delete the tag. For a tag-push run, rerun that tag's run. If a manual dispatch created the tag before failing, rerun that manual run on the default branch: recovery is allowed only when the manifest-matching tag points to the exact checked-out commit, and an existing release is skipped. If the tagged commit cannot be released, keep the tag, run **Prepare release version** on the default branch to advance to the next patch, and publish that version instead.
+To publish, run **Release → Run workflow** on the default branch after version preparation completes. If preparation is stale, run **Prepare release version** first. Retry failed releases through their original workflow run; do not move or delete published tags.
 
 ## Contributing and community
 

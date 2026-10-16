@@ -240,6 +240,41 @@ static MONITOR_TRANSITION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static PENDING_MONITOR_REFRESH: AtomicBool = AtomicBool::new(false);
 static PENDING_SETTING_CHANGE: AtomicBool = AtomicBool::new(false);
 static PENDING_TASKBAR_REFRESH: AtomicBool = AtomicBool::new(false);
+/// Watchdog stale-attachment sightings since the last healthy check. Monitor
+/// and topology queries can flap once while the shell is settling (seen
+/// around Task View) even though the live parent still matches; only a
+/// repeated mismatch triggers a refresh, because ripping a healthy child out
+/// of the taskbar over one transient can poison the surface.
+static WATCHDOG_STALE_SIGHTINGS: AtomicU32 = AtomicU32::new(0);
+/// Consecutive UpdateLayeredWindow failures with no success in between, and
+/// whether any render ever succeeded in this process.
+static LAYERED_RENDER_FAILURES: AtomicU32 = AtomicU32::new(0);
+static LAYERED_RENDER_SUCCEEDED_ONCE: AtomicBool = AtomicBool::new(false);
+/// Failed renders in a row (each after in-process recovery already failed)
+/// before the process restarts itself. Restarting re-creates the HWND and its
+/// DWM surface, the one recovery proven to work; the storm throttle in
+/// relaunch_self bounds the worst case.
+const LAYERED_RENDER_RELAUNCH_THRESHOLD: u32 = 3;
+
+fn note_layered_render_succeeded() {
+    LAYERED_RENDER_SUCCEEDED_ONCE.store(true, Ordering::Relaxed);
+    LAYERED_RENDER_FAILURES.store(0, Ordering::Relaxed);
+}
+
+/// Restart the process when the layered surface stays dead across recovery.
+/// Only fires after this process rendered successfully at least once, so a
+/// build that can never render cannot relaunch-loop.
+fn escalate_persistent_layered_failure() {
+    let failures = LAYERED_RENDER_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures >= LAYERED_RENDER_RELAUNCH_THRESHOLD
+        && LAYERED_RENDER_SUCCEEDED_ONCE.load(Ordering::Relaxed)
+    {
+        diagnose::log(format!(
+            "widget surface dead for {failures} consecutive renders; relaunching to rebuild it"
+        ));
+        relaunch_self();
+    }
+}
 
 #[repr(C)]
 struct ChooseColor {
@@ -399,14 +434,26 @@ fn spawn_taskbar_watchdog() {
             widget_alive,
             attachment_matches,
         ) {
-            TaskbarWatchdogAction::Ignore => {}
+            TaskbarWatchdogAction::Ignore => {
+                WATCHDOG_STALE_SIGHTINGS.store(0, Ordering::Relaxed);
+            }
             TaskbarWatchdogAction::Refresh => {
-                diagnose::log(
-                    "watchdog: live widget attachment is stale; requesting in-process refresh",
-                );
-                unsafe {
-                    let _ =
-                        PostMessageW(snapshot.hwnd, WM_APP_TASKBAR_CREATED, WPARAM(0), LPARAM(0));
+                let sightings = WATCHDOG_STALE_SIGHTINGS.fetch_add(1, Ordering::Relaxed) + 1;
+                if sightings < 2 {
+                    diagnose::log("watchdog: stale attachment sighted once; waiting to confirm");
+                } else {
+                    WATCHDOG_STALE_SIGHTINGS.store(1, Ordering::Relaxed);
+                    diagnose::log(
+                        "watchdog: live widget attachment is stale; requesting in-process refresh",
+                    );
+                    unsafe {
+                        let _ = PostMessageW(
+                            snapshot.hwnd,
+                            WM_APP_TASKBAR_CREATED,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
                 }
             }
             TaskbarWatchdogAction::Relaunch => {
@@ -1706,12 +1753,19 @@ impl Drop for MonitorTransitionGuard {
 }
 
 fn transition_to_monitor(hwnd: HWND, target: &ResolvedMonitorTarget) -> bool {
-    let (tray_offset, anchor_left, dragging) = {
+    let (tray_offset, anchor_left, dragging, embedded, current_taskbar, selection_pending) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
             return false;
         };
-        (s.tray_offset, s.anchor_left, s.dragging)
+        (
+            s.tray_offset,
+            s.anchor_left,
+            s.dragging,
+            s.embedded,
+            s.taskbar_hwnd,
+            s.pending_monitor_device.is_some() || s.legacy_selection_pending,
+        )
     };
     if dragging {
         return false;
@@ -1725,6 +1779,29 @@ fn transition_to_monitor(hwnd: HWND, target: &ResolvedMonitorTarget) -> bool {
     let Some(_transition) = MonitorTransitionGuard::new(hwnd) else {
         return false;
     };
+
+    if target.taskbar.is_none() && !selection_pending {
+        // Never rip a healthy child out of a live taskbar over a transient
+        // topology flap (seen around Task View, where the monitor mapping
+        // wobbles while the parent still matches). Detaching is what poisons
+        // the surface, so retain the attachment and retry; only float once
+        // our own taskbar is really gone. An explicit user monitor selection
+        // still goes through the normal path via selection_pending.
+        let live_parent = embedded
+            && current_taskbar.is_some_and(|taskbar| unsafe {
+                IsWindow(taskbar).as_bool()
+                    && GetParent(hwnd).is_ok_and(|parent| parent == taskbar)
+                    && native_interop::find_taskbars()
+                        .iter()
+                        .any(|taskbar_window| taskbar_window.hwnd == taskbar)
+            });
+        if live_parent {
+            diagnose::log(
+                "taskbar attachment retained: live taskbar still present during topology flap",
+            );
+            return false;
+        }
+    }
 
     let (embedded, position, taskbar) = if let Some((_, taskbar)) = target.taskbar {
         let rect = native_interop::get_taskbar_rect(taskbar.hwnd).unwrap_or(taskbar.rect);
@@ -3928,14 +4005,27 @@ fn render_layered() {
             // SetLayeredWindowAttributes locks out per-pixel updates until the
             // layered style is reset. Recover without changing attachment or
             // desired visibility, and retry with the already-rendered bitmap.
+            let mut recovered = false;
             if native_interop::reset_layered_surface(hwnd) {
                 if let Err(error) = UpdateLayeredWindow(
                     hwnd, screen_dc, None, Some(&sz), mem_dc, Some(&pt_src),
                     COLORREF(0), Some(&blend), ULW_ALPHA,
                 ) {
                     diagnose::log_error("widget layered surface recovery failed", error);
+                } else {
+                    recovered = true;
                 }
             }
+            if recovered {
+                note_layered_render_succeeded();
+            } else {
+                // The HWND's DWM surface can stay dead even with perfect
+                // styles (seen after Task View); restart to rebuild it rather
+                // than sit invisible until the next manual restart.
+                escalate_persistent_layered_failure();
+            }
+        } else {
+            note_layered_render_succeeded();
         }
 
         // Cleanup

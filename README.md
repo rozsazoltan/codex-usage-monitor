@@ -138,13 +138,15 @@ Builds the native settings companion and `target/release/quota-usage.exe`. Use t
 
 ### Release version policy
 
-Releases use `YYYY.M.patch` CalVer, such as `2026.10.0`. **Prepare release version** maintains the version automatically; do not edit it manually.
+Releases use `YYYY.M.patch` CalVer, such as `2026.10.0`. The version is maintained automatically by the release workflow; do not edit it manually.
 
-To publish, run **Release → Run workflow** on the default branch after version preparation completes. If preparation is stale, run **Prepare release version** first. Retry failed releases through their original workflow run; do not move or delete published tags.
+To publish, run **Release → Run workflow** on the default branch. The workflow prepares the next CalVer automatically, builds the executable, and publishes the GitHub Release with the matching tag. Retry failed releases through their original workflow run; do not move or delete published tags.
 
 ## Contributing and community
 
 Fork the repository, make a focused change, and open a pull request. Run the relevant Rust tests; for native settings changes, follow the build and smoke-test instructions in [settings-ui/BUILDING.md](settings-ui/BUILDING.md). Report reproducible problems through [GitHub Issues](https://github.com/rozsazoltan/quota-usage-monitor/issues), without credentials or unredacted diagnostic logs.
+
+The repository provides agent skills for AI-assisted development, managed with APM (see `apm.yml`). To deploy them, run `mise use apm@latest` and then `apm install`; the generated `.agents/skills/` directory is intentionally untracked.
 
 ## Acknowledgments
 

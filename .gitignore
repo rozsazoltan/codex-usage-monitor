@@ -30,6 +30,9 @@ AGENTS.md
 # APM dependencies
 apm_modules/
 
+# APM-deployed agent skills (install with `apm install`)
+.agents/skills/
+
 # Deepwork session state (git-local)
 .slim/deepwork/
 

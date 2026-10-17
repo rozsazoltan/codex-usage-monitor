@@ -169,12 +169,12 @@ try {
                 $tagCommit = @(& git rev-parse --verify "refs/tags/$recoveryTag^{commit}" 2>$null)
                 $tagExitCode = $LASTEXITCODE
                 if ($tagExitCode -ne 0 -or $tagCommit.Count -ne 1) {
-                    throw "Cargo version '$manifestVersion' is stale; the next available CalVer version is '$nextVersion'. Run the Prepare release version workflow on the default branch, then dispatch Release again."
+                    throw "Cargo version '$manifestVersion' is stale; the next available CalVer version is '$nextVersion'. Run the Release workflow on the default branch to prepare the next version."
                 }
 
                 $headCommit = @(& git rev-parse --verify HEAD)
                 if ($LASTEXITCODE -ne 0 -or $headCommit.Count -ne 1 -or $tagCommit[0] -cne $headCommit[0]) {
-                    throw "Cargo version '$manifestVersion' is not the next available CalVer version '$nextVersion', and its existing recovery tag '$recoveryTag' does not point to the checked-out commit. Run the Prepare release version workflow on the default branch."
+                    throw "Cargo version '$manifestVersion' is not the next available CalVer version '$nextVersion', and its existing recovery tag '$recoveryTag' does not point to the checked-out commit. Run the Release workflow on the default branch to prepare the next version."
                 }
             }
             Write-Output $manifestVersion

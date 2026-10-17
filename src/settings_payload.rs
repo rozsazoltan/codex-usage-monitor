@@ -46,45 +46,21 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Exact payload allowlist: the native companion plus the pinned self-contained
+/// Windows App SDK files and the single en-us XAML satellite. Relative paths
+/// use '/' separators in ordinal sort order. The same file drives the PowerShell
+/// publisher/packager, so every side enforces the identical set; SDK bumps
+/// must review this list.
+const PORTABLE_FILES: &str = include_str!("../settings-ui/portable-files.txt");
+/// The only subdirectory the payload may contain.
+const PORTABLE_SUBDIR: &str = "en-us";
+
+fn portable_file_list() -> impl Iterator<Item = &'static str> {
+    PORTABLE_FILES.lines().filter(|line| !line.is_empty())
+}
+
 fn allowed_name(name: &str) -> bool {
-    if matches!(
-        name,
-        "SettingsUI.exe" | "Microsoft.WindowsAppRuntime.Bootstrap.dll" | "SettingsUI.pri"
-    ) {
-        return true;
-    }
-    let Some(stem) = name.strip_suffix(".xbf") else {
-        return false;
-    };
-    let reserved = matches!(
-        stem.to_ascii_uppercase().as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    );
-    !reserved
-        && stem.len() <= 100
-        && stem.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
-        && stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    !name.contains('\\') && portable_file_list().any(|allowed| allowed == name)
 }
 
 fn parse_manifest(bytes: &[u8], payload_length: usize) -> io::Result<Manifest> {
@@ -98,15 +74,11 @@ fn parse_manifest(bytes: &[u8], payload_length: usize) -> io::Result<Manifest> {
     {
         return Err(invalid("Unsupported settings payload manifest"));
     }
-    let mut names = HashSet::new();
     let mut end = 0usize;
     let mut total = 0usize;
     let mut previous = "";
     for entry in &manifest.files {
-        if !allowed_name(&entry.name)
-            || !names.insert(entry.name.to_ascii_lowercase())
-            || entry.name.as_str() <= previous
-        {
+        if !allowed_name(&entry.name) || entry.name.as_str() <= previous {
             return Err(invalid("Invalid, duplicate or unordered payload filename"));
         }
         previous = &entry.name;
@@ -132,16 +104,16 @@ fn parse_manifest(bytes: &[u8], payload_length: usize) -> io::Result<Manifest> {
             return Err(invalid("Settings payload bounds exceeded"));
         }
     }
+    // The manifest must match the pinned allowlist exactly: no missing runtime
+    // files, no extras. Both sides are ordinal-sorted, so a pairwise compare is
+    // exact.
     if end != payload_length
-        || [
-            "settingsui.exe",
-            "microsoft.windowsappruntime.bootstrap.dll",
-            "settingsui.pri",
-            "app.xbf",
-            "mainwindow.xbf",
-        ]
-        .iter()
-        .any(|name| !names.contains(*name))
+        || manifest.files.len() != portable_file_list().count()
+        || manifest
+            .files
+            .iter()
+            .zip(portable_file_list())
+            .any(|(entry, allowed)| entry.name != allowed)
     {
         return Err(invalid("Incomplete settings payload"));
     }
@@ -209,45 +181,101 @@ fn lock_directory_tree(path: &Path, create: bool) -> io::Result<Vec<File>> {
     Ok(locks)
 }
 
+fn verify_file(path: &Path, entry: &Entry) -> io::Result<File> {
+    regular_metadata(&fs::symlink_metadata(path)?, false)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .custom_flags(OPEN_REPARSE)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    regular_metadata(&metadata, false)?;
+    if metadata.len() != entry.size as u64 {
+        return Err(invalid(format!(
+            "Settings cache size mismatch: {}",
+            entry.name
+        )));
+    }
+    let mut bytes = Vec::with_capacity(entry.size);
+    (&mut file)
+        .take(entry.size as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() != entry.size || digest(&bytes) != entry.sha256 {
+        return Err(invalid(format!(
+            "Settings cache hash mismatch: {}. Remove this cache version and retry.",
+            entry.name
+        )));
+    }
+    Ok(file)
+}
+
+fn unexpected_cache() -> io::Error {
+    invalid("Unexpected files in settings cache; remove this cache version and retry")
+}
+
 fn verify_directory(directory: &Path, manifest: &Manifest) -> io::Result<Vec<File>> {
     let mut locks = lock_directory_tree(directory, false)?;
     let canonical = directory.canonicalize()?;
-    let entries: Vec<_> = fs::read_dir(&canonical)?.collect::<Result<_, _>>()?;
-    if entries.len() != manifest.files.len() {
-        return Err(invalid(
-            "Unexpected files in settings cache; remove this cache version and retry",
-        ));
-    }
-    for entry in &manifest.files {
-        let path = canonical.join(&entry.name);
-        regular_metadata(&fs::symlink_metadata(&path)?, false)?;
+    let mut remaining: HashSet<&str> = manifest
+        .files
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    let mut subdir_seen = false;
+    for dir_entry in fs::read_dir(&canonical)?.collect::<Result<Vec<_>, _>>()? {
+        let path = dir_entry.path();
+        if path.is_dir() {
+            if subdir_seen
+                || path.file_name().and_then(|name| name.to_str()) != Some(PORTABLE_SUBDIR)
+            {
+                return Err(unexpected_cache());
+            }
+            regular_metadata(&fs::symlink_metadata(&path)?, true)?;
+            let subdir = path.canonicalize()?;
+            if subdir.parent() != Some(canonical.as_path()) {
+                return Err(invalid("Settings cache path escaped its directory"));
+            }
+            let children = fs::read_dir(&subdir)?.collect::<Result<Vec<_>, _>>()?;
+            let [child] = children.as_slice() else {
+                return Err(unexpected_cache());
+            };
+            let child_path = child.path();
+            if child_path.is_dir() {
+                return Err(unexpected_cache());
+            }
+            let name = format!(
+                "{PORTABLE_SUBDIR}/{}",
+                child.file_name().to_str().ok_or_else(unexpected_cache)?
+            );
+            let Some(entry) = manifest.files.iter().find(|entry| entry.name == name) else {
+                return Err(unexpected_cache());
+            };
+            if child_path.canonicalize()?.parent() != Some(subdir.as_path()) {
+                return Err(invalid("Settings cache path escaped its directory"));
+            }
+            if !remaining.remove(entry.name.as_str()) {
+                return Err(unexpected_cache());
+            }
+            locks.push(verify_file(&child_path, entry)?);
+            subdir_seen = true;
+            continue;
+        }
+        let name = dir_entry.file_name();
+        let name = name.to_str().ok_or_else(unexpected_cache)?;
+        let Some(entry) = manifest.files.iter().find(|entry| entry.name == name) else {
+            return Err(unexpected_cache());
+        };
+        let path = canonical.join(name);
         if path.canonicalize()?.parent() != Some(canonical.as_path()) {
             return Err(invalid("Settings cache path escaped its directory"));
         }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .custom_flags(OPEN_REPARSE)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        regular_metadata(&metadata, false)?;
-        if metadata.len() != entry.size as u64 {
-            return Err(invalid(format!(
-                "Settings cache size mismatch: {}",
-                entry.name
-            )));
+        if !remaining.remove(entry.name.as_str()) {
+            return Err(unexpected_cache());
         }
-        let mut bytes = Vec::with_capacity(entry.size);
-        (&mut file)
-            .take(entry.size as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() != entry.size || digest(&bytes) != entry.sha256 {
-            return Err(invalid(format!(
-                "Settings cache hash mismatch: {}. Remove this cache version and retry.",
-                entry.name
-            )));
-        }
-        locks.push(file);
+        locks.push(verify_file(&path, entry)?);
+    }
+    if !remaining.is_empty() {
+        return Err(unexpected_cache());
     }
     Ok(locks)
 }
@@ -323,7 +351,8 @@ fn extract(root: &Path, manifest_bytes: &[u8], payload: &[u8]) -> io::Result<Pre
             let staging = root.join(format!(".stage-{}-{nonce}", std::process::id()));
             fs::create_dir(&staging)?;
             let staging_locks = lock_directory_tree(&staging, false)?;
-            // No arbitrary archive paths: the manifest is flat and allowlisted above.
+            // Manifest paths are allowlisted above; only the single pinned
+            // resource subdirectory may nest, and it must be created first.
             for entry in &manifest.files {
                 let bytes = decode(
                     &payload[entry.offset..entry.offset + entry.compressed_size],
@@ -332,12 +361,23 @@ fn extract(root: &Path, manifest_bytes: &[u8], payload: &[u8]) -> io::Result<Pre
                 if digest(&bytes) != entry.sha256 {
                     return Err(invalid("Embedded settings payload hash mismatch"));
                 }
+                let path = staging.join(&entry.name);
+                if let Some(parent) = path.parent() {
+                    if parent != staging {
+                        if parent.file_name().and_then(|name| name.to_str()) != Some(PORTABLE_SUBDIR)
+                            || parent.parent() != Some(staging.as_path())
+                        {
+                            return Err(invalid("Settings payload path escaped its directory"));
+                        }
+                        fs::create_dir(parent)?;
+                    }
+                }
                 let mut file = OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .share_mode(0)
                     .custom_flags(OPEN_REPARSE)
-                    .open(staging.join(&entry.name))?;
+                    .open(&path)?;
                 file.write_all(&bytes)?;
                 file.sync_all()?;
             }
@@ -371,7 +411,7 @@ pub fn prepare() -> Result<Option<PreparedPayload>, String> {
         return Ok(None);
     }
     cache_root().and_then(|root| extract(&root, MANIFEST, PAYLOAD)).map(Some)
-        .map_err(|e| format!("Cannot prepare native settings: {e}. The cache is under LocalAppData\\QuotaUsage\\SettingsPayloads. Settings also require Windows App Runtime 1.8 x64; install it from Microsoft's Windows App SDK downloads page. It is never installed automatically."))
+        .map_err(|e| format!("Cannot prepare native settings: {e}. The cache is under LocalAppData\\QuotaUsage\\SettingsPayloads. The companion is self-contained and needs no shared Windows App Runtime; a corrupt or mixed cache is the usual cause, so remove that version directory and retry."))
 }
 
 fn development_payload_allowed(
@@ -408,10 +448,18 @@ mod tests {
     }
 
     #[test]
-    fn names_are_flat_allowlisted_and_not_devices() {
+    fn names_match_the_pinned_allowlist_exactly() {
+        let listed: Vec<&str> = portable_file_list().collect();
+        assert_eq!(listed.len(), 81);
+        assert!(
+            listed.windows(2).all(|pair| pair[0] < pair[1]),
+            "portable-files.txt must stay ordinal-sorted"
+        );
         for name in [
             "../SettingsUI.exe",
             "C:\\SettingsUI.exe",
+            "en-us/../../SettingsUI.exe",
+            "en-us\\Microsoft.ui.xaml.dll.mui",
             "a/b.xbf",
             "a\\b.xbf",
             "evil.dll",
@@ -421,35 +469,34 @@ mod tests {
             "app.xbf.",
             "App.XBF",
             "a-b.xbf",
+            "AppearancePage.xbf",
             "",
         ] {
             assert!(!allowed_name(name), "{name}");
         }
         for name in [
             "SettingsUI.exe",
+            "Microsoft.WindowsAppRuntime.Bootstrap.dll",
+            "SettingsUI.pri",
             "App.xbf",
             "MainWindow.xbf",
-            "AppearancePage.xbf",
+            "en-us/Microsoft.ui.xaml.dll.mui",
         ] {
             assert!(allowed_name(name));
         }
     }
 
     fn fixture() -> serde_json::Value {
-        let names = [
-            "App.xbf",
-            "MainWindow.xbf",
-            "Microsoft.WindowsAppRuntime.Bootstrap.dll",
-            "SettingsUI.exe",
-            "SettingsUI.pri",
-        ];
+        // The manifest must mirror the pinned allowlist entry for entry.
+        let names: Vec<&str> = portable_file_list().collect();
         serde_json::json!({"schema":1,"compression":"xpress-huff","files": names.iter().enumerate().map(|(i,n)| serde_json::json!({"name":n,"size":1,"sha256":"a".repeat(64),"offset":i,"compressed_size":1})).collect::<Vec<_>>()})
     }
 
     #[test]
     fn manifest_rejects_paths_duplicates_missing_files_and_bounds() {
         let valid = fixture();
-        assert!(parse_manifest(&serde_json::to_vec(&valid).unwrap(), 5).is_ok());
+        let count = valid["files"].as_array().unwrap().len();
+        assert!(parse_manifest(&serde_json::to_vec(&valid).unwrap(), count).is_ok());
         for (field, value) in [
             ("name", serde_json::json!("../App.xbf")),
             ("name", serde_json::json!("MainWindow.xbf")),
@@ -461,12 +508,12 @@ mod tests {
         ] {
             let mut broken = valid.clone();
             broken["files"][0][field] = value;
-            assert!(parse_manifest(&serde_json::to_vec(&broken).unwrap(), 5).is_err());
+            assert!(parse_manifest(&serde_json::to_vec(&broken).unwrap(), count).is_err());
         }
         let mut broken = valid.clone();
         broken["files"].as_array_mut().unwrap().pop();
-        assert!(parse_manifest(&serde_json::to_vec(&broken).unwrap(), 4).is_err());
-        assert!(parse_manifest(&serde_json::to_vec(&valid).unwrap(), 6).is_err());
+        assert!(parse_manifest(&serde_json::to_vec(&broken).unwrap(), count - 1).is_err());
+        assert!(parse_manifest(&serde_json::to_vec(&valid).unwrap(), count + 1).is_err());
     }
 
     #[test]
@@ -503,6 +550,7 @@ mod tests {
         for entry in manifest.files {
             fs::remove_file(directory.join(entry.name)).unwrap();
         }
+        fs::remove_dir(directory.join(PORTABLE_SUBDIR)).unwrap();
         fs::remove_dir(directory).unwrap();
         fs::remove_dir(root).unwrap();
     }

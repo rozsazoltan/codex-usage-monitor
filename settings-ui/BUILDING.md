@@ -1,7 +1,9 @@
 # Native settings companion: build and validation
 
-This is an unpackaged, framework-dependent C++20/C++/WinRT WinUI 3 application.
-XAML is compiled to XBF and indexed in a PRI. There is no .NET application runtime.
+This is an unpackaged, self-contained C++20/C++/WinRT WinUI 3 application.
+XAML is compiled to XBF and indexed in a PRI. There is no .NET application runtime,
+and no shared Windows App Runtime installation is required: the payload carries
+the WinUI 3 framework files it needs.
 The Rust widget remains the state owner. The companion connects to its private
 named pipe, requests authoritative snapshots, and submits typed setting/action
 requests; it never reads or writes settings files itself. The General, Monitoring,
@@ -18,8 +20,9 @@ centered within the nearest monitor's work area.
 - PowerShell **7.2 or later**, with `pwsh` on `PATH`, for `PublishPortable` and
   the release scripts. Windows PowerShell 5.1 is not supported.
 - Internet access to nuget.org for the initial restore.
-- To run: the shared **Windows App Runtime 1.8, x64**, at least the servicing
-  level required by the pinned Windows App SDK. This project does not install it.
+- To run: nothing extra. The payload is self-contained; the required WinUI 3
+  framework files ship with the companion, so no shared Windows App Runtime
+  installation is needed.
 
 The scripts use `QUOTA_SETTINGS_MSBUILD` to select a nonstandard full MSBuild
 path when automatic discovery is insufficient; `CODEX_SETTINGS_MSBUILD` remains
@@ -87,27 +90,21 @@ without replacing the directory.
 `scripts\build-release.ps1` publishes to the dedicated ignored
 `target\settings-portable-build` directory and passes that directory explicitly
 to `scripts\package-settings.ps1 -InputDirectory`. It does not publish or package
-the shared developer `settings-ui\bin\portable` directory. The payload still
-contains exactly five flat files; the shared Windows App Runtime remains an
-external prerequisite and is never bundled or installed by publication.
+the shared developer `settings-ui\bin\portable` directory. The payload is the
+pinned allowlist in `settings-ui\portable-files.txt`: the companion files plus
+the self-contained WinUI 3 framework files and the one required `en-us` XAML
+satellite. No shared runtime is needed and none is installed by publication.
 
 Change `$msbuild` to the full VS 2022 MSBuild path on other machines. Do not copy
 the entire compiler output directory into a release: it includes symbols and
-unused SDK-transitive WebView2/background-task artifacts. `PublishPortable`
-publishes only the five runtime files:
-
-| File | Observed Release x64 bytes |
-| --- | ---: |
-| `SettingsUI.exe` | 672,256 |
-| `Microsoft.WindowsAppRuntime.Bootstrap.dll` | 399,712 |
-| `SettingsUI.pri` | 4,480 |
-| `App.xbf` | 690 |
-| `MainWindow.xbf` | 2,918 |
-| **Total** | **1,080,056** |
+unused SDK-transitive artifacts. `PublishPortable` publishes only the pinned
+file set in `settings-ui\portable-files.txt` (companion EXE/PRI/XBF files, the
+self-contained WinUI 3 framework files, and the required `en-us` XAML satellite;
+currently 81 entries, about 53 MB uncompressed).
 
 Keep these files together. This is a folder deployment, not a standalone EXE.
-The executable statically links its C++ CRT; the shared Windows App Runtime has
-its own prerequisites. Shared runtime installation size is not included above.
+The executable statically links its C++ CRT; the bundled framework files have
+no extra prerequisites beyond the OS.
 
 ## Runtime smoke test
 
@@ -138,7 +135,7 @@ If a development Settings launch exits before connecting, check which payload
 the widget actually uses. Debug builds without embedded settings use
 `settings-ui\bin\portable`; `scripts\build-release.ps1` publishes a separate
 `target\settings-portable-build` copy and does not refresh that developer folder.
-Rebuild and publish the complete five-file payload rather than copying individual
+Rebuild and publish the complete pinned payload rather than copying individual
 files. A mixed EXE/XBF/PRI can fail XAML connection-ID binding with
 `E_NOINTERFACE` (`0x80004002`) and still exit with code 0, without an Application
 Error/WER crash record. Startup diagnostics, when emitted by the companion, are

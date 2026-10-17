@@ -17,13 +17,13 @@ Quota Usage Monitor is a lightweight, portable, easy-to-use, customizable, open-
 
 - Windows 10 or Windows 11.
 - Existing sign-in credentials for the providers you enable; see [Provider setup](#provider-setup).
-- For native settings: **Windows App Runtime 1.8, x64**, at the servicing level required by the pinned Windows App SDK **1.8.260921001**. Use [Microsoft's Windows App SDK downloads](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) to obtain the x64 installer. The app does not bundle or install this shared runtime. The settings companion does not require a .NET runtime.
+- For native settings: nothing extra. The required WinUI 3 framework files ship inside `quota-usage.exe`; no shared Windows App Runtime installation is needed. The settings companion does not require a .NET runtime.
 
 ## Installation
 
 ### Portable download
 
-Download and run `quota-usage.exe` from the [latest release](https://github.com/rozsazoltan/quota-usage-monitor/releases/latest). No installer is needed. Settings are included; the [Windows App Runtime](#requirements) must be installed separately.
+Download and run `quota-usage.exe` from the [latest release](https://github.com/rozsazoltan/quota-usage-monitor/releases/latest). No installer is needed; settings and their WinUI 3 framework files are included.
 
 ### Scoop and marcosnils/bin
 
@@ -60,7 +60,7 @@ Choose **Uninstall Quota Usage** in About to remove the app. Preferences are kep
 
 For an installation managed by `bin`, use `bin remove <binary>`, replacing `<binary>` with the installed binary name, to remove its package entry too.
 
-The app's uninstaller removes its private settings-companion cache, but never the shared Windows App Runtime. External package-manager removal may leave the cache behind.
+The app's uninstaller removes its private settings-companion cache. External package-manager removal may leave the cache behind.
 
 ## Provider setup
 
@@ -104,8 +104,8 @@ At startup, enabled providers whose credentials are unavailable are switched off
 
 ## Troubleshooting
 
-- **Settings will not open:** install or repair the x64 Windows App Runtime 1.8 at the required servicing level. The app reports this prerequisite but does not silently install it.
-- **Settings payload verification fails:** close all Quota Usage instances, delete only the affected version folder under `%LOCALAPPDATA%\QuotaUsage\SettingsPayloads`, then restart. Leave preferences and the shared runtime intact. Junction/reparse-point cache directories are unsupported.
+- **Settings will not open:** check the app log for a settings-payload error. A corrupt payload cache can be cleared per the next item; the companion carries its own WinUI 3 files, so no runtime install is involved.
+- **Settings payload verification fails:** close all Quota Usage instances, delete only the affected version folder under `%LOCALAPPDATA%\QuotaUsage\SettingsPayloads`, then restart. Leave preferences intact. Junction/reparse-point cache directories are unsupported.
 - **Missing quota data or rejected credentials:** sign in again with the affected provider, then choose **Refresh** from the app menu. Claude Desktop authentication cannot replace Claude Code CLI sign-in.
 - **The app does not start or the widget is missing:** run this command from the executable's folder:
 
@@ -134,7 +134,7 @@ Follow the prerequisites in [settings-ui/BUILDING.md](settings-ui/BUILDING.md), 
 ./scripts/build-release.ps1
 ```
 
-Builds the native settings companion and `target/release/quota-usage.exe`. Use this script rather than plain `cargo build --release`; the shared Windows App Runtime is not bundled.
+Builds the native settings companion and `target/release/quota-usage.exe`. Use this script rather than plain `cargo build --release`; the companion's WinUI 3 framework files are bundled inside the executable.
 
 ### Release version policy
 

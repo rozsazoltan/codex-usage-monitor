@@ -1,9 +1,11 @@
 #requires -Version 7.2
 <#
 .SYNOPSIS
-Publishes the five portable Settings UI files without overwriting live files.
+Publishes the allowlisted portable Settings UI files without overwriting live files.
 .NOTES
-SourceDir may contain other build outputs; only the five named files are copied.
+SourceDir may contain other build outputs; only the listed files are copied.
+The file list is settings-ui/portable-files.txt: exact relative paths with '/'
+separators in ordinal sort order, including the single en-us XAML satellite.
 DestinationDir may contain only allowlisted files. Its parent is created after
 source validation if missing; reparse paths are refused before creation.
 Directory replacement uses two renames, not an atomic exchange. Ordinary failures
@@ -18,8 +20,23 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$names = [string[]]@('SettingsUI.exe', 'Microsoft.WindowsAppRuntime.Bootstrap.dll', 'SettingsUI.pri', 'App.xbf', 'MainWindow.xbf')
-$allowed = [Collections.Generic.HashSet[string]]::new($names, [StringComparer]::Ordinal)
+$listPath = "$PSScriptRoot/../settings-ui/portable-files.txt"
+$names = @(Get-Content -LiteralPath $listPath -Encoding utf8NoBOM | Where-Object { $_ -ne '' })
+$sortedCheck = [string[]]$names.Clone()
+[Array]::Sort($sortedCheck, [StringComparer]::Ordinal)
+for ($i = 0; $i -lt $names.Count; $i++) {
+    if ($sortedCheck[$i] -cne $names[$i]) { throw "portable-files.txt must be ordinal-sorted: $($names[$i])" }
+}
+$allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($entry in $names) {
+    if ($entry -cnotmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_.-]+)?$' -or $entry.Contains('\') -or $entry.Contains('..')) {
+        throw "Unsupported portable file path: $entry"
+    }
+    if (-not $allowed.Add($entry)) { throw "Duplicate portable file: $entry" }
+}
+foreach ($required in @('App.xbf', 'MainWindow.xbf', 'SettingsUI.exe', 'SettingsUI.pri', 'en-us/Microsoft.ui.xaml.dll.mui')) {
+    if (-not $allowed.Contains($required)) { throw "Missing required portable file: $required" }
+}
 
 function Get-PathAttributes([string]$Path) {
     try { [IO.File]::GetAttributes($Path) }
@@ -46,10 +63,30 @@ function Assert-SafePath([string]$Path, [switch]$Directory) {
 function Get-PayloadNames([string]$Path) {
     Assert-SafePath $Path -Directory
     foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($Path)) {
-        $name = [IO.Path]::GetFileName($entry)
         $attributes = Get-PathAttributes $entry
-        if (-not $allowed.Contains($name) -or
-            ($attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint))) {
+        if ($attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Unexpected portable artifact: $entry. Refusing to replace unrelated files or directories."
+        }
+        if ($attributes -band [IO.FileAttributes]::Directory) {
+            $name = [IO.Path]::GetFileName($entry)
+            if ($name -cne 'en-us') {
+                throw "Unexpected portable artifact: $entry. Refusing to replace unrelated files or directories."
+            }
+            foreach ($child in [IO.Directory]::EnumerateFileSystemEntries($entry)) {
+                $childAttributes = Get-PathAttributes $child
+                if (($childAttributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint))) {
+                    throw "Unexpected portable artifact: $child. Refusing to replace unrelated files or directories."
+                }
+                $relative = 'en-us/' + [IO.Path]::GetFileName($child)
+                if (-not $allowed.Contains($relative)) {
+                    throw "Unexpected portable artifact: $child. Refusing to replace unrelated files or directories."
+                }
+                $relative
+            }
+            continue
+        }
+        $name = [IO.Path]::GetFileName($entry)
+        if (-not $allowed.Contains($name)) {
             throw "Unexpected portable artifact: $entry. Refusing to replace unrelated files or directories."
         }
         $name
@@ -81,11 +118,17 @@ function Assert-SourceUnchanged {
 
 function Remove-OwnedDirectory([string]$Path) {
     # Never recursively remove a directory or follow an unexpected entry.
+    # Entries use '/' separators; only the single pinned en-us file may nest.
     $entries = @(Get-PayloadNames $Path)
     foreach ($name in $entries) {
-        $file = Join-Path $Path $name
+        $file = Join-Path $Path ($name -replace '/', [IO.Path]::DirectorySeparatorChar)
         Assert-SafePath $file
         [IO.File]::Delete($file)
+    }
+    $satellite = Join-Path $Path 'en-us'
+    if ($null -ne (Get-PathAttributes $satellite)) {
+        Assert-SafePath $satellite -Directory
+        [IO.Directory]::Delete($satellite, $false)
     }
     [IO.Directory]::Delete($Path, $false)
 }
@@ -181,6 +224,11 @@ try {
         $stagingOwned = $true
         foreach ($name in $names) {
             $path = Join-Path $stagingPath $name
+            $parent = [IO.Path]::GetDirectoryName($path)
+            if ($parent -cne $stagingPath) {
+                if ([IO.Path]::GetFileName($parent) -cne 'en-us') { throw "Unexpected nested portable file: $name" }
+                [IO.Directory]::CreateDirectory($parent) | Out-Null
+            }
             $output = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
             try {
                 $sourceStreams[$name].Position = 0

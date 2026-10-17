@@ -6,20 +6,39 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# Only explicit native project XAML items may add resources to this allowlist.
-[xml]$project = Get-Content "$PSScriptRoot/../settings-ui/SettingsUI.vcxproj" -Raw
-$names = [System.Collections.Generic.List[string]]::new()
-$names.AddRange([string[]]@('SettingsUI.exe', 'Microsoft.WindowsAppRuntime.Bootstrap.dll', 'SettingsUI.pri'))
-foreach ($item in $project.SelectNodes("//*[local-name()='ApplicationDefinition' or local-name()='Page']")) {
-    $name = [IO.Path]::ChangeExtension($item.GetAttribute('Include'), '.xbf')
-    if ($name -cnotmatch '^[A-Za-z][A-Za-z0-9_]*\.xbf$') { throw "Unsupported XAML resource path: $name" }
-    $names.Add($name)
+# The payload file list is settings-ui/portable-files.txt: exact relative paths
+# with '/' separators in ordinal sort order. It pins the native companion plus
+# the self-contained Windows App SDK files and the single en-us XAML satellite
+# (without it the companion crashes at startup with 0xC000027B). Only explicit
+# native project XAML items may add *.xbf resources to this list; framework
+# files change only with the pinned SDK and must be reviewed then.
+$listPath = "$PSScriptRoot/../settings-ui/portable-files.txt"
+$names = [Collections.Generic.List[string]]::new()
+foreach ($line in (Get-Content -LiteralPath $listPath -Encoding utf8NoBOM)) {
+    if ($line -ne '') { $names.Add($line) }
+}
+foreach ($entry in $names) {
+    if ($entry -cnotmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_.-]+)?$' -or $entry.Contains('\') -or $entry.Contains('..')) {
+        throw "Unsupported payload path: $entry"
+    }
 }
 $sorted = $names.ToArray()
 [Array]::Sort($sorted, [StringComparer]::Ordinal)
-$unique = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+for ($i = 0; $i -lt $sorted.Count; $i++) {
+    if ($sorted[$i] -cne $names[$i]) { throw "portable-files.txt must be ordinal-sorted: $($names[$i])" }
+}
+$unique = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($name in $sorted) {
     if (-not $unique.Add($name)) { throw "Duplicate payload name: $name" }
+}
+# Every XBF in the list must come from a native project XAML item.
+[xml]$project = Get-Content "$PSScriptRoot/../settings-ui/SettingsUI.vcxproj" -Raw
+$xaml = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($item in $project.SelectNodes("//*[local-name()='ApplicationDefinition' or local-name()='Page']")) {
+    $xaml.Add([IO.Path]::ChangeExtension($item.GetAttribute('Include'), '.xbf')) | Out-Null
+}
+foreach ($name in $sorted) {
+    if ($name -clike '*.xbf' -and -not $xaml.Contains($name)) { throw "XAML resource is not a project item: $name" }
 }
 foreach ($required in @('App.xbf', 'MainWindow.xbf')) {
     if ($required -cnotin $sorted) { throw "Missing required XAML item: $required" }
@@ -31,7 +50,22 @@ while ($null -ne $ancestor) {
     $ancestor = $ancestor.Parent
 }
 foreach ($file in Get-ChildItem $inputPath -Force) {
-    if ($file.Name -cnotin $sorted -or $file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Unexpected portable artifact: $($file.Name). Publish a clean allowlisted folder."
+    }
+    if ($file.PSIsContainer) {
+        if ($file.Name -cne 'en-us') {
+            throw "Unexpected portable artifact: $($file.Name). Publish a clean allowlisted folder."
+        }
+        foreach ($child in Get-ChildItem $file.FullName -Force) {
+            $relative = 'en-us/' + $child.Name
+            if ($child.PSIsContainer -or ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $relative -cnotin $sorted) {
+                throw "Unexpected portable artifact: $relative. Publish a clean allowlisted folder."
+            }
+        }
+        continue
+    }
+    if ($file.Name -cnotin $sorted) {
         throw "Unexpected portable artifact: $($file.Name). Publish a clean allowlisted folder."
     }
 }

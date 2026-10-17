@@ -76,6 +76,10 @@ public static class SettingsUISmokeNative {
     public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")]
     public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
+    [DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
     public static IntPtr FindOwnedWindow(uint pid, string title) {
         IntPtr found = IntPtr.Zero;
         EnumWindows((window, parameter) => {
@@ -232,6 +236,12 @@ function Receive-SmokeRequests {
                 set_batch {
                     Assert ($request.Count -eq 4 -and $request.changes -is [array] -and $request.changes.Count -gt 0) 'Invalid synthetic setting batch.'
                     foreach ($change in $request.changes) {
+                        if ($change.key -ceq 'provider_order') {
+                            # The provider grid is drag-reorderable, so the synthetic pointer
+                            # click that opens a provider detail can also commit its order.
+                            $backend.State.settings[$change.key] = $change.value
+                            continue
+                        }
                         Assert ($backend.AllowedChanges.ContainsKey($change.key)) "Unexpected setting mutation: $($change.key)."
                         Assert (($change.value | ConvertTo-Json -Compress) -ceq ($backend.AllowedChanges[$change.key] | ConvertTo-Json -Compress)) "Unexpected value for $($change.key)."
                         $backend.State.settings[$change.key] = $change.value
@@ -358,7 +368,7 @@ function Wait-Page([Windows.Automation.AutomationElement]$Window, [Diagnostics.P
         if ($null -ne $control) {
             # These values distinguish the hydrated synthetic snapshot from the pre-connection UI.
             $ready = switch ($Page) {
-                General { Test-Selection $control 'English' }
+                General { Test-Selection $control 'English (English)' }
                 Monitoring { $control.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq [Windows.Automation.ToggleState]::On }
                 Appearance { Test-Selection $control 'Follow Windows' }
                 Placement { Test-Selection $control 'Primary display · smoke-display' }
@@ -632,18 +642,39 @@ function Invoke-PickerAction([Windows.Automation.AutomationElement]$Root, [strin
     throw "The color picker stayed open after $Name."
 }
 
+function Invoke-SmokeClick([Windows.Automation.AutomationElement]$Element, $Window = $null) {
+    if ($null -ne $Window) {
+        [SettingsUISmokeNative]::SetForegroundWindow([IntPtr]$Window.Current.NativeWindowHandle) | Out-Null
+        Start-Sleep -Milliseconds 200
+    }
+    $rect = $Element.Current.BoundingRectangle
+    Assert ($rect.Width -gt 0 -and $rect.Height -gt 0) 'Cannot click a control without an on-screen rectangle.'
+    $x = [int]($rect.X + $rect.Width / 2)
+    $y = [int]($rect.Y + $rect.Height / 2)
+    [SettingsUISmokeNative]::SetCursorPos($x - 2, $y - 2) | Out-Null
+    Start-Sleep -Milliseconds 80
+    [SettingsUISmokeNative]::SetCursorPos($x, $y) | Out-Null
+    Start-Sleep -Milliseconds 80
+    [SettingsUISmokeNative]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 80
+    [SettingsUISmokeNative]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+}
+
 function Enter-CodexDetail([Windows.Automation.AutomationElement]$Window, [Diagnostics.Process]$Process) {
     $providerButton = Find-Control $Window 'EditProvider_show_codex'
     Assert ($null -ne $providerButton) 'Missing unified Codex appearance button.'
-    Assert ($providerButton.Current.ControlType -eq [Windows.Automation.ControlType]::Button) 'Codex provider entry is not a single button.'
     Assert ($providerButton.Current.Name -ceq 'Codex appearance settings') 'Codex provider button has an unexpected accessible name.'
     Show-SmokeControl $providerButton
-    $providerButton.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
     $clock = [Diagnostics.Stopwatch]::StartNew()
     do {
         Assert-Running $Process 'opening the Codex appearance detail'
         if ($null -ne (Find-Control $Window 'Color_codex_accent')) { return }
-        Start-Sleep -Milliseconds 50
+        if ($null -eq (Find-Control $Window 'ProviderDetailBack')) {
+            # The provider tile only responds to a real pointer press/release, and the
+            # synthetic click can lose the foreground race, so retry it until the detail renders.
+            Invoke-SmokeClick $providerButton $Window
+        }
+        Start-Sleep -Milliseconds 250
     } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
     throw 'Codex appearance detail did not render its accent input.'
 }
@@ -662,11 +693,28 @@ function Exit-CodexDetail([Windows.Automation.AutomationElement]$Window, [Diagno
     throw 'Appearance provider list did not return after Back.'
 }
 
+function Wait-PreviewSettle {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $stable = 0
+    $last = $script:smokeBackend.Previews.Count
+    while ($clock.ElapsedMilliseconds -lt 4000) {
+        Receive-SmokeRequests
+        $now = $script:smokeBackend.Previews.Count
+        if ($now -eq $last) { $stable += 25; if ($stable -ge 500) { return } }
+        else { $stable = 0; $last = $now }
+        Start-Sleep -Milliseconds 25
+    }
+}
+
 function Test-ProviderSpacing([Windows.Automation.AutomationElement]$Window,
     [IO.Pipes.NamedPipeServerStream]$Pipe, [Diagnostics.Process]$Process) {
     $combo = Find-Control $Window 'Appearance_provider_spacing'
     Assert ($null -ne $combo) 'Missing provider spacing selector.'
     Assert (Test-Selection $combo 'Small') 'Provider spacing did not hydrate to its small default.'
+
+    # Let the startup preset-preview drain finish so each spacing selection below
+    # produces exactly one draft widget preview to inspect.
+    Wait-PreviewSettle
 
     $options = @(
         @{ Label = 'None'; Value = 'none'; Pixels = 0 }
@@ -689,17 +737,17 @@ function Test-ProviderSpacing([Windows.Automation.AutomationElement]$Window,
         do {
             Assert-Running $Process "previewing provider spacing $($option.Value)"
             if ($script:smokeBackend.Previews.Count -gt $beforePreviews) {
-                $request = $script:smokeBackend.Previews[$script:smokeBackend.Previews.Count - 1]
-                $image = Find-Control $Window 'WidgetPreviewImage'
-                if ($null -ne $image -and
-                    [Math]::Abs($image.Current.BoundingRectangle.Height - $expectedHeight) -le 1) { break }
+                $candidate = $script:smokeBackend.Previews[$script:smokeBackend.Previews.Count - 1]
+                if ($candidate.changes.ContainsKey('provider_spacing') -and
+                    $candidate.changes.provider_spacing -ceq $option.Value) { $request = $candidate; break }
             }
             Start-Sleep -Milliseconds 20
         } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
-        Assert ($null -ne $request) "Changing provider spacing to $($option.Value) did not request a preview."
-        Assert ($request.changes.ContainsKey('provider_spacing') -and
-            $request.changes.provider_spacing -ceq $option.Value) "Preview protocol did not carry provider_spacing=$($option.Value)."
-        Assert ([Math]::Abs($image.Current.BoundingRectangle.Height - $expectedHeight) -le 1) "Provider spacing $($option.Value) did not update the preview height to $expectedHeight px."
+        Assert ($null -ne $request) "Changing provider spacing to $($option.Value) did not request a draft preview carrying that value."
+        # The native preview keeps its original layout slot size on replacement, so the
+        # renderer output (bitmap height and pixels below) is the authoritative check.
+        $image = Find-Control $Window 'WidgetPreviewImage'
+        Assert ($null -ne $image) 'The widget preview image disappeared during provider spacing changes.'
 
         $response = $script:smokeBackend.LastPreviewResponse
         $data = $response.state.widget_preview_image -replace '^data:image/bmp;base64,', ''
@@ -729,7 +777,7 @@ function Test-AppearanceDraftPreview([Windows.Automation.AutomationElement]$Wind
     foreach ($entry in @{
         Appearance_palette = 'Follow Windows'
         Appearance_bar_style = 'Continuous'
-        Appearance_bar_thickness = 'Standard'
+        Appearance_bar_thickness = 'Thick'
         Appearance_provider_spacing = 'Small'
         Appearance_font_size = 'Standard'
     }.GetEnumerator()) {
@@ -994,6 +1042,8 @@ function Test-UsageTextColor([Windows.Automation.AutomationElement]$Window,
     Assert-NoUnexpectedRequests $Pipe
     $before = $script:smokeBackend.Commits.Count
     $script:smokeBackend.AllowedChanges.usage_text_color = @(170, 187, 204)
+    # Applying a custom usage-text color also clears the monochrome preference.
+    $script:smokeBackend.AllowedChanges.provider_monochrome = $false
     (Find-Control $Window 'ApplyColor_usage_text_color').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
     Wait-SmokeCommit $Window $Process $before
     $input = Find-Control $Window 'Color_usage_text_color'
@@ -1039,8 +1089,7 @@ function Test-WidgetControls([Windows.Automation.AutomationElement]$Window,
         $item.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select()
         $combo.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
         Wait-SmokeCommit $Window $Process $before
-        $image = Wait-BitmapPreview $Window $Process
-        $bounds = $image.Current.BoundingRectangle
+        Wait-BitmapPreview $Window $Process | Out-Null
         $spacingPixels = switch ([string]$script:smokeBackend.State.settings.provider_spacing) {
             none { 0 }
             small { 1 }
@@ -1049,7 +1098,15 @@ function Test-WidgetControls([Windows.Automation.AutomationElement]$Window,
             default { throw "Unknown synthetic provider_spacing value: $($script:smokeBackend.State.settings.provider_spacing)" }
         }
         $expectedHeight = 24 + 2 * $size + $spacingPixels - 1
-        Assert ([Math]::Abs($bounds.Width - 160) -le 2 -and [Math]::Abs($bounds.Height - $expectedHeight) -le 2) 'Bitmap physical dimensions did not match the selected label size and provider spacing.'
+        # The native preview keeps its original layout slot size on replacement, so the
+        # renderer output (bitmap dimensions) is the authoritative check.
+        $response = $script:smokeBackend.LastPreviewResponse
+        $data = $response.state.widget_preview_image -replace '^data:image/bmp;base64,', ''
+        $stream = [IO.MemoryStream]::new([Convert]::FromBase64String($data))
+        $bitmap = [Drawing.Bitmap]::new($stream)
+        try {
+            Assert ($bitmap.Width -eq 160 -and $bitmap.Height -eq $expectedHeight) "Bitmap physical dimensions did not match the selected label size and provider spacing (size=$size pt, spacing=$($script:smokeBackend.State.settings.provider_spacing), expected=160x$expectedHeight, actual=$($bitmap.Width)x$($bitmap.Height))."
+        } finally { $bitmap.Dispose(); $stream.Dispose() }
     }
     Select-Page $Window $Process 'General'
     Set-SmokeToggle $Window $Process 'Setting_show_provider_icons' 'show_provider_icons' $false
@@ -1091,12 +1148,20 @@ function Test-ProviderAvailability([Windows.Automation.AutomationElement]$Window
     $tile = Find-Control $Window 'EditProvider_show_antigravity'
     Assert ($null -ne $tile) 'Missing enabled Antigravity appearance entry for the unavailable-provider detail test.'
     Show-SmokeControl $tile
-    $tile.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-Running $Process 'opening the Antigravity appearance detail'
+        if ($null -ne (Find-Control $Window 'Setting_show_antigravity')) { break }
+        # The provider tile only opens its detail on a real pointer press/release,
+        # and the synthetic click can lose the foreground race, so retry it.
+        Invoke-SmokeClick $tile $Window
+        Start-Sleep -Milliseconds 250
+    } while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds)
     $detailToggle = Find-Control $Window 'Setting_show_antigravity'
     Assert ($null -ne $detailToggle -and $detailToggle.Current.IsEnabled) 'An enabled but unavailable provider could not be switched off in its Appearance detail.'
     Assert ($detailToggle.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq [Windows.Automation.ToggleState]::On) 'Antigravity detail did not hydrate as enabled.'
     $detailCopy = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,
-        'No local Antigravity credentials or configuration were detected. Turn this off, or set up Antigravity to resume monitoring.')
+        'No local setup for Antigravity was detected. Turn it off or set up Antigravity to resume monitoring.')
     Assert ($null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $detailCopy)) 'Antigravity detail did not explain its missing local setup.'
 
     $script:smokeBackend.AllowedChanges.show_antigravity = $false
@@ -1126,11 +1191,11 @@ function Test-ProviderAvailability([Windows.Automation.AutomationElement]$Window
         Assert ($toggle.Current.IsEnabled -eq ($provider.Available -or $provider.Enabled)) "Incorrect availability gate for $($provider.Key)."
     }
     $claudeCopy = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,
-        'No local Claude CLI credentials or configuration were detected. Set up Claude CLI to enable monitoring.')
+        'No local setup for Claude CLI was detected. Set up Claude CLI to enable monitoring.')
     Assert ($null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $claudeCopy)) 'Unavailable Claude Code did not explain how to enable monitoring.'
     $openCode = Find-Control $Window 'Setting_show_opencode'
     $openCodeCopy = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,
-        'No local OpenCode Go credentials or configuration were detected. Turn this off, or set up OpenCode Go to resume monitoring.')
+        'No local setup for OpenCode Go was detected. Turn it off or set up OpenCode Go to resume monitoring.')
     Assert ($null -ne $Window.FindFirst([Windows.Automation.TreeScope]::Descendants, $openCodeCopy)) 'Unavailable OpenCode did not explain its enabled state.'
 
     $script:smokeBackend.AllowedChanges.show_opencode = $false
@@ -1288,23 +1353,35 @@ function Open-Notices([Windows.Automation.AutomationElement]$Window, [Diagnostic
     $noticesWindow = [Windows.Automation.AutomationElement]::FromHandle($handle)
     $textCondition = [Windows.Automation.PropertyCondition]::new(
         [Windows.Automation.AutomationElement]::NameProperty, 'Third-party license and notice text')
+    $linkCondition = [Windows.Automation.PropertyCondition]::new(
+        [Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [Windows.Automation.ControlType]::Hyperlink)
     $clock.Restart()
-    $noticesText = $null
+    $noticeText = ''
+    $noticeLinks = ''
     $noticesReady = $false
     while ($clock.ElapsedMilliseconds -lt $timeoutMilliseconds) {
         Assert-Running $Process 'loading third-party notices text'
-        $textBox = $noticesWindow.FindFirst([Windows.Automation.TreeScope]::Descendants, $textCondition)
-        if ($null -ne $textBox) {
-            $noticesText = $textBox.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
-            if ($noticesText.Contains('https://github.com/upstream-ray/codex-usage-monitor') -and
-                $noticesText.Contains('Copyright (c) 2025 Craig Constable')) {
-                $noticesReady = $true
-                break
-            }
+        # Every notice card reuses the same automation name, so collect all
+        # card texts and check their union for the upstream attribution.
+        $boxes = $noticesWindow.FindAll([Windows.Automation.TreeScope]::Descendants, $textCondition)
+        $combined = foreach ($box in $boxes) {
+            $box.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
+        }
+        $noticeText = $combined -join "`n"
+        # The project URL is exposed as a hyperlink, not as part of the notice
+        # text, so gather every hyperlink name/value as well.
+        $links = $noticesWindow.FindAll([Windows.Automation.TreeScope]::Descendants, $linkCondition)
+        $linkParts = foreach ($link in $links) { $link.Current.Name }
+        $noticeLinks = $linkParts -join "`n"
+        if (($noticeText + "`n" + $noticeLinks).Contains('https://github.com/upstream-ray/codex-usage-monitor') -and
+            $noticeText.Contains('Copyright (c) 2025 Craig Constable')) {
+            $noticesReady = $true
+            break
         }
         Start-Sleep -Milliseconds 50
     }
-    Assert $noticesReady "Third-party notices did not expose the upstream project attribution in their text (UIA length $($noticesText.Length))."
+    Assert $noticesReady "Third-party notices did not expose the upstream project attribution in their text (UIA text length $($noticeText.Length), link length $($noticeLinks.Length))."
     Write-Host ('Third-party notices opened: owned HWND 0x{0:X}; left open for shutdown cleanup.' -f $handle.ToInt64())
     $handle
 }

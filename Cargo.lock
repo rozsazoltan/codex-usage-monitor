@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "quota-usage"
-version = "2026.10.0"
+version = "2026.10.1"
 dependencies = [
  "dirs",
  "httpdate",

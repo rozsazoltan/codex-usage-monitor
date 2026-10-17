@@ -1,6 +1,6 @@
 [package]
 name = "quota-usage"
-version = "2026.10.0"
+version = "2026.10.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Lightweight, portable, easy-to-use, customizable, open-source usage monitor for Claude, Codex, and many other providers"

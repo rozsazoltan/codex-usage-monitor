@@ -179,5 +179,5 @@ Project URL: https://github.com/microsoft/microsoft-ui-xaml
 Source license: MIT
 
 WinUI 3 is used through the Windows App SDK. Its source repository is MIT-licensed.
-The shared Windows App Runtime is installed separately and is not bundled with
-this application.
+The required WinUI 3 framework files ship inside this application; no shared
+Windows App Runtime installation is needed.

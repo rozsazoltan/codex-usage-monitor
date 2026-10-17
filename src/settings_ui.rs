@@ -379,7 +379,7 @@ fn open_in_session(
     let directory = &payload.directory;
     let executable = directory.join("SettingsUI.exe");
     if !executable.is_file() {
-        return Err(format!("SettingsUI.exe is missing from {}. Build and publish the native companion using settings-ui/BUILDING.md, or reinstall the complete application payload. Windows App Runtime 1.8 x64 is required; it is not installed automatically.", directory.display()));
+        return Err(format!("SettingsUI.exe is missing from {}. Build and publish the native companion using settings-ui/BUILDING.md, or reinstall the complete application payload. The companion is self-contained and needs no shared Windows App Runtime.", directory.display()));
     }
     let name = format!(
         r"\\.\pipe\QuotaUsage.Settings.{}.{}",
@@ -496,7 +496,7 @@ fn format_child_exit_error(
         ),
     };
     format!(
-        "Settings companion process PID {pid} exited {phase_description} with Windows exit code {}. Check its Application Error/WER record. If it points to resource loading, confirm the five companion payload files come from one build; if it points to a bootstrap/dependency failure, verify Windows App Runtime 1.8 x64.",
+        "Settings companion process PID {pid} exited {phase_description} with Windows exit code {}. Check its Application Error/WER record. If it points to resource loading (often 0xC000027B), confirm the companion payload files come from one build and the cache holds exactly the allowlisted set including the en-us XAML satellite.",
         format_windows_exit_code(code)
     )
 }
@@ -1233,7 +1233,7 @@ mod tests {
             .contains("during the active pipe connection after 501 ms (connected after 23 ms)"));
         assert!(during_connection.contains("3221226505 (0xC0000409)"));
         assert!(during_connection.contains(
-            "if it points to a bootstrap/dependency failure, verify Windows App Runtime 1.8 x64"
+            "confirm the companion payload files come from one build and the cache holds exactly the allowlisted set including the en-us XAML satellite"
         ));
 
         let unavailable =

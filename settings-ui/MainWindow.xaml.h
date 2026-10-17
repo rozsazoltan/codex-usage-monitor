@@ -174,6 +174,7 @@ namespace winrt::SettingsUI::implementation
         uint32_t inFlight_{ 0 };
         uint64_t revision_{};
         bool initialGetPending_{};
+        bool initialStateReady_{};
         bool mutationInFlight_{};
         bool persistInFlight_{};
         bool persistNeeded_{};

@@ -1083,6 +1083,7 @@ namespace winrt::SettingsUI::implementation
         }
         if (isInitialGet)
         {
+            initialStateReady_ = true;
             SyncPaneState();
         }
         UpdateProviderAvailability();
@@ -1436,7 +1437,7 @@ namespace winrt::SettingsUI::implementation
     }
     void MainWindow::SendWidgetPreviewIfIdle()
     {
-        if (closed_ || stopping_ || page_ != L"Appearance" || inFlight_ != 0) return;
+        if (closed_ || stopping_ || page_ != L"Appearance" || inFlight_ != 0 || !initialStateReady_) return;
         if (appearancePresetPreviewNext_ < appearancePresetPreviewJobs_.size())
         {
             SendNextPresetPreviewIfIdle();
@@ -1486,7 +1487,7 @@ namespace winrt::SettingsUI::implementation
     void MainWindow::SendNextPresetPreviewIfIdle()
     {
         if (closed_ || stopping_ || page_ != L"Appearance" || inFlight_ != 0 ||
-            presetPreviewInFlight_ || appearancePresetPreviewNext_ >= appearancePresetPreviewJobs_.size()) return;
+            presetPreviewInFlight_ || !initialStateReady_ || appearancePresetPreviewNext_ >= appearancePresetPreviewJobs_.size()) return;
         const auto jobIndex = appearancePresetPreviewNext_++;
         const auto index = appearancePresetPreviewJobs_[jobIndex].cardIndex;
         auto request = Request(L"preview");
@@ -2648,6 +2649,8 @@ namespace winrt::SettingsUI::implementation
         });
         input.IsEnabled(accentEnabled); pickerButton.IsEnabled(accentEnabled);
         apply.IsEnabled(accentEnabled); discard.IsEnabled(accentEnabled);
+        row.Children().Append(input); row.Children().Append(pickerButton);
+        row.Children().Append(apply); row.Children().Append(discard);
         if (key == L"usage_text_color")
         {
             auto monochrome = Button(); monochrome.Content(box_value(NativeLocalization::Translate(L"Monochrome", g_nativeLanguage)));

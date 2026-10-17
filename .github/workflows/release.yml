@@ -60,12 +60,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/quota-usage.exe dist/quota-usage.exe
-          Copy-Item dist/quota-usage.exe dist/codex-usage.exe
 
-          foreach ($name in @('quota-usage.exe', 'codex-usage.exe')) {
-            $hash = (Get-FileHash -Algorithm SHA256 "dist/$name").Hash.ToLowerInvariant()
-            "$hash  $name" | Set-Content -Encoding ascii "dist/$name.sha256"
-          }
+          $name = 'quota-usage.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$name").Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content -Encoding ascii "dist/$name.sha256"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -75,7 +73,5 @@ jobs:
           files: |
             dist/quota-usage.exe
             dist/quota-usage.exe.sha256
-            dist/codex-usage.exe
-            dist/codex-usage.exe.sha256
           generate_release_notes: true
           skip_if_release_exists: true
